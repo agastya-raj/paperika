@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+.DS_Store
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+runtime/
+downloads/
+artifacts/
+playwright-report/
+test-results/
+node_modules/
+
+# Keep runtime state outside the repo by default
+/home/agastya/Downloads/papers/
+/home/agastya/.hermes/paper_pipeline/
