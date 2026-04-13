@@ -22,13 +22,3 @@ def should_retry(attempt_number: int) -> bool:
     return attempt_number < MAX_TRIES
 
 
-def notification_type(previous_status: str | None, new_status: str) -> str | None:
-    if new_status == "failed" and previous_status != "failed":
-        return "first_failure"
-    if new_status == "downloaded" and previous_status in {"failed", "retrying", "manual_intervention"}:
-        return "first_success_after_failure"
-    if new_status == "permanent_failure":
-        return "final_failure"
-    if new_status == "manual_intervention":
-        return "manual_intervention_needed"
-    return None

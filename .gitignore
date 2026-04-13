@@ -18,6 +18,7 @@ artifacts/
 playwright-report/
 test-results/
 node_modules/
+.hermes/
 
 # Keep runtime state outside the repo by default
 /home/agastya/Downloads/papers/

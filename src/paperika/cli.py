@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
 
-from .config import get_default_config
+from .config import PaperikaConfig, get_default_config
 from .db import Database
-from .downloader import Downloader
+from .downloader import Downloader, outcome_to_dict
 from .locator import create_locator
+from .runtime_check import collect_runtime_report, format_runtime_summary
+from .worker import run_worker_once
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -16,6 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init-db", help="Initialize the runtime SQLite database")
+    subparsers.add_parser("doctor", help="Report runtime readiness for local Chrome downloads")
 
     locate = subparsers.add_parser("locate", help="Remote-only paper locator")
     locate.add_argument("query")
@@ -31,19 +33,25 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument("request_id", type=int)
 
     subparsers.add_parser("retry-pending", help="Process queued/retrying requests that are due")
+    subparsers.add_parser("run-worker-once", help="One-shot cron/Hermes-friendly retry worker")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    config = get_default_config()
+    config = PaperikaConfig.from_env() if args.command == "doctor" else get_default_config()
     db = Database.from_config(config)
 
     if args.command == "init-db":
         db.init()
         print(json.dumps({"status": "ok", "db_path": str(config.db_path)}))
         return 0
+
+    if args.command == "doctor":
+        report = collect_runtime_report(config)
+        print(json.dumps({**report, "summary": format_runtime_summary(report)}, indent=2))
+        return 0 if report["ready"] else 1
 
     db.init()
 
@@ -60,34 +68,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "process-request":
         outcome = downloader.process_request(args.request_id)
-        print(json.dumps(_outcome_to_dict(outcome), indent=2))
+        print(json.dumps(outcome_to_dict(outcome), indent=2))
         return 0
     if args.command == "retry-pending":
         outcomes = downloader.retry_pending()
-        print(json.dumps([_outcome_to_dict(outcome) for outcome in outcomes], indent=2))
+        print(json.dumps([outcome_to_dict(outcome) for outcome in outcomes], indent=2))
+        return 0
+    if args.command == "run-worker-once":
+        print(json.dumps(run_worker_once(downloader), indent=2))
         return 0
 
     parser.print_help()
     return 1
-
-
-def _outcome_to_dict(outcome):
-    return {
-        "request_id": outcome.request_id,
-        "paper_id": outcome.paper_id,
-        "status": outcome.status,
-        "message": outcome.message,
-        "local_pdf_path": outcome.local_pdf_path,
-        "deduped": outcome.deduped,
-        "attempt_number": outcome.attempt_number,
-        "manual": None if outcome.manual is None else {
-            "reason": outcome.manual.reason,
-            "screenshot_path": outcome.manual.screenshot_path,
-            "page_title": outcome.manual.page_title,
-            "current_url": outcome.manual.current_url,
-            "suggested_next_action": outcome.manual.suggested_next_action,
-        },
-    }
 
 
 if __name__ == "__main__":
