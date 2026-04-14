@@ -87,6 +87,15 @@ Hardening added:
 
 That fix is what made the final DOI-driven validation produce a valid PDF at the expected slugged destination path.
 
+## Downloader identity hardening
+
+Behavior changed after the wrong-tab regression fix:
+
+- existing-tab reuse is now conservative and only happens with strong DOI or canonical URL evidence
+- DOI-known requests do not reuse tabs on weak title, token, or publisher overlap alone
+- every materialized PDF is identity-verified before the paper/request is marked downloaded
+- wrong-paper downloads are treated as failed attempts with diagnostics and artifacts, then retried/manual-handled instead of being recorded as success
+
 ## Remaining pain points
 
 - publisher-specific viewers can still require more selectors or identity heuristics over time

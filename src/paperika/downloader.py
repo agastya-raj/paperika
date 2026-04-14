@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 import shutil
+import subprocess
 import time
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
@@ -32,6 +35,57 @@ class DownloadOutcome:
     deduped: bool = False
     attempt_number: int = 0
     notification_events: list[NotificationEvent] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class PageMatchResult:
+    score: int
+    reuse_allowed: bool
+    evidence: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class PdfIdentityCheck:
+    ok: bool
+    reason: str
+    observed_title: str | None = None
+    observed_doi: str | None = None
+
+
+GENERIC_TITLE_WORDS = {
+    "advanced",
+    "analysis",
+    "approach",
+    "conference",
+    "design",
+    "for",
+    "from",
+    "ieee",
+    "international",
+    "journal",
+    "letter",
+    "letters",
+    "methods",
+    "model",
+    "monitoring",
+    "network",
+    "networks",
+    "novel",
+    "of",
+    "on",
+    "optical",
+    "paper",
+    "proceedings",
+    "research",
+    "study",
+    "system",
+    "systems",
+    "the",
+    "using",
+    "with",
+}
+
+DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.IGNORECASE)
 
 
 class Downloader:
@@ -251,29 +305,47 @@ class Downloader:
         return self.db.upsert_located_paper(candidate)
 
     def _download_with_fallback(self, parsed: ParsedInput, request_id: int, paper_id: int | None, attempt_number: int) -> DownloadOutcome:
-        chrome_result = self._download_via_local_chrome(parsed, request_id=request_id, attempt_number=attempt_number)
-        if chrome_result:
-            if paper_id is None:
-                paper_id = self._ensure_paper_record(parsed)
-            return DownloadOutcome(request_id, paper_id, "downloaded", "Downloaded via local Chrome", chrome_result, attempt_number=attempt_number)
-
-        if parsed.doi:
+        if parsed.doi and not parsed.url:
             resolved = self._resolve_doi(parsed.doi)
             if resolved:
                 parsed.url = resolved
                 parsed.probable_pdf = parsed.probable_pdf or resolved.lower().endswith(".pdf")
                 parsed.probable_viewer = parsed.probable_viewer or "pdf" in resolved.lower()
-                chrome_result = self._download_via_local_chrome(parsed, request_id=request_id, attempt_number=attempt_number)
-                if chrome_result:
-                    if paper_id is None:
-                        paper_id = self._ensure_paper_record(parsed)
-                    return DownloadOutcome(request_id, paper_id, "downloaded", "Resolved DOI and used local Chrome", chrome_result, attempt_number=attempt_number)
+
+        with self._connected_local_browser() as browser:
+            chrome_result = self._download_via_browser(
+                browser,
+                parsed,
+                request_id=request_id,
+                attempt_number=attempt_number,
+            )
+            if chrome_result:
+                if paper_id is None:
+                    paper_id = self._ensure_paper_record(parsed)
+                return DownloadOutcome(request_id, paper_id, "downloaded", "Downloaded via local Chrome", chrome_result, attempt_number=attempt_number)
+
+            if parsed.doi:
+                resolved = self._resolve_doi(parsed.doi)
+                if resolved and self._normalized_page_url(resolved) != self._normalized_page_url(parsed.url):
+                    parsed.url = resolved
+                    parsed.probable_pdf = parsed.probable_pdf or resolved.lower().endswith(".pdf")
+                    parsed.probable_viewer = parsed.probable_viewer or "pdf" in resolved.lower()
+                    chrome_result = self._download_via_browser(
+                        browser,
+                        parsed,
+                        request_id=request_id,
+                        attempt_number=attempt_number,
+                    )
+                    if chrome_result:
+                        if paper_id is None:
+                            paper_id = self._ensure_paper_record(parsed)
+                        return DownloadOutcome(request_id, paper_id, "downloaded", "Resolved DOI and used local Chrome", chrome_result, attempt_number=attempt_number)
 
         raise RuntimeError("Unable to find or open a matching local Chrome tab/viewer for this paper")
 
     def _resolve_doi(self, doi: str) -> str | None:
         url = f"https://doi.org/{doi}"
-        request = Request(url, headers={"Accept": "text/html,application/pdf;q=0.9,*/*;q=0.8", "User-Agent": "paperika/0.1.0"})
+        request = Request(url, headers=self._browserish_headers())
         with urlopen(request, timeout=20) as response:
             return normalize_url(response.geturl())
 
@@ -287,37 +359,66 @@ class Downloader:
         target.parent.mkdir(parents=True, exist_ok=True)
         return target
 
-    def _download_via_local_chrome(self, parsed: ParsedInput, request_id: int, attempt_number: int) -> str | None:
+    @contextmanager
+    def _connected_local_browser(self) -> Iterator[Any | None]:
         if sync_playwright is None:
-            return None
+            yield None
+            return
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp(self.config.chrome_cdp_url)
-            pages = self._collect_pages(browser)
-            matched_page = self._find_matching_page(pages, parsed)
-            if matched_page is None and parsed.url:
-                context = browser.contexts[0] if browser.contexts else None
-                if context is None:
-                    return None
-                matched_page = context.new_page()
-                matched_page.goto(parsed.url, wait_until="domcontentloaded", timeout=60000)
-                matched_page.wait_for_timeout(2000)
-            if matched_page is None:
-                return None
-            self._prepare_download_behavior(matched_page)
-            screenshot_path = self.config.screenshot_dir / f"request_{request_id}_attempt_{attempt_number}_matched.png"
-            matched_page.screenshot(path=str(screenshot_path), full_page=False)
-            existing_files = {path.resolve() for path in self.config.download_dir.glob("*")}
-            download = self._click_pdf_download(matched_page)
-            if not download and parsed.url and self._normalized_page_url(matched_page.url) != self._normalized_page_url(parsed.url):
-                matched_page.goto(parsed.url, wait_until="domcontentloaded", timeout=60000)
-                matched_page.wait_for_timeout(2000)
-                self._prepare_download_behavior(matched_page)
-                existing_files = {path.resolve() for path in self.config.download_dir.glob("*")}
-                download = self._click_pdf_download(matched_page)
-            if download:
-                target = self._target_pdf_path(parsed, None, matched_page.url)
-                return str(self._materialize_download(download, target, existing_files))
+            yield browser
+
+    def _download_via_local_chrome(self, parsed: ParsedInput, request_id: int, attempt_number: int) -> str | None:
+        with self._connected_local_browser() as browser:
+            return self._download_via_browser(browser, parsed, request_id=request_id, attempt_number=attempt_number)
+
+    def _download_via_browser(self, browser: Any | None, parsed: ParsedInput, request_id: int, attempt_number: int) -> str | None:
+        if browser is None:
             return None
+        pages = self._collect_pages(browser)
+        matched_page = self._find_matching_page(pages, parsed)
+        if matched_page is None and parsed.url:
+            context = browser.contexts[0] if browser.contexts else None
+            if context is None:
+                return None
+            matched_page = context.new_page()
+            matched_page.goto(parsed.url, wait_until="domcontentloaded", timeout=60000)
+            matched_page.wait_for_timeout(2000)
+        if matched_page is None:
+            return None
+        self._prepare_download_behavior(matched_page)
+        screenshot_path = self.config.screenshot_dir / f"request_{request_id}_attempt_{attempt_number}_matched.png"
+        try:
+            matched_page.screenshot(path=str(screenshot_path), full_page=False)
+        except Exception:
+            pass
+        direct_pdf = self._try_materialize_direct_pdf_page(matched_page, parsed)
+        if direct_pdf is not None:
+            return str(direct_pdf)
+        existing_files = {path.resolve() for path in self.config.download_dir.glob("*")}
+        download_clicked = self._click_pdf_download(matched_page)
+        if not download_clicked and parsed.url and self._normalized_page_url(matched_page.url) != self._normalized_page_url(parsed.url):
+            matched_page.goto(parsed.url, wait_until="domcontentloaded", timeout=60000)
+            matched_page.wait_for_timeout(2000)
+            self._prepare_download_behavior(matched_page)
+            direct_pdf = self._try_materialize_direct_pdf_page(matched_page, parsed)
+            if direct_pdf is not None:
+                return str(direct_pdf)
+            existing_files = {path.resolve() for path in self.config.download_dir.glob("*")}
+            download_clicked = self._click_pdf_download(matched_page)
+        if not download_clicked:
+            pdf_candidate = self._find_pdf_link_candidate(matched_page)
+            if pdf_candidate and self._normalized_page_url(pdf_candidate) != self._normalized_page_url(matched_page.url):
+                matched_page.goto(pdf_candidate, wait_until="domcontentloaded", timeout=60000)
+                direct_pdf, existing_files, download_clicked = self._stabilize_pdf_candidate_page(matched_page, parsed)
+                if direct_pdf is not None:
+                    return str(direct_pdf)
+        if download_clicked:
+            target = self._target_pdf_path(parsed, None, matched_page.url)
+            materialized = self._materialize_clicked_download(target, existing_files)
+            self._raise_if_download_identity_mismatch(parsed, materialized, matched_page)
+            return str(materialized)
+        return None
 
     def _collect_pages(self, browser: Any) -> list[Any]:
         pages = []
@@ -327,20 +428,22 @@ class Downloader:
 
     def _find_matching_page(self, pages: list[Any], parsed: ParsedInput) -> Any | None:
         best_page = None
-        best_score = 0
+        best_result: PageMatchResult | None = None
         for page in pages:
             try:
                 candidate_url = page.url or ""
                 title = page.title()
             except Exception:
                 continue
-            score = self._page_match_score(page_url=candidate_url, page_title=title, parsed=parsed)
-            if score > best_score:
-                best_score = score
+            result = self._evaluate_page_match(page_url=candidate_url, page_title=title, parsed=parsed)
+            if not result.reuse_allowed:
+                continue
+            if best_result is None or result.score > best_result.score:
+                best_result = result
                 best_page = page
-        return best_page if best_score >= 2 else None
+        return best_page
 
-    def _click_pdf_download(self, page: Any):
+    def _click_pdf_download(self, page: Any) -> bool:
         selectors = [
             "[aria-label='Download']",
             "[title='Download']",
@@ -356,47 +459,163 @@ class Downloader:
         for target in targets:
             for selector in selectors:
                 try:
-                    with page.expect_download(timeout=3000) as download_info:
-                        target.locator(selector).first.click(timeout=1500)
-                    return download_info.value
+                    locator = target.locator(selector).first
+                    if locator.count() == 0:
+                        continue
+                    locator.click(timeout=1500)
+                    return True
                 except Exception:
                     continue
-        return None
+        return False
+
+    def _find_pdf_link_candidate(self, page: Any) -> str | None:
+        try:
+            candidates = page.eval_on_selector_all(
+                "a[href], button, [role='button']",
+                """
+                elements => elements.map(el => ({
+                    href: el.href || el.getAttribute('href') || null,
+                    text: (el.innerText || el.textContent || '').trim(),
+                    aria: el.getAttribute('aria-label') || '',
+                    title: el.getAttribute('title') || '',
+                }))
+                """,
+            )
+        except Exception:
+            return None
+
+        best_url = None
+        best_score = 0
+        for candidate in candidates:
+            href = candidate.get("href")
+            haystack = " ".join(
+                str(candidate.get(key) or "") for key in ("text", "aria", "title", "href")
+            ).lower()
+            if not href:
+                continue
+            score = 0
+            if "viewmedia" in href.lower() or "view_article" in href.lower():
+                score += 5
+            if "pdf" in haystack:
+                score += 4
+            if "get pdf" in haystack or "pdf article" in haystack or "download pdf" in haystack:
+                score += 4
+            if "full text" in haystack:
+                score += 2
+            if score > best_score:
+                best_score = score
+                best_url = href
+        return best_url if best_score >= 4 else None
+
+    def _browserish_headers(self) -> dict[str, str]:
+        return {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        }
+
+    def _is_downloadable_pdf_url(self, url: str | None) -> bool:
+        lowered = (url or "").lower()
+        return lowered.endswith(".pdf") or "directpdfaccess" in lowered or "/pdf" in lowered
+
+    def _stabilize_pdf_candidate_page(
+        self,
+        page: Any,
+        parsed: ParsedInput,
+        settle_attempts: int = 4,
+        settle_delay_ms: int = 1000,
+    ) -> tuple[Path | None, set[Path], bool]:
+        existing_files: set[Path] = {path.resolve() for path in self.config.download_dir.glob("*")}
+        for attempt in range(settle_attempts):
+            direct_pdf = self._try_materialize_direct_pdf_page(page, parsed)
+            if direct_pdf is not None:
+                return direct_pdf, existing_files, False
+            self._prepare_download_behavior(page)
+            existing_files = {path.resolve() for path in self.config.download_dir.glob("*")}
+            if self._click_pdf_download(page):
+                return None, existing_files, True
+            if attempt < settle_attempts - 1:
+                page.wait_for_timeout(settle_delay_ms)
+        direct_pdf = self._try_materialize_direct_pdf_page(page, parsed)
+        if direct_pdf is not None:
+            return direct_pdf, existing_files, False
+        return None, existing_files, False
+
+    def _materialize_direct_pdf_page(self, page: Any, parsed: ParsedInput) -> Path | None:
+        if not self._is_downloadable_pdf_url(getattr(page, "url", None)):
+            return None
+        target = self._target_pdf_path(parsed, None, page.url)
+        materialized = self._materialize_url_download(page.url, target)
+        self._raise_if_download_identity_mismatch(parsed, materialized, page)
+        return materialized
+
+    def _try_materialize_direct_pdf_page(self, page: Any, parsed: ParsedInput) -> Path | None:
+        try:
+            return self._materialize_direct_pdf_page(page, parsed)
+        except Exception:
+            return None
+
+    def _materialize_url_download(self, url: str, target: Path) -> Path:
+        request = Request(url, headers=self._browserish_headers())
+        with urlopen(request, timeout=30) as response:
+            payload = response.read()
+        if not payload.startswith(b"%PDF"):
+            raise RuntimeError(f"Resolved PDF URL did not return PDF bytes: {url}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        return target
 
     def _page_matches(self, page_url: str, page_title: str | None, parsed: ParsedInput) -> bool:
-        return self._page_match_score(page_url=page_url, page_title=page_title, parsed=parsed) >= 2
+        return self._evaluate_page_match(page_url=page_url, page_title=page_title, parsed=parsed).reuse_allowed
 
     def _page_match_score(self, page_url: str, page_title: str | None, parsed: ParsedInput) -> int:
-        title = normalize_title(page_title) or ""
-        url = (page_url or "").lower()
-        url_tokens = self._identifier_tokens(url)
+        return self._evaluate_page_match(page_url=page_url, page_title=page_title, parsed=parsed).score
+
+    def _evaluate_page_match(self, page_url: str, page_title: str | None, parsed: ParsedInput) -> PageMatchResult:
+        normalized_title = normalize_title(page_title) or ""
+        page_text = " ".join(part for part in [normalized_title, unquote((page_url or "").lower())] if part)
+        evidence: list[str] = []
         score = 0
-        if parsed.doi:
-            doi = parsed.doi.lower()
-            if doi in url or doi in title:
-                score += 4
-            elif doi.replace("/", "") in url.replace("/", ""):
-                score += 3
+
+        doi_match = False
+        if parsed.doi and self._text_contains_doi(page_text, parsed.doi):
+            evidence.append("doi")
+            score += 100
+            doi_match = True
+
+        url_match = False
         if parsed.url:
-            normalized_input_url = self._normalized_page_url(parsed.url)
-            normalized_page_url = self._normalized_page_url(page_url)
-            if normalized_input_url == normalized_page_url:
-                score += 4
-            elif normalized_input_url and normalized_input_url in normalized_page_url:
-                score += 3
-        if parsed.title:
-            title_words = [word for word in (normalize_title(parsed.title) or "").split() if len(word) > 3]
-            title_hits = sum(word in title or word in url for word in title_words[:8])
-            if title_hits >= min(3, len(title_words[:8]) or 0):
-                score += 3
-            elif title_hits >= min(2, len(title_words[:8]) or 0):
-                score += 2
-        parsed_ids = self._identifier_tokens(parsed.url) | self._identifier_tokens(parsed.doi)
-        if parsed_ids and parsed_ids.intersection(url_tokens):
+            url_match = self._urls_strongly_match(parsed.url, page_url)
+            if url_match:
+                evidence.append("url")
+                score += 90
+
+        title_strength = self._title_match_strength(parsed.title, page_title)
+        if title_strength >= 3:
+            evidence.append("title_strong")
+            score += 35
+        elif title_strength == 2:
+            evidence.append("title_partial")
+            score += 10
+
+        if parsed.publisher_hint and parsed.publisher_hint in (page_url or "").lower():
+            evidence.append("publisher")
             score += 2
-        if parsed.publisher_hint and parsed.publisher_hint in url:
-            score += 1
-        return score
+
+        identifier_overlap = self._identifier_tokens(parsed.url) | self._identifier_tokens(parsed.doi)
+        overlap_count = len(identifier_overlap.intersection(self._identifier_tokens(page_url)))
+        if overlap_count:
+            evidence.append(f"identifier_overlap:{overlap_count}")
+            score += min(overlap_count, 3)
+
+        reuse_allowed = False
+        if parsed.doi:
+            reuse_allowed = doi_match or url_match
+        elif parsed.url:
+            reuse_allowed = url_match
+        else:
+            reuse_allowed = title_strength >= 3
+
+        return PageMatchResult(score=score, reuse_allowed=reuse_allowed, evidence=evidence)
 
     def _normalized_page_url(self, value: str | None) -> str:
         if not value:
@@ -420,6 +639,174 @@ class Downloader:
                     tokens.add(cleaned)
         return tokens
 
+    def _normalize_doi_token(self, value: str | None) -> str | None:
+        normalized = (value or "").strip().lower().rstrip(".,;)]")
+        return normalized or None
+
+    def _text_contains_doi(self, text: str, doi: str) -> bool:
+        normalized_doi = self._normalize_doi_token(doi)
+        if not normalized_doi or not text:
+            return False
+        for match in DOI_PATTERN.finditer(text):
+            if self._normalize_doi_token(match.group(0)) == normalized_doi:
+                return True
+        return False
+
+    def _urls_strongly_match(self, left: str | None, right: str | None) -> bool:
+        normalized_left = self._normalized_page_url(left)
+        normalized_right = self._normalized_page_url(right)
+        if not normalized_left or not normalized_right:
+            return False
+        if normalized_left == normalized_right:
+            return True
+        parsed_left = urlparse(normalized_left)
+        parsed_right = urlparse(normalized_right)
+        if parsed_left.netloc != parsed_right.netloc:
+            return False
+        left_path = parsed_left.path.rstrip("/")
+        right_path = parsed_right.path.rstrip("/")
+        if not left_path or not right_path:
+            return False
+        if left_path == right_path:
+            return True
+        return False
+
+    def _distinctive_title_tokens(self, title: str | None) -> list[str]:
+        normalized = normalize_title(title) or ""
+        return [token for token in normalized.split() if len(token) >= 5 and token not in GENERIC_TITLE_WORDS]
+
+    def _text_contains_normalized_title(self, requested_title: str | None, observed_text: str | None) -> bool:
+        normalized_requested = normalize_title(requested_title) or ""
+        normalized_observed = normalize_title(observed_text) or ""
+        if not normalized_requested or not normalized_observed:
+            return False
+        return normalized_requested in normalized_observed
+
+    def _title_match_strength(self, requested_title: str | None, observed_title: str | None) -> int:
+        requested_tokens = self._distinctive_title_tokens(requested_title)
+        observed_normalized = normalize_title(observed_title) or ""
+        if not requested_tokens or not observed_normalized:
+            return 0
+        matches = sum(1 for token in requested_tokens if token in observed_normalized)
+        coverage = matches / len(requested_tokens)
+        if len(requested_tokens) >= 3 and matches >= 3 and coverage >= 0.6:
+            return 3
+        if len(requested_tokens) >= 2 and matches >= 2 and coverage >= 0.5:
+            return 2
+        return 0
+
+    def _extract_pdf_identity(self, pdf_path: Path) -> tuple[str | None, str | None]:
+        observed_title: str | None = None
+        observed_doi: str | None = None
+
+        if shutil.which("pdfinfo"):
+            try:
+                result = subprocess.run(
+                    ["pdfinfo", str(pdf_path)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                if result.stdout:
+                    for line in result.stdout.splitlines():
+                        if line.lower().startswith("title:"):
+                            candidate = line.split(":", 1)[1].strip()
+                            if candidate:
+                                observed_title = candidate
+                                break
+            except Exception:
+                pass
+
+        try:
+            data = pdf_path.read_bytes()[:262144]
+        except Exception:
+            data = b""
+        text = data.decode("latin-1", errors="ignore")
+        if observed_title is None:
+            title_match = re.search(r"/Title\s*\((.*?)\)", text, re.IGNORECASE | re.DOTALL)
+            if title_match:
+                candidate = " ".join(title_match.group(1).split())
+                if candidate:
+                    observed_title = candidate
+        doi_match = DOI_PATTERN.search(text)
+        if doi_match:
+            observed_doi = doi_match.group(0).lower().rstrip(".,;)]")
+        return observed_title, observed_doi
+
+    def _extract_pdf_text(self, pdf_path: Path, max_chars: int = 20000) -> str:
+        if shutil.which("pdftotext"):
+            try:
+                result = subprocess.run(
+                    ["pdftotext", "-f", "1", "-l", "2", str(pdf_path), "-"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                if result.stdout:
+                    return result.stdout[:max_chars]
+            except Exception:
+                pass
+        try:
+            return pdf_path.read_bytes()[:max_chars].decode("latin-1", errors="ignore")
+        except Exception:
+            return ""
+
+    def _verify_downloaded_pdf_identity(self, parsed: ParsedInput, pdf_path: Path) -> PdfIdentityCheck:
+        observed_title, observed_doi = self._extract_pdf_identity(pdf_path)
+        extracted_text = self._extract_pdf_text(pdf_path)
+        normalized_observed_doi = self._normalize_doi_token(observed_doi)
+        normalized_requested_doi = self._normalize_doi_token(parsed.doi)
+        if normalized_requested_doi:
+            if normalized_observed_doi == normalized_requested_doi:
+                return PdfIdentityCheck(True, "Matched requested DOI in downloaded PDF", observed_title, normalized_observed_doi)
+            if normalized_observed_doi:
+                return PdfIdentityCheck(
+                    False,
+                    f"expected DOI {parsed.doi} but observed {normalized_observed_doi}",
+                    observed_title,
+                    normalized_observed_doi,
+                )
+            if parsed.title and self._text_contains_normalized_title(parsed.title, extracted_text):
+                return PdfIdentityCheck(
+                    True,
+                    "Matched requested title in extracted PDF text after DOI was unavailable",
+                    observed_title or parsed.title,
+                    None,
+                )
+            return PdfIdentityCheck(
+                False,
+                "downloaded PDF did not expose the requested DOI or a strong title match in extracted text",
+                observed_title,
+                None,
+            )
+
+        title_strength = self._title_match_strength(parsed.title, observed_title)
+        if parsed.title and title_strength >= 3:
+            return PdfIdentityCheck(True, "Matched requested title in downloaded PDF", observed_title, normalized_observed_doi)
+        if parsed.title and self._text_contains_normalized_title(parsed.title, extracted_text):
+            return PdfIdentityCheck(True, "Matched requested title in extracted PDF text", observed_title or parsed.title, normalized_observed_doi)
+        if observed_title:
+            return PdfIdentityCheck(False, f"title mismatch for requested paper: observed '{observed_title}'", observed_title, normalized_observed_doi)
+        return PdfIdentityCheck(False, "downloaded PDF did not expose a matching DOI or strong title", observed_title, normalized_observed_doi)
+
+    def _raise_if_download_identity_mismatch(self, parsed: ParsedInput, pdf_path: Path, page: Any) -> None:
+        identity = self._verify_downloaded_pdf_identity(parsed, pdf_path)
+        if identity.ok:
+            return
+        raise RuntimeError(
+            "Downloaded PDF identity mismatch: "
+            f"target_doi={parsed.doi or 'n/a'}; "
+            f"target_title={parsed.title or 'n/a'}; "
+            f"observed_doi={identity.observed_doi or 'n/a'}; "
+            f"observed_title={identity.observed_title or 'n/a'}; "
+            f"page_url={getattr(page, 'url', None) or 'n/a'}; "
+            f"page_title={page.title() or 'n/a'}; "
+            f"pdf_path={pdf_path}; "
+            f"reason={identity.reason}"
+        )
+
     def _prepare_download_behavior(self, page: Any) -> None:
         try:
             session = page.context.new_cdp_session(page)
@@ -435,13 +822,28 @@ class Downloader:
         except Exception:
             return
 
+    def _materialize_clicked_download(self, target: Path, existing_files: set[Path], timeout_seconds: int = 30) -> Path:
+        deadline = time.time() + timeout_seconds
+        seen_files = set(existing_files)
+        while time.time() < deadline:
+            candidate = self._find_native_download(seen_files, suggested_name=None)
+            if candidate is not None:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if candidate.resolve() != target.resolve():
+                    shutil.copy2(candidate, target)
+                if self._is_pdf_file(target):
+                    return target
+                seen_files.add(candidate.resolve())
+            time.sleep(0.5)
+        raise RuntimeError("Chrome reported a download click, but no non-empty PDF was materialized")
+
     def _materialize_download(self, download: Any, target: Path, existing_files: set[Path], timeout_seconds: int = 30) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             download.save_as(str(target))
         except Exception:
             pass
-        if target.exists() and target.stat().st_size > 0:
+        if self._is_pdf_file(target):
             return target
 
         try:
@@ -460,20 +862,29 @@ class Downloader:
                 return target
             time.sleep(0.5)
 
-        if target.exists() and target.stat().st_size > 0:
+        if self._is_pdf_file(target):
             return target
         raise RuntimeError("Chrome reported a download, but no non-empty PDF was materialized")
+
+    def _is_pdf_file(self, path: Path) -> bool:
+        try:
+            if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+                return False
+            with path.open("rb") as handle:
+                return handle.read(4) == b"%PDF"
+        except Exception:
+            return False
 
     def _find_native_download(self, existing_files: set[Path], suggested_name: str | None) -> Path | None:
         if suggested_name:
             candidate = self.config.download_dir / suggested_name
-            if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0:
+            if self._is_pdf_file(candidate):
                 return candidate
         for path in sorted(self.config.download_dir.glob("*"), key=lambda item: item.stat().st_mtime, reverse=True):
             resolved = path.resolve()
             if resolved in existing_files or path.suffix == ".crdownload" or not path.is_file():
                 continue
-            if path.stat().st_size > 0:
+            if self._is_pdf_file(path):
                 return path
         return None
 
