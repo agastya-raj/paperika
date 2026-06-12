@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 from .config import PaperikaConfig
 from .db import Database, normalize_title
 from .models import ManualIntervention, ParsedInput, LocateCandidate
-from .normalize import infer_input, normalize_url
+from .normalize import infer_input, normalize_url, is_probable_pdf_url, is_probable_viewer_url, detect_publisher
 from .notifications import NotificationEvent, build_notification_event, emit_notification_event
 from .retry import next_retry_at, should_retry
 
@@ -123,11 +123,22 @@ class Downloader:
         )
         return {"request_id": request_id, "paper_id": paper_id, "status": "queued"}
 
-    def process_request(self, request_id: int) -> DownloadOutcome:
+    def process_request(self, request_id: int, browser: Any | None = None) -> DownloadOutcome:
         request_row = self.db.get_request(request_id)
         if request_row is None:
             raise KeyError(f"Unknown request id {request_id}")
         parsed = infer_input(request_row["raw_input"])
+        # Use stored inferred_url when raw_input lacked a URL (e.g. plain DOI)
+        if not parsed.url and request_row["inferred_url"]:
+            parsed = ParsedInput(
+                raw_input=parsed.raw_input,
+                title=parsed.title,
+                doi=parsed.doi,
+                url=request_row["inferred_url"],
+                probable_pdf=is_probable_pdf_url(request_row["inferred_url"]),
+                probable_viewer=is_probable_viewer_url(request_row["inferred_url"]),
+                publisher_hint=detect_publisher(request_row["inferred_url"]),
+            )
         previous_status = request_row["status"]
         paper_id = request_row["paper_id"]
         if previous_status in {"completed_deduped", "downloaded"} and not request_row["force_redownload"]:
@@ -174,7 +185,13 @@ class Downloader:
                 )
 
         try:
-            outcome = self._download_with_fallback(parsed, request_id=request_id, paper_id=paper_id, attempt_number=attempt_number)
+            outcome = self._download_with_fallback(
+                parsed,
+                request_id=request_id,
+                paper_id=paper_id,
+                attempt_number=attempt_number,
+                browser=browser,
+            )
             if outcome.local_pdf_path and outcome.paper_id:
                 self.db.mark_paper_downloaded(outcome.paper_id, outcome.local_pdf_path)
                 self.db.update_request_status(request_id, "downloaded", attempt_count=attempt_number, paper_id=outcome.paper_id)
@@ -285,10 +302,10 @@ class Downloader:
                 ),
             )
 
-    def retry_pending(self) -> list[DownloadOutcome]:
+    def retry_pending(self, browser: Any | None = None) -> list[DownloadOutcome]:
         results = []
         for request in self.db.list_retryable_requests():
-            results.append(self.process_request(int(request["id"])))
+            results.append(self.process_request(int(request["id"]), browser=browser))
         return results
 
     def _ensure_paper_record(self, parsed: ParsedInput) -> int:
@@ -304,7 +321,14 @@ class Downloader:
         )
         return self.db.upsert_located_paper(candidate)
 
-    def _download_with_fallback(self, parsed: ParsedInput, request_id: int, paper_id: int | None, attempt_number: int) -> DownloadOutcome:
+    def _download_with_fallback(
+        self,
+        parsed: ParsedInput,
+        request_id: int,
+        paper_id: int | None,
+        attempt_number: int,
+        browser: Any | None = None,
+    ) -> DownloadOutcome:
         if parsed.doi and not parsed.url:
             resolved = self._resolve_doi(parsed.doi)
             if resolved:
@@ -312,7 +336,7 @@ class Downloader:
                 parsed.probable_pdf = parsed.probable_pdf or resolved.lower().endswith(".pdf")
                 parsed.probable_viewer = parsed.probable_viewer or "pdf" in resolved.lower()
 
-        with self._connected_local_browser() as browser:
+        if browser is not None:
             chrome_result = self._download_via_browser(
                 browser,
                 parsed,
@@ -340,6 +364,35 @@ class Downloader:
                         if paper_id is None:
                             paper_id = self._ensure_paper_record(parsed)
                         return DownloadOutcome(request_id, paper_id, "downloaded", "Resolved DOI and used local Chrome", chrome_result, attempt_number=attempt_number)
+        else:
+            with self._connected_local_browser() as connected_browser:
+                chrome_result = self._download_via_browser(
+                    connected_browser,
+                    parsed,
+                    request_id=request_id,
+                    attempt_number=attempt_number,
+                )
+                if chrome_result:
+                    if paper_id is None:
+                        paper_id = self._ensure_paper_record(parsed)
+                    return DownloadOutcome(request_id, paper_id, "downloaded", "Downloaded via local Chrome", chrome_result, attempt_number=attempt_number)
+
+                if parsed.doi:
+                    resolved = self._resolve_doi(parsed.doi)
+                    if resolved and self._normalized_page_url(resolved) != self._normalized_page_url(parsed.url):
+                        parsed.url = resolved
+                        parsed.probable_pdf = parsed.probable_pdf or resolved.lower().endswith(".pdf")
+                        parsed.probable_viewer = parsed.probable_viewer or "pdf" in resolved.lower()
+                        chrome_result = self._download_via_browser(
+                            connected_browser,
+                            parsed,
+                            request_id=request_id,
+                            attempt_number=attempt_number,
+                        )
+                        if chrome_result:
+                            if paper_id is None:
+                                paper_id = self._ensure_paper_record(parsed)
+                            return DownloadOutcome(request_id, paper_id, "downloaded", "Resolved DOI and used local Chrome", chrome_result, attempt_number=attempt_number)
 
         raise RuntimeError("Unable to find or open a matching local Chrome tab/viewer for this paper")
 
@@ -761,6 +814,16 @@ class Downloader:
         if normalized_requested_doi:
             if normalized_observed_doi == normalized_requested_doi:
                 return PdfIdentityCheck(True, "Matched requested DOI in downloaded PDF", observed_title, normalized_observed_doi)
+            # Optica/JOCN PDFs can expose a license DOI (e.g. 10.1364/oa_license_v2)
+            # in low-level PDF bytes before the article DOI appears in rendered text.
+            # Trust the rendered text if it contains the exact requested DOI.
+            if normalized_requested_doi in extracted_text.lower():
+                return PdfIdentityCheck(
+                    True,
+                    "Matched requested DOI in extracted PDF text despite non-article DOI in PDF metadata/bytes",
+                    observed_title,
+                    normalized_requested_doi,
+                )
             if normalized_observed_doi:
                 return PdfIdentityCheck(
                     False,
