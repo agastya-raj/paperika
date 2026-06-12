@@ -22,16 +22,23 @@ EXEC_WALL_SECONDS = 240
 KILL_GRACE_SECONDS = 15
 
 # Final-message JSON Schema (--output-schema). Forces the executor's last message
-# into the shape the bridge parses.
+# into the shape the bridge parses. OpenAI strict structured outputs require
+# additionalProperties=false, every property listed in required, and explicit
+# types — a non-conforming schema fails the turn instantly (invalid_json_schema
+# 400) before any browsing happens.
 OUTCOME_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "outcome": {"enum": ["downloaded", "throttled", "paywalled_no_access", "bot_wall", "gave_up"]},
+        "outcome": {
+            "type": "string",
+            "enum": ["downloaded", "throttled", "paywalled_no_access", "bot_wall", "gave_up"],
+        },
         "file_path": {"type": ["string", "null"]},
         "final_url": {"type": ["string", "null"]},
         "notes": {"type": "string"},
     },
-    "required": ["outcome", "notes"],
+    "required": ["outcome", "file_path", "final_url", "notes"],
+    "additionalProperties": False,
 }
 
 # Static goal prompt. The ONLY interpolated value is {run_dir} (bridge-generated);
