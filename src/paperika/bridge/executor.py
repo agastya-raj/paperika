@@ -30,6 +30,10 @@ KILL_GRACE_SECONDS = 15
 # could shadow the local CDP Chrome; disable them for every bridge invocation.
 MCP_OFF: list[str] = ["-c", "mcp_servers={}"]
 
+# Fast mode (user request): low reasoning effort cuts the ~35s/turn latency,
+# buying more exploration turns inside EXEC_WALL_SECONDS.
+REASONING_FAST: list[str] = ["-c", 'model_reasoning_effort="low"']
+
 # Final-message JSON Schema (--output-schema). Forces the executor's last message
 # into the shape the bridge parses. OpenAI strict structured outputs require
 # additionalProperties=false, every property listed in required, and explicit
@@ -86,6 +90,15 @@ test: if the article's full text is rendered on the page, or a "PDF" /
 "View PDF" / "Download PDF" link is present, access is granted — proceed to
 the PDF. Classify paywalled_no_access only when the full text is absent AND
 the PDF link is missing or itself lands on a purchase/login form.
+
+Finding the PDF: on a full-text HTML page the article-level PDF link is
+typically labeled "PDF" / "View PDF" / "Download PDF", near the title or in
+a toolbar; per-figure "Download Full Size | PDF" links prove the article PDF
+exists — keep looking for the article-level link while navigation budget
+remains; do NOT classify paywalled from a page whose full text is rendered.
+If a page says the PDF "will open shortly" or similar, the download IS being
+delivered: wait up to 60 seconds, polling /home/agastya/Downloads/papers for
+a new .pdf file, before classifying anything.
 
 Hard rules:
 - At most 6 page navigations on publisher domains, and at most ONE download
@@ -250,6 +263,7 @@ def build_argv(
         "exec",
         "--skip-git-repo-check",
         *MCP_OFF,
+        *REASONING_FAST,
         *sandbox_flags(sandbox_mode),
         "-C",
         str(run_dir),
