@@ -206,7 +206,7 @@ if run_dir:
 print(json.dumps({"type": "turn.completed"}))
 if last:
     with open(last, "w") as fh:
-        fh.write("TITLE=Chrome\n")
+        fh.write("CDP_BROWSER=Chrome/147.0.7727.55\nTITLE=About Version\n")
 sys.exit(0)
 """
 
@@ -227,7 +227,7 @@ if is_bypass:
     print(json.dumps({"type": "turn.completed"}))
     if last:
         with open(last, "w") as fh:
-            fh.write("TITLE=Chrome\n")
+            fh.write("CDP_BROWSER=Chrome/147.0.7727.55\nTITLE=About Version\n")
     sys.exit(0)
 else:
     # variant 1 fails (not auth) — simulate sandbox blocking

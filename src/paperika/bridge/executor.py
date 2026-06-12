@@ -14,12 +14,18 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import time
 
 CODEX_BIN = "codex"
 EXEC_WALL_SECONDS = 240
 KILL_GRACE_SECONDS = 15
+
+# MCP servers from ~/.codex/config.toml (browserbase, brave_search, ...) are
+# irrelevant to downloads, add ~2.4M prompt tokens per run, and a cloud browser
+# could shadow the local CDP Chrome; disable them for every bridge invocation.
+MCP_OFF: list[str] = ["-c", "mcp_servers={}"]
 
 # Final-message JSON Schema (--output-schema). Forces the executor's last message
 # into the shape the bridge parses. OpenAI strict structured outputs require
@@ -84,15 +90,21 @@ saved PDF or null), final_url, notes (one short paragraph of what happened,
 including anything suspicious you ignored)."""
 
 # The chrome://version selftest prompt (innocuous; never a publisher page).
+# The CDP_BROWSER line is the pass marker: its value comes from the live CDP
+# endpoint, so a blocked/failed execution narrative cannot fabricate it the way
+# a bare "TITLE=" prefix could (the v1 false-pass: codex printed
+# "TITLE=Execution blocked (bwrap ...)" and satisfied the old substring check).
 SELFTEST_PROMPT = (
-    "Use the Python at /home/agastya/paperika/.venv/bin/python with the playwright "
-    "package (playwright.sync_api). Connect over CDP to the Chrome already running "
-    'at http://127.0.0.1:9224 using p.chromium.connect_over_cdp("http://127.0.0.1:9224"). '
+    "Use the Python at /home/agastya/paperika/.venv/bin/python. Step 1: fetch "
+    "http://127.0.0.1:9224/json/version with urllib and print exactly one line: "
+    "CDP_BROWSER=<the Browser field from the JSON>. Step 2: with the playwright "
+    "package (playwright.sync_api), connect over CDP using "
+    'p.chromium.connect_over_cdp("http://127.0.0.1:9224"). '
     "Open a NEW page in the existing browser context (do not launch a new browser). "
     "Navigate that page to chrome://version, then print exactly one line: "
     "TITLE=<the page.title()>. Then close only your own page and the playwright "
     "connection (do not close the browser). Do all of this by writing and running a "
-    "short python script. Report the printed TITLE line and nothing else."
+    "short python script. Report the two printed lines and nothing else."
 )
 
 
@@ -224,6 +236,7 @@ def build_argv(
         CODEX_BIN,
         "exec",
         "--skip-git-repo-check",
+        *MCP_OFF,
         *sandbox_flags(sandbox_mode),
         "-C",
         str(run_dir),
@@ -334,7 +347,14 @@ def _selftest_passed(result: ExecResult) -> bool:
         return False
     if not _turn_completed(result.events):
         return False
-    return "TITLE=" in (result.raw_last_message or "")
+    msg = result.raw_last_message or ""
+    # Both markers required: CDP_BROWSER proves the venv python ran and reached
+    # the loopback CDP socket (its value only exists at /json/version); the
+    # Version-bearing TITLE proves the playwright drive itself.
+    return bool(
+        re.search(r"CDP_BROWSER=(Headless)?Chrome/\d+", msg)
+        and re.search(r"TITLE=.*Version", msg)
+    )
 
 
 async def run_selftest(run_dir: Path, *, env: dict[str, str] | None = None) -> SelftestResult:
