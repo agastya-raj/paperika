@@ -1,0 +1,29 @@
+[Unit]
+Description=paperika institutional-download bridge (KC)
+# Wants= (NOT Requires=) on paperika-chrome — LOAD-BEARING: systemd propagates
+# explicit restarts through Requires= to dependents, and the bridge itself runs
+# `systemctl restart paperika-chrome` from INSIDE request handlers (chrome.py
+# wedge escalation + idle recycle). With Requires= that command would SIGTERM the
+# bridge mid-handler, kill the in-flight HTTP response, and make the first download
+# after every 24h recycle die — guaranteed. With Wants= the bridge survives chrome
+# restarts and already degrades gracefully via 503 chrome_down when chrome is down.
+Wants=paperika-chrome.service network-online.target
+After=paperika-chrome.service network-online.target docker.service
+
+[Service]
+User=agastya
+Group=agastya
+WorkingDirectory=/home/agastya/paperika
+# CODEX_HOME intentionally unset -> codex uses /home/agastya/.codex (host login).
+# PAPERIKA_BRIDGE_TOKEN comes from a root-owned 0600 drop-in (10-token.conf), never this file.
+ExecStart=/home/agastya/paperika/.venv/bin/uvicorn paperika.bridge.app:app \
+  --host 172.17.0.1 --port 8103 --workers 1
+Restart=always
+RestartSec=5
+# KillMode is deliberately LEFT AT THE DEFAULT (control-group): the codex executor
+# is spawned with start_new_session=True (own session/pgid), but cgroup membership
+# is inherited regardless of setsid, so on unit stop/restart systemd reaps codex and
+# any python it spawned. Do NOT set KillMode=process.
+
+[Install]
+WantedBy=multi-user.target

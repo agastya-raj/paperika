@@ -1,0 +1,25 @@
+[Unit]
+Description=Managed headful Chrome (CDP 127.0.0.1:9224) for the paperika bridge
+Requires=paperika-xvfb.service
+After=paperika-xvfb.service
+
+[Service]
+User=agastya
+Group=agastya
+Environment=DISPLAY=:99
+ExecStart=/usr/bin/google-chrome \
+  --remote-debugging-port=9224 \
+  --remote-debugging-address=127.0.0.1 \
+  --user-data-dir=/home/agastya/.hermes/paper_pipeline/chrome_profile \
+  --no-first-run --no-default-browser-check \
+  --disable-session-crashed-bubble --disable-features=TranslateUI \
+  --window-size=1920,1080 \
+  about:blank
+Restart=always
+RestartSec=5
+# NO RuntimeMaxSec. A unit-level recycle can fire mid-download. Periodic
+# recycling is done by the BRIDGE, lock-guarded and idle-only (chrome.py
+# idle_recycle_if_stale), so it can never interrupt a live executor run.
+
+[Install]
+WantedBy=multi-user.target
