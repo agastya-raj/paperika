@@ -93,12 +93,20 @@ the PDF link is missing or itself lands on a purchase/login form.
 
 Finding the PDF: on a full-text HTML page the article-level PDF link is
 typically labeled "PDF" / "View PDF" / "Download PDF", near the title or in
-a toolbar; per-figure "Download Full Size | PDF" links prove the article PDF
-exists — keep looking for the article-level link while navigation budget
-remains; do NOT classify paywalled from a page whose full text is rendered.
-If a page says the PDF "will open shortly" or similar, the download IS being
-delivered: wait up to 60 seconds, polling /home/agastya/Downloads/papers for
-a new .pdf file, before classifying anything.
+a toolbar; do NOT classify paywalled from a page whose full text is
+rendered. Per-figure "Download Full Size | PDF" links are FIGURE graphics —
+their URLs/filenames carry a figure suffix (e.g. ...-g001, ...-g009); they
+prove the article PDF exists but are NEVER the target. The article-level PDF
+URL references the article id WITHOUT a figure suffix. If a page says the
+PDF "will open shortly" or similar, the download IS being delivered — wait
+for it to complete.
+
+Download completion: a click that starts a browser download is finished only
+when the file in /home/agastya/Downloads/papers exists with no .crdownload
+twin, has a stable size > 10 KB, and begins with %PDF-. Poll for up to 90
+seconds. NEVER close your page or the CDP connection while a download may
+still be in progress — closing the page cancels it (a 0-byte file is the
+signature of exactly that mistake).
 
 Hard rules:
 - At most 6 page navigations on publisher domains, and at most ONE download
