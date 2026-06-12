@@ -19,7 +19,10 @@ import signal
 import time
 
 CODEX_BIN = "codex"
-EXEC_WALL_SECONDS = 240
+# 240 was too tight: run 62 burned 204s on navigation alone, and run 63 was
+# killed AT Optica's "your PDF will open shortly" delivery page. Each codex
+# turn costs ~35s; the full navigate→judge→download→report chain needs slack.
+EXEC_WALL_SECONDS = 480
 KILL_GRACE_SECONDS = 15
 
 # MCP servers from ~/.codex/config.toml (browserbase, brave_search, ...) are
