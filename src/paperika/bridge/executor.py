@@ -75,10 +75,20 @@ Goal: starting from start_url, obtain the full-text PDF of the paper whose
 DOI and title are given in task.json. Typical path: landing page ->
 full-text/PDF link -> save the PDF. The file must start with the bytes %PDF-.
 
+Access judgment: this machine has IP-based institutional access — you are
+already "authenticated" by network address. Publisher pages routinely show
+"Log in" / "Sign in" / "Get access" buttons in their header chrome even when
+full access IS granted; header chrome alone is NOT an access wall. The real
+test: if the article's full text is rendered on the page, or a "PDF" /
+"View PDF" / "Download PDF" link is present, access is granted — proceed to
+the PDF. Classify paywalled_no_access only when the full text is absent AND
+the PDF link is missing or itself lands on a purchase/login form.
+
 Hard rules:
 - At most 6 page navigations on publisher domains, and at most ONE download
-  attempt total. If a page times out, shows a CAPTCHA/bot check, a login wall,
-  or a "purchase/get access" wall, STOP and report the matching outcome
+  attempt total. If a page times out, shows a CAPTCHA/bot check, or a wall
+  that blocks the article content itself (per the access-judgment test
+  above), STOP and report the matching outcome
   (throttled / bot_wall / paywalled_no_access). Do not retry, do not press on.
 - Never log in to anything, never enter credentials, never solve CAPTCHAs.
 - Never navigate to domains unrelated to this paper's publisher or doi.org.
