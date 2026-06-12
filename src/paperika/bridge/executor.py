@@ -198,10 +198,19 @@ def classify(
     return ExecResult(kind="gave_up", final_url=final_url, notes=notes or "executor gave up", **base)
 
 
-def build_argv(run_dir: Path, prompt: str, sandbox_mode: str) -> list[str]:
-    """Construct the timeout-wrapped codex exec argv (§2.4)."""
+def build_argv(
+    run_dir: Path, prompt: str, sandbox_mode: str, *, with_schema: bool = True
+) -> list[str]:
+    """Construct the timeout-wrapped codex exec argv (§2.4).
+
+    ``--output-schema`` requires the schema file to exist — codex exec exits 1
+    immediately ("Failed to read output schema file") otherwise, so the flag is
+    only emitted when the caller also writes the schema (selftest does not).
+    """
     last_message = str(run_dir / "last_message.txt")
-    schema = str(run_dir / "outcome.schema.json")
+    schema_args = (
+        ["--output-schema", str(run_dir / "outcome.schema.json")] if with_schema else []
+    )
     return [
         "timeout",
         str(EXEC_WALL_SECONDS),
@@ -214,8 +223,7 @@ def build_argv(run_dir: Path, prompt: str, sandbox_mode: str) -> list[str]:
         "--json",
         "-o",
         last_message,
-        "--output-schema",
-        schema,
+        *schema_args,
         prompt,
     ]
 
@@ -248,7 +256,7 @@ async def run_codex(
     run_dir.mkdir(parents=True, exist_ok=True)
     if write_schema:
         write_outcome_schema(run_dir)
-    argv = build_argv(run_dir, prompt, sandbox_mode)
+    argv = build_argv(run_dir, prompt, sandbox_mode, with_schema=write_schema)
 
     run_env = dict(os.environ)
     if env:
@@ -258,6 +266,9 @@ async def run_codex(
     started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *argv,
+        # codex exec reads "additional input" from a non-TTY stdin; give it an
+        # immediate EOF instead of whatever handle the service inherited.
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
