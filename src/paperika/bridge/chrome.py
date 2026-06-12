@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import subprocess
+import time
 import urllib.request
 
 CDP_HOST = "127.0.0.1"
@@ -129,11 +130,20 @@ async def close_orphan_targets(cdp_http: str = CDP_HTTP) -> list[str]:
     return await loop.run_in_executor(None, _list_and_close)
 
 
-def chrome_active_since() -> datetime | None:
-    """ActiveEnterTimestamp of the chrome unit, or None if unavailable."""
+def chrome_uptime_seconds() -> float | None:
+    """Seconds the chrome unit has been active, from ActiveEnterTimestampMonotonic.
+
+    Review fix (finding 3): the previous implementation parsed the human-readable
+    ActiveEnterTimestamp string with a ``%Z`` token. On this box (Europe/Dublin)
+    systemd renders that string in local time with the ``IST`` abbreviation, which
+    strptime mis-binds to UTC — under-counting uptime by 1h in summer (idle recycle
+    fired at ~25h, not 24h) and, if ``%Z`` ever failed to parse, returning None so
+    the recycle silently never ran. The Monotonic variant is microseconds on
+    CLOCK_MONOTONIC (tz-free, DST-free); subtract it from the current monotonic
+    clock for a correct, timezone-independent uptime."""
     try:
         out = subprocess.run(
-            ["systemctl", "show", "-p", "ActiveEnterTimestamp", "--value", CHROME_UNIT],
+            ["systemctl", "show", "-p", "ActiveEnterTimestampMonotonic", "--value", CHROME_UNIT],
             capture_output=True, text=True, timeout=10, check=False,
         )
     except Exception:
@@ -141,16 +151,15 @@ def chrome_active_since() -> datetime | None:
     raw = (out.stdout or "").strip()
     if not raw:
         return None
-    # systemd format e.g. "Sat 2026-06-13 10:00:00 UTC"
-    for fmt in ("%a %Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S %Z"):
-        try:
-            dt = datetime.strptime(raw, fmt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except ValueError:
-            continue
-    return None
+    try:
+        entered_us = int(raw)
+    except ValueError:
+        return None
+    if entered_us <= 0:
+        # 0 ⇒ unit not currently active (no ActiveEnter recorded) ⇒ no recycle.
+        return None
+    now_us = time.clock_gettime(time.CLOCK_MONOTONIC) * 1_000_000
+    return (now_us - entered_us) / 1_000_000
 
 
 def _restart_chrome_unit() -> bool:
@@ -218,11 +227,8 @@ async def idle_recycle_if_stale(*, threshold_seconds: int = IDLE_RECYCLE_SECONDS
     """Lock-guarded idle recycle (§2.3 step 5): if chrome has been up longer than
     the threshold, restart it now (lock held ⇒ never mid-download), wait for CDP.
     Returns True if a recycle happened."""
-    since = chrome_active_since()
-    if since is None:
-        return False
-    uptime = (_utc_now() - since).total_seconds()
-    if uptime < threshold_seconds:
+    uptime = chrome_uptime_seconds()
+    if uptime is None or uptime < threshold_seconds:
         return False
     loop = asyncio.get_running_loop()
     if await loop.run_in_executor(None, _restart_chrome_unit):

@@ -188,6 +188,32 @@ class Bridge:
         candidates.sort(reverse=True)
         return candidates[0][1]
 
+    def _within_download_window(
+        self, path: Path, window_start: datetime, window_end: datetime
+    ) -> bool:
+        """Containment + mtime gate for a codex-REPORTED file_path (review fix,
+        finding 1). The window locator already enforces both; the primary
+        ``downloaded`` candidate did not, so an injection-steered codex could name
+        any agastya-owned, %PDF--prefixed file anywhere on disk and have the
+        UNsandboxed bridge link it (verify-pass) or path.replace() it into
+        quarantine (verify-fail destructive primitive). Require: (a) the resolved
+        path lives under config.download_dir, and (b) its mtime falls inside the
+        run window (same grace as _locate_in_window)."""
+        try:
+            resolved = path.resolve()
+            downloads = self.config.download_dir.resolve()
+        except OSError:
+            return False
+        if downloads not in resolved.parents:
+            return False
+        try:
+            mtime = resolved.stat().st_mtime
+        except OSError:
+            return False
+        start_ts = (window_start - timedelta(seconds=SALVAGE_GRACE_SECONDS)).timestamp()
+        end_ts = (window_end + timedelta(seconds=SALVAGE_GRACE_SECONDS)).timestamp()
+        return start_ts <= mtime <= end_ts
+
     def _mechanical_gates(self, path: Path) -> bool:
         try:
             if not path.is_file():
@@ -594,10 +620,15 @@ async def _resolve_outcome(
 
     # downloaded path
     if kind == "downloaded":
+        # The codex-REPORTED file_path is trusted only after containment + window
+        # gates (review fix, finding 1): it must resolve INSIDE config.download_dir
+        # and have an mtime within the run window. Anything else (out-of-tree,
+        # stale, or a steered injection naming an arbitrary file) is discarded —
+        # never used, never quarantined — and we fall back to the window locator.
         located = None
         if exec_result.file_path:
             p = Path(exec_result.file_path)
-            if p.exists():
+            if bridge._within_download_window(p, window_start, window_end):
                 located = p
         if located is None:
             located = bridge._locate_in_window(window_start, window_end)
@@ -606,26 +637,42 @@ async def _resolve_outcome(
             attempt_id=attempt_id, final_url=exec_result.final_url, screenshot=screenshot,
             salvaged=False, run_dir=run_dir,
         )
-        if verify is not None:
+        if isinstance(verify, Response):
             return verify
-        # downloaded but verify failed ⇒ wrong_paper
-        return _finish_failure(bridge, kind="wrong_paper", request_id=request_id,
+        if verify == "verify_failed":
+            # A real, in-tree, in-window PDF was found but its identity did not
+            # match ⇒ wrong_paper (terminal). Only reachable when verification
+            # actually ran and failed.
+            return _finish_failure(bridge, kind="wrong_paper", request_id=request_id,
+                                   attempt_id=attempt_id, screenshot=screenshot,
+                                   message="downloaded PDF failed identity verification")
+        # No locatable candidate at all (codex MISREPORTED 'downloaded' — nothing
+        # was ever verified). Treat as a retryable executor failure, not a
+        # terminal wrong_paper claim (review fix, finding 4a).
+        return _finish_failure(bridge, kind="gave_up", request_id=request_id,
                                attempt_id=attempt_id, screenshot=screenshot,
-                               message="downloaded PDF failed identity verification")
+                               message="executor reported 'downloaded' but no PDF was located")
 
     # salvage pass on timeout/gave_up
     if kind in {"timeout", "gave_up"}:
         located = bridge._locate_in_window(window_start, window_end)
         if located is not None and bridge._mechanical_gates(located):
-            ok, _reason = bridge.verify_identity(doi=doi, title=title, path=located)
+            ok, reason = bridge.verify_identity(doi=doi, title=title, path=located)
             if ok:
                 salvage = await _verify_and_finish(
                     bridge, located=located, doi=doi, title=title, request_id=request_id,
                     attempt_id=attempt_id, final_url=exec_result.final_url, screenshot=screenshot,
                     salvaged=True, run_dir=run_dir,
                 )
-                if salvage is not None:
+                if isinstance(salvage, Response):
                     return salvage
+            else:
+                # Salvage candidate failed identity verify ⇒ quarantine it but KEEP
+                # the original failure outcome (design §2.6 step 4; review fix,
+                # finding 2). Otherwise the orphan sits in ~/Downloads/papers; with
+                # 558 pre-existing files the mtime window is the only guard.
+                _quarantine(located, run_dir=run_dir,
+                            reason=f"salvage candidate failed verification: {reason}")
         # salvage found nothing valid ⇒ original failure taxonomy
         return _finish_failure(bridge, kind=kind, request_id=request_id, attempt_id=attempt_id,
                                screenshot=screenshot, message=exec_result.notes or kind)
@@ -652,18 +699,21 @@ async def _verify_and_finish(
     bridge: Bridge, *, located: Path | None, doi: str, title: str, request_id: int,
     attempt_id: int, final_url: str | None, screenshot: str | None, salvaged: bool,
     run_dir: Path,
-) -> Response | None:
+) -> Response | str:
     """Run mechanical + identity gates; on pass, link + resolve + stream bytes.
-    Returns None when no valid file (caller decides wrong_paper vs original)."""
+    Returns the PDF Response on success, or a string signal the caller maps to a
+    taxonomy outcome: ``"no_candidate"`` (no valid file located — nothing verified)
+    vs ``"verify_failed"`` (a candidate was found and quarantined after failing
+    identity verification)."""
     if located is None or not bridge._mechanical_gates(located):
-        return None
+        return "no_candidate"
     ok, reason = bridge.verify_identity(doi=doi, title=title, path=located)
     if not ok:
         # Quarantine the candidate (downloaded path ⇒ wrong_paper; salvage ⇒ keep
         # the original failure). Either way move it out of the dedupe dir. The
         # caller resolves the attempt outcome (no double-resolve here).
         _quarantine(located, run_dir=Path(run_dir), reason=reason)
-        return None
+        return "verify_failed"
 
     sha = bridge._sha256(located)
     paper_id = bridge.link_paper(doi=doi, title=title, path=located, final_url=final_url)

@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import sqlite3
 import threading
+import time
 
 from fastapi.testclient import TestClient
 import pytest
@@ -777,3 +778,129 @@ def test_html_named_pdf_rejected_at_magic_gate(cfg):
     html.parent.mkdir(parents=True, exist_ok=True)
     html.write_bytes(b"<html><body>bot wall</body></html>")
     assert bridge._mechanical_gates(html) is False
+
+
+# ----------------------------------------------- finding 1: file_path gates ---
+
+
+def test_within_download_window_gate(cfg, tmp_path):
+    """Unit gate: a codex-reported path is accepted ONLY when it resolves inside
+    download_dir AND its mtime is in the run window."""
+    bridge = bridge_app.build_bridge(cfg)
+    cfg.download_dir.mkdir(parents=True, exist_ok=True)
+    w0 = _now() - timedelta(seconds=5)
+    w1 = _now()
+    inside = cfg.download_dir / "in.pdf"
+    _make_pdf(inside, doi="10.1364/x")
+    assert bridge._within_download_window(inside, w0, w1) is True
+    # outside the tree ⇒ rejected even though it exists and is a PDF
+    outside = tmp_path / "elsewhere" / "out.pdf"
+    _make_pdf(outside, doi="10.1364/x")
+    assert bridge._within_download_window(outside, w0, w1) is False
+    # inside the tree but mtime far outside the window ⇒ rejected
+    stale = cfg.download_dir / "stale.pdf"
+    _make_pdf(stale, doi="10.1364/x")
+    old = (_now() - timedelta(hours=2)).timestamp()
+    os.utime(stale, (old, old))
+    assert bridge._within_download_window(stale, w0, w1) is False
+
+
+def test_download_rejects_out_of_tree_file_path_and_never_moves_it(cfg, tmp_path, monkeypatch):
+    """Finding 1 (primary): codex REPORTS a valid %PDF- file with the right DOI but
+    located OUTSIDE download_dir. The bridge must (a) NOT serve those bytes,
+    (b) NOT quarantine/move the out-of-tree file (the destructive primitive),
+    (c) fall through to the in-window locator — which finds nothing — and resolve
+    as a retryable codex_gave_up, never wrong_paper."""
+    _seed_sandbox_mode(cfg)
+    doi = "10.1364/jocn.containment"
+    title = "Containment Target Paper"
+    # an attacker-named, agastya-owned, %PDF--prefixed file that would PASS identity
+    # verification if the bridge trusted the reported path — but it lives outside
+    # download_dir (here: a sibling temp dir).
+    outside = tmp_path / "victim" / "innocent.pdf"
+    _make_pdf(outside, doi=doi, title=title)
+    _install_stub_codex(tmp_path, monkeypatch, script_body=_STUB_DOWNLOADED)
+    monkeypatch.setenv("STUB_PDF_PATH", str(outside))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": doi, "title": title})
+    # not served, and classified retryable (codex_gave_up), NOT terminal wrong_paper
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["error_code"] == "codex_gave_up"
+    # the out-of-tree file is untouched: still present, never moved into any quarantine/
+    assert outside.exists()
+    assert not list(tmp_path.rglob("quarantine"))
+    con = _conn(cfg)
+    att = con.execute("SELECT outcome FROM paper_attempts ORDER BY id DESC LIMIT 1").fetchone()
+    assert att["outcome"] == "executor_gave_up"
+    con.close()
+
+
+def test_download_reported_no_file_is_codex_gave_up_not_wrong_paper(cfg, tmp_path, monkeypatch):
+    """Finding 4a: codex reports outcome=downloaded with NO locatable file ⇒ a
+    retryable executor failure (codex_gave_up), not terminal wrong_paper — no
+    identity verification ever ran."""
+    _seed_sandbox_mode(cfg)
+    _install_stub_codex(tmp_path, monkeypatch, script_body=_STUB_DOWNLOADED)
+    # point at a path that does not exist anywhere
+    monkeypatch.setenv("STUB_PDF_PATH", str(tmp_path / "nope" / "ghost.pdf"))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.ghost", "title": "Ghost Paper"})
+    assert resp.status_code == 502 and resp.json()["error_code"] == "codex_gave_up"
+
+
+def test_salvage_verify_fail_quarantines(cfg, tmp_path, monkeypatch):
+    """Finding 2: a salvage candidate that fails identity verify is quarantined
+    (moved out of the dedupe dir) while the original failure outcome is kept."""
+    _seed_sandbox_mode(cfg)
+    # in-window file lands during the run, but its DOI/title do NOT match the request
+    bad = cfg.download_dir / "mismatch.pdf"
+    _make_pdf(bad, doi="10.9999/unrelated", title="Totally Unrelated Words Here")
+    _install_stub_codex(tmp_path, monkeypatch, script_body=_STUB_TIMEOUT)
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.req", "title": "Requested Paper Alpha Beta"})
+    # original timeout outcome stands (not promoted to wrong_paper)
+    assert resp.status_code == 504 and resp.json()["error_code"] == "executor_timeout"
+    # the mismatched file was quarantined out of the dedupe dir
+    assert not bad.exists()
+    quarantined = list((cfg.db_path.parent / "codex_runs").rglob("quarantine/*.pdf"))
+    assert quarantined, "salvage verify-fail must quarantine the candidate"
+
+
+# ----------------------------------------- finding 4b: auth classification ---
+
+
+def test_is_auth_failure_ignores_unrelated_401(cfg):
+    """Finding 4b: a 401 substring in an unrelated error payload must NOT be
+    classified codex_auth; a genuine 401-in-auth-context still is."""
+    unrelated = [{"type": "error", "message": "HTTP 401 returned by the paper's host while fetching figures"}]
+    assert executor._is_auth_failure(unrelated, "") is False
+    genuine = [{"type": "turn.failed", "error": {"message": "401 Unauthorized: token invalid"}}]
+    assert executor._is_auth_failure(genuine, "") is True
+    revoked = [{"type": "error", "message": "refresh_token revoked"}]
+    assert executor._is_auth_failure(revoked, "") is True
+
+
+# ------------------------------------------- finding 3: chrome uptime (tz) ---
+
+
+def test_chrome_uptime_uses_monotonic(monkeypatch):
+    """Finding 3: uptime comes from ActiveEnterTimestampMonotonic vs the current
+    monotonic clock — no wall-clock/tz parsing. ~3600s entered ⇒ ~ (now-entered)."""
+    now_mono_us = int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1_000_000)
+    entered_us = now_mono_us - 3600 * 1_000_000  # 1h ago
+
+    def _show(value: str):
+        class _R:
+            stdout = value
+        return lambda *a, **k: _R()
+
+    monkeypatch.setattr(chrome.subprocess, "run", _show(str(entered_us)))
+    uptime = chrome.chrome_uptime_seconds()
+    assert uptime is not None
+    assert 3590 <= uptime <= 3650
+
+    # inactive unit (monotonic 0) ⇒ None ⇒ no recycle
+    monkeypatch.setattr(chrome.subprocess, "run", _show("0"))
+    assert chrome.chrome_uptime_seconds() is None

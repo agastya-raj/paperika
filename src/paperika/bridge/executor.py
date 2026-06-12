@@ -125,13 +125,21 @@ def _parse_events(jsonl_text: str) -> list[dict]:
     return events
 
 
+_AUTH_KEYWORDS = ("unauthorized", "authentication", "auth", "token", "login", "log in")
+
+
 def _is_auth_failure(events: list[dict], stderr: str) -> bool:
     for ev in events:
         if ev.get("type") in {"error", "turn.failed"}:
             blob = json.dumps(ev).lower()
-            if "refresh_token" in blob or "refresh token" in blob or "401" in blob:
+            if "refresh_token" in blob or "refresh token" in blob:
                 return True
             if "session has ended" in blob or "log in again" in blob:
+                return True
+            # '401' alone is too loose — an unrelated payload whose JSON happens to
+            # contain the digits 401 would be misclassified codex_auth (review fix,
+            # finding 4b). Require it alongside an auth-context keyword.
+            if "401" in blob and any(kw in blob for kw in _AUTH_KEYWORDS):
                 return True
     low = (stderr or "").lower()
     return "refresh_token" in low or "refresh token was revoked" in low
