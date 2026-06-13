@@ -74,13 +74,33 @@ Setup:
 - Use the existing browser context; OPEN A NEW PAGE for your work. Never launch
   a new browser, never close the browser or other pages, close only your own
   page and CDP connection when done.
-- Route downloads through the BROWSER: CDP Browser.setDownloadBehavior with
-  behavior "allow" and downloadPath /home/agastya/Downloads/papers. Do not
-  write files outside your working directory yourself.
+- Dismiss any cookie-consent / privacy banner FIRST (click "Accept All" /
+  "Reject All" / "Accept"): it overlays the page and silently swallows clicks
+  on the PDF link, which looks like "no download happened".
 
 Goal: starting from start_url, obtain the full-text PDF of the paper whose
-DOI and title are given in task.json. Typical path: landing page ->
-full-text/PDF link -> save the PDF. The file must start with the bytes %PDF-.
+DOI and title are given in task.json. Save it to
+/home/agastya/Downloads/papers/<sanitized-doi>.pdf. The file must start with
+the bytes %PDF-.
+
+Preferred retrieval method (works even when the publisher renders PDFs inline
+instead of triggering a browser download — the most common reason a click
+"does nothing"): find the article-level PDF link, resolve it to a URL, then
+fetch the bytes through the SAME authenticated browser session and write them
+yourself:
+  1. Locate the article PDF anchor (left sidebar / toolbar "PDF" / "PDF
+     Article" / "View PDF" / "Download PDF"). Read its href = pdf_url.
+  2. If clicking it would pass through a "your PDF will open shortly"
+     interstitial, navigate the page to pdf_url and let it settle so any
+     delivery cookie is set and page.url becomes the real media URL.
+  3. body = page.request.get(page.url).body()   # uses the page's cookies +
+     this machine's institutional IP — no separate login
+  4. If body starts with b"%PDF-" and len(body) > 10_000, write it to the
+     target path and you are DONE (outcome=downloaded, file_path=that path).
+Browser-native download via CDP Browser.setDownloadBehavior(behavior="allow",
+downloadPath=/home/agastya/Downloads/papers) is an acceptable fallback, but
+inline-rendered PDFs never fire a download event — prefer the fetch above.
+Only write PDF bytes you actually retrieved; never fabricate a file.
 
 Access judgment: this machine has IP-based institutional access — you are
 already "authenticated" by network address. Publisher pages routinely show
@@ -101,12 +121,13 @@ URL references the article id WITHOUT a figure suffix. If a page says the
 PDF "will open shortly" or similar, the download IS being delivered — wait
 for it to complete.
 
-Download completion: a click that starts a browser download is finished only
-when the file in /home/agastya/Downloads/papers exists with no .crdownload
-twin, has a stable size > 10 KB, and begins with %PDF-. Poll for up to 90
-seconds. NEVER close your page or the CDP connection while a download may
-still be in progress — closing the page cancels it (a 0-byte file is the
-signature of exactly that mistake).
+Download completion: if you used the fetch method above, the file is complete
+the moment you have written %PDF- bytes — verify it on disk and you are done.
+If you fell back to a browser download, it is finished only when the file in
+/home/agastya/Downloads/papers exists with no .crdownload twin, has a stable
+size > 10 KB, and begins with %PDF-; poll for up to 90 seconds, and NEVER
+close your page or the CDP connection while a .crdownload is still present —
+closing the page cancels it (a 0-byte file is the signature of that mistake).
 
 Hard rules:
 - At most 6 page navigations on publisher domains, and at most ONE download
