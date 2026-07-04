@@ -24,7 +24,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from paperika.bridge import app as bridge_app
-from paperika.bridge import chrome, executor, limits
+from paperika.bridge import chrome, direct_fetch, executor, limits, scripted_browser
 from paperika.config import PaperikaConfig
 
 TOKEN = "test-token-aga260"
@@ -65,6 +65,22 @@ def _ok_probe(monkeypatch):
     async def _noop_recover():
         return chrome.RecoveryResult(True, "noop")
     monkeypatch.setattr(chrome, "recover", _noop_recover)
+
+
+@pytest.fixture(autouse=True)
+def _stub_tiers(monkeypatch):
+    """Default: the deterministic ladder tiers 1/2 MISS (no_pdf) so codex-focused
+    /download tests still exercise tier 3. Ladder tests override these per-test.
+    Keeps the suite off the real network + a real browser (the tier modules would
+    otherwise touch httpx/playwright)."""
+    async def _miss_direct(**kwargs):
+        return direct_fetch.DirectFetchResult(kind="no_pdf", notes="tier-1 stub miss")
+
+    async def _miss_scripted(**kwargs):
+        return scripted_browser.ScriptedFetchResult(kind="no_pdf", notes="tier-2 stub miss")
+
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _miss_direct)
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _miss_scripted)
 
 
 def _now() -> datetime:
@@ -250,8 +266,8 @@ def test_spacing_boundary(cfg):
                 (limits.iso(_now()), limits.iso(_now())))
     rid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
     t179 = _now() - timedelta(seconds=179)
-    con.execute("INSERT INTO paper_attempts (request_id, attempt_number, status, created_at, started_at, outcome) "
-                "VALUES (?,1,'running',?,?,'running')", (rid, limits.iso(t179), limits.iso(t179)))
+    con.execute("INSERT INTO paper_attempts (request_id, attempt_number, status, strategy, created_at, started_at, outcome) "
+                "VALUES (?,1,'running','codex_bridge',?,?,'running')", (rid, limits.iso(t179), limits.iso(t179)))
     con.commit()
     d = limits.check_rate(con, now=_now())
     assert not d.allowed and d.error_code == "cooldown"
@@ -274,8 +290,8 @@ def test_daily_cap_counts_running_and_interrupted(cfg):
     outcomes = (["running"] * 5) + (["interrupted"] * 5) + (["timeout"] * 5) + (["completed"] * 5)
     for i, oc in enumerate(outcomes):
         ts = limits.iso(base + timedelta(seconds=i))
-        con.execute("INSERT INTO paper_attempts (request_id, attempt_number, status, created_at, started_at, outcome) "
-                    "VALUES (?,?,'x',?,?,?)", (rid, i + 1, ts, ts, oc))
+        con.execute("INSERT INTO paper_attempts (request_id, attempt_number, status, strategy, created_at, started_at, outcome) "
+                    "VALUES (?,?,'x','codex_bridge',?,?,?)", (rid, i + 1, ts, ts, oc))
     con.commit()
     assert limits.attempts_today(con, now=_now()) == 20
     d = limits.check_rate(con, now=_now(), min_spacing_seconds=0)
@@ -490,11 +506,16 @@ async def _GENUINE_PROBE(*, fresh=False, cdp_http=chrome.CDP_HTTP):
 
 def test_download_requires_sandbox_mode(cfg):
     client = _client(cfg)
-    # no bridge_state.json ⇒ selftest_required, no attempt row
+    # no bridge_state.json ⇒ the sandbox gate blocks ONLY tier 3 (codex). Tiers 1/2
+    # (autouse stub ⇒ no_pdf) still attempt, then escalation ⇒ selftest_required.
     resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.1", "title": "t"})
     assert resp.status_code == 503 and resp.json()["error_code"] == "selftest_required"
     con = _conn(cfg)
-    assert con.execute("SELECT COUNT(*) FROM paper_attempts").fetchone()[0] == 0
+    strategies = [
+        r["strategy"] for r in con.execute("SELECT strategy FROM paper_attempts ORDER BY id").fetchall()
+    ]
+    # tiers 1/2 ran; codex (tier 3) never did — the sandbox gate held for it alone.
+    assert strategies == ["direct_fetch", "scripted_browser"]
     con.close()
 
 
@@ -904,3 +925,235 @@ def test_chrome_uptime_uses_monotonic(monkeypatch):
     # inactive unit (monotonic 0) ⇒ None ⇒ no recycle
     monkeypatch.setattr(chrome.subprocess, "run", _show("0"))
     assert chrome.chrome_uptime_seconds() is None
+
+
+# ------------------------------------------------ AGA-339: the tiered ladder ---
+
+
+def _tier_download_stub(*, mismatch: bool = False):
+    """Build a tier-1/2 fetch stub that lands a %PDF- file into the passed
+    download_dir under the shared sanitized-doi name and reports 'downloaded'.
+    ``mismatch=True`` writes a PDF whose identity does NOT match the request."""
+    async def _stub(**kwargs):
+        dl = Path(kwargs["download_dir"])
+        doi = kwargs["doi"]
+        path = dl / f"{direct_fetch.sanitize_doi(doi)}.pdf"
+        if mismatch:
+            _make_pdf(path, doi="10.9999/wrong", title="Completely Different Words Here")
+        else:
+            _make_pdf(path, doi=doi, title=kwargs["title"])
+        return direct_fetch.DirectFetchResult(
+            kind="downloaded", file_path=str(path), final_url="https://pub.example.org/x.pdf"
+        )
+    return _stub
+
+
+def _fake_codex_recorder(counter, *, kind="gave_up"):
+    async def _fake(run_dir, prompt, sandbox_mode):
+        counter["n"] += 1
+        return executor.ExecResult(kind=kind, notes=f"fake codex {kind}")
+    return _fake
+
+
+def test_ladder_escalates_through_tiers_then_codex(cfg, monkeypatch):
+    """tier1 miss -> tier2 miss -> codex called (in that attempt-row order)."""
+    _seed_sandbox_mode(cfg)
+    codex = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind="paywalled_no_access"))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.ladder", "title": "Ladder Escalation Paper"})
+    assert codex["n"] == 1
+    assert resp.status_code == 403 and resp.json()["error_code"] == "paywalled_no_access"
+    con = _conn(cfg)
+    strategies = [r["strategy"] for r in con.execute(
+        "SELECT strategy FROM paper_attempts ORDER BY id").fetchall()]
+    assert strategies == ["direct_fetch", "scripted_browser", "codex_bridge"]
+    con.close()
+
+
+def test_ladder_tier1_hit_short_circuits_codex(cfg, monkeypatch):
+    """A tier-1 'downloaded' streams the PDF, tags X-Paperika-Tier, and codex is
+    NEVER called; tier 2 never runs either."""
+    _seed_sandbox_mode(cfg)
+    codex = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex))
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _tier_download_stub())
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.tier1", "title": "Tier One Paper Alpha"})
+    assert resp.status_code == 200, resp.text
+    assert resp.content.startswith(b"%PDF-")
+    assert resp.headers.get("X-Paperika-Tier") == "direct_fetch"
+    assert codex["n"] == 0
+    con = _conn(cfg)
+    rows = con.execute("SELECT strategy, outcome FROM paper_attempts ORDER BY id").fetchall()
+    assert [r["strategy"] for r in rows] == ["direct_fetch"]  # short-circuit: no tier2/tier3 rows
+    assert rows[0]["outcome"] == "completed"
+    con.close()
+
+
+def test_ladder_per_strategy_spacing_isolation(cfg, monkeypatch):
+    """A codex_bridge attempt 60s ago (< 180s codex spacing) must NOT block a fresh
+    direct_fetch (30s spacing, no prior direct_fetch attempt)."""
+    _seed_sandbox_mode(cfg)
+    bridge_app.build_bridge(cfg)  # migrate schema
+    con = _conn(cfg)
+    con.execute("INSERT INTO paper_requests (raw_input, status, created_at, updated_at) VALUES ('x','in_progress',?,?)",
+                (limits.iso(_now()), limits.iso(_now())))
+    rid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    t60 = _now() - timedelta(seconds=60)
+    con.execute("INSERT INTO paper_attempts (request_id, attempt_number, status, strategy, created_at, started_at, outcome) "
+                "VALUES (?,1,'failed','codex_bridge',?,?,'gave_up')", (rid, limits.iso(t60), limits.iso(t60)))
+    con.commit()
+    con.close()
+
+    codex = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex))
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _tier_download_stub())
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.iso", "title": "Isolation Paper Beta"})
+    # direct_fetch ran to success despite the recent codex attempt ⇒ spacing is per-strategy.
+    assert resp.status_code == 200 and resp.headers.get("X-Paperika-Tier") == "direct_fetch"
+
+
+def test_ladder_all_tiers_rate_blocked_429_min_retry(cfg):
+    """Every tier in cooldown ⇒ 429 with the SMALLEST retry_after (direct_fetch's)."""
+    _seed_sandbox_mode(cfg)
+    bridge_app.build_bridge(cfg)
+    con = _conn(cfg)
+    con.execute("INSERT INTO paper_requests (raw_input, status, created_at, updated_at) VALUES ('x','in_progress',?,?)",
+                (limits.iso(_now()), limits.iso(_now())))
+    rid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    # direct_fetch just under its 30s spacing (smallest retry_after ~ 11s); the
+    # other two comfortably inside their larger windows.
+    seeds = [("direct_fetch", 20), ("scripted_browser", 5), ("codex_bridge", 5)]
+    for i, (strat, ago) in enumerate(seeds):
+        ts = limits.iso(_now() - timedelta(seconds=ago))
+        con.execute("INSERT INTO paper_attempts (request_id, attempt_number, status, strategy, created_at, started_at, outcome) "
+                    "VALUES (?,?,'failed',?,?,?,'gave_up')", (rid, i + 1, strat, ts, ts))
+    con.commit()
+    con.close()
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.blocked", "title": "All Blocked Paper"})
+    assert resp.status_code == 429
+    body = resp.json()
+    assert body["error_code"] == "rate_limited"
+    # smallest bucket is direct_fetch (30s spacing); scripted/codex would be >80s.
+    assert 1 <= body["retry_after_seconds"] <= 30
+    # a rate rejection writes NO new attempt row (only the 3 seeds remain).
+    con = _conn(cfg)
+    assert con.execute("SELECT COUNT(*) FROM paper_attempts").fetchone()[0] == 3
+    con.close()
+
+
+def test_ladder_tier1_verify_fail_quarantines_and_continues(cfg, monkeypatch):
+    """A tier-1 'downloaded' that fails identity verify is quarantined and the
+    ladder CONTINUES to codex (NOT terminal wrong_paper — codex owns that)."""
+    _seed_sandbox_mode(cfg)
+    doi = "10.1364/jocn.vf"
+    codex = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind="gave_up"))
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _tier_download_stub(mismatch=True))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": doi, "title": "Verify Fail Target Gamma"})
+    # terminal is codex_gave_up, NOT wrong_paper ⇒ the tier-1 verify-fail escalated.
+    assert resp.status_code == 502 and resp.json()["error_code"] == "codex_gave_up"
+    assert codex["n"] == 1
+    # the mismatched tier-1 file was moved out of the dedupe dir into a quarantine/.
+    assert not (cfg.download_dir / f"{direct_fetch.sanitize_doi(doi)}.pdf").exists()
+    assert list((cfg.db_path.parent / "codex_runs").rglob("quarantine/*.pdf"))
+    con = _conn(cfg)
+    rows = con.execute("SELECT strategy, outcome FROM paper_attempts ORDER BY id").fetchall()
+    assert rows[0]["strategy"] == "direct_fetch" and rows[0]["outcome"] == "verify_failed"
+    assert [r["strategy"] for r in rows] == ["direct_fetch", "scripted_browser", "codex_bridge"]
+    con.close()
+
+
+def test_ladder_chrome_down_tier1_attempted_cookieless_tier2_skipped(cfg, monkeypatch):
+    """Chrome down ⇒ tier 1 still attempts (cookie-less), tier 2 is skipped, and
+    tier 3 keeps the legacy 503 chrome_down."""
+    _seed_sandbox_mode(cfg)
+
+    async def _down_probe(*, fresh=False, cdp_http=chrome.CDP_HTTP):
+        return chrome.ProbeResult(False, error="cdp down", checked_at=_now())
+    monkeypatch.setattr(chrome, "probe", _down_probe)
+
+    tier1 = {"n": 0}
+    tier2 = {"n": 0}
+    codex = {"n": 0}
+
+    async def _t1(**kwargs):
+        tier1["n"] += 1
+        return direct_fetch.DirectFetchResult(kind="no_pdf", notes="cookieless miss")
+
+    async def _t2(**kwargs):
+        tier2["n"] += 1
+        return scripted_browser.ScriptedFetchResult(kind="no_pdf")
+
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _t1)
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _t2)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex))
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.cd", "title": "Chrome Down Paper Delta"})
+    assert tier1["n"] == 1  # tier 1 attempted despite a dead Chrome
+    assert tier2["n"] == 0  # tier 2 skipped (needs Chrome)
+    assert codex["n"] == 0  # tier 3 gated
+    assert resp.status_code == 503 and resp.json()["error_code"] == "chrome_down"
+    con = _conn(cfg)
+    strategies = [r["strategy"] for r in con.execute(
+        "SELECT strategy FROM paper_attempts ORDER BY id").fetchall()]
+    assert strategies == ["direct_fetch"]
+    con.close()
+
+
+def test_gated_codex_miss_does_not_leak_in_progress_request(cfg):
+    """Finding 2: tiers 1/2 run and escalate (autouse stub ⇒ no_pdf) but codex is
+    unavailable (no sandbox mode), so the ladder returns selftest_required. The
+    request the tiers materialized must be finalized 'failed', never left dangling
+    'in_progress' (startup_sweep only reaps running ATTEMPTS, not the request)."""
+    # no _seed_sandbox_mode ⇒ codex gated ⇒ selftest_required after the tiers miss
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.leak", "title": "Leak Guard Paper"})
+    assert resp.status_code == 503 and resp.json()["error_code"] == "selftest_required"
+    con = _conn(cfg)
+    statuses = [r["status"] for r in con.execute(
+        "SELECT status FROM paper_requests ORDER BY id").fetchall()]
+    # a request was materialized by the tiers, and it is NOT left in_progress
+    assert statuses and statuses[-1] == "failed"
+    assert all(s != "in_progress" for s in statuses)
+    # the tier attempt rows themselves are resolved (not 'running')
+    outcomes = [r["outcome"] for r in con.execute(
+        "SELECT outcome FROM paper_attempts ORDER BY id").fetchall()]
+    assert outcomes and all(o != "running" for o in outcomes)
+    con.close()
+
+
+def test_healthz_reports_per_strategy_attempts(cfg):
+    bridge = bridge_app.build_bridge(cfg)
+    con = _conn(cfg)
+    con.execute("INSERT INTO paper_requests (raw_input, status, created_at, updated_at) VALUES ('x','in_progress',?,?)",
+                (limits.iso(_now()), limits.iso(_now())))
+    rid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    n = 0
+    for strat, count in (("direct_fetch", 2), ("scripted_browser", 1), ("codex_bridge", 3)):
+        for _ in range(count):
+            n += 1
+            ts = limits.iso(_now())
+            con.execute("INSERT INTO paper_attempts (request_id, attempt_number, status, strategy, created_at, started_at, outcome) "
+                        "VALUES (?,?,'failed',?,?,?,'gave_up')", (rid, n, strat, ts, ts))
+    con.commit()
+    con.close()
+    client = _client(cfg)
+    body = client.get("/healthz", headers=_auth()).json()
+    assert body["limits"]["attempts_today"] == {
+        "direct_fetch": 2, "scripted_browser": 1, "codex_bridge": 3,
+    }
+    assert body["limits"]["downloads_today"] == 6

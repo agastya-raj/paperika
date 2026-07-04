@@ -23,6 +23,17 @@ import sqlite3
 MIN_SPACING_SECONDS = 180
 DAILY_CAP = 20
 
+# Per-strategy rate discipline for the tiered ladder (AGA-339): each entry is
+# ``(min_spacing_seconds, daily_cap)``. The cheap deterministic tiers get tighter
+# spacing and a higher daily cap than the expensive ~117s codex session. The
+# ``codex_bridge`` entry mirrors the module-level MIN_SPACING_SECONDS/DAILY_CAP,
+# which are retained as the codex defaults for backward compatibility.
+RATE_RULES: dict[str, tuple[int, int]] = {
+    "direct_fetch": (30, 100),
+    "scripted_browser": (90, 40),
+    "codex_bridge": (MIN_SPACING_SECONDS, DAILY_CAP),
+}
+
 # Columns the bridge adds to paper_attempts (request_id already exists in the
 # live schema). Guarded idempotent ALTERs — safe to run on every startup.
 _BRIDGE_ATTEMPT_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -69,47 +80,82 @@ def _parse_iso(value: str | None) -> datetime | None:
     return dt
 
 
-def most_recent_attempt_start(conn: sqlite3.Connection) -> datetime | None:
-    """started_at of the most recent attempt of ANY recorded outcome."""
-    row = conn.execute(
-        "SELECT started_at FROM paper_attempts "
-        "WHERE started_at IS NOT NULL AND outcome IS NOT NULL "
-        "ORDER BY started_at DESC LIMIT 1"
-    ).fetchone()
+def most_recent_attempt_start(
+    conn: sqlite3.Connection, *, strategy: str | None = None
+) -> datetime | None:
+    """started_at of the most recent attempt of ANY recorded outcome. When
+    ``strategy`` is given, only that strategy's attempts count (per-strategy
+    spacing); ``None`` considers every strategy."""
+    if strategy is None:
+        row = conn.execute(
+            "SELECT started_at FROM paper_attempts "
+            "WHERE started_at IS NOT NULL AND outcome IS NOT NULL "
+            "ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT started_at FROM paper_attempts "
+            "WHERE started_at IS NOT NULL AND outcome IS NOT NULL AND strategy = ? "
+            "ORDER BY started_at DESC LIMIT 1",
+            (strategy,),
+        ).fetchone()
     return _parse_iso(row[0]) if row else None
 
 
-def attempts_today(conn: sqlite3.Connection, *, now: datetime | None = None) -> int:
-    """Count attempts launched in the current UTC day (any outcome)."""
+def attempts_today(
+    conn: sqlite3.Connection,
+    strategy: str | None = None,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Count attempts launched in the current UTC day (any outcome). ``strategy``
+    ``None`` counts every strategy (the healthz total); a string scopes the count to
+    that strategy's per-strategy daily cap."""
     now = now or utc_now()
     day_start = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    row = conn.execute(
-        "SELECT COUNT(*) FROM paper_attempts "
-        "WHERE started_at IS NOT NULL AND outcome IS NOT NULL AND started_at >= ?",
-        (iso(day_start),),
-    ).fetchone()
+    if strategy is None:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM paper_attempts "
+            "WHERE started_at IS NOT NULL AND outcome IS NOT NULL AND started_at >= ?",
+            (iso(day_start),),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM paper_attempts "
+            "WHERE started_at IS NOT NULL AND outcome IS NOT NULL AND started_at >= ? "
+            "AND strategy = ?",
+            (iso(day_start), strategy),
+        ).fetchone()
     return int(row[0]) if row else 0
 
 
 def check_rate(
     conn: sqlite3.Connection,
+    strategy: str = "codex_bridge",
     *,
     now: datetime | None = None,
-    min_spacing_seconds: int = MIN_SPACING_SECONDS,
-    daily_cap: int = DAILY_CAP,
+    min_spacing_seconds: int | None = None,
+    daily_cap: int | None = None,
 ) -> RateDecision:
-    """Pre-flight spacing + daily-cap gate. Called inside the lock, BEFORE the
-    write-ahead row is inserted (so a rejection never starts the clock)."""
+    """Per-strategy pre-flight spacing + daily-cap gate. Consults ONLY attempts of
+    ``strategy``. Called inside the lock, BEFORE the write-ahead row is inserted (so
+    a rejection never starts the clock). ``min_spacing_seconds``/``daily_cap`` fall
+    back to that strategy's ``RATE_RULES`` entry when not explicitly overridden."""
     now = now or utc_now()
+    default_spacing, default_cap = RATE_RULES.get(strategy, (MIN_SPACING_SECONDS, DAILY_CAP))
+    if min_spacing_seconds is None:
+        min_spacing_seconds = default_spacing
+    if daily_cap is None:
+        daily_cap = default_cap
 
-    last = most_recent_attempt_start(conn)
+    last = most_recent_attempt_start(conn, strategy=strategy)
     if last is not None:
         elapsed = (now - last).total_seconds()
         if elapsed < min_spacing_seconds:
             retry_after = int(min_spacing_seconds - elapsed) + 1
             return RateDecision(False, "cooldown", retry_after)
 
-    if attempts_today(conn, now=now) >= daily_cap:
+    if attempts_today(conn, strategy, now=now) >= daily_cap:
         return RateDecision(False, "daily_cap")
 
     return RateDecision(True)

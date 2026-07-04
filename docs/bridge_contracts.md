@@ -214,3 +214,65 @@ bridge constructs `NotificationEvent` DIRECTLY with new event-type strings
 Run dirs: `~/.hermes/paper_pipeline/codex_runs/<request_id>/`. Bridge state:
 `~/.hermes/paper_pipeline/bridge_state.json` (sandbox_mode, last_selftest_*,
 last recovery action).
+
+---
+
+## 7. Tiered ladder (AGA-339)
+
+`/download` no longer runs a codex session for every request. Inside the
+serialization lock, `_download_locked` walks a three-tier ladder, cheapest first,
+short-circuiting on the first success. The gpu host has IP-based institutional
+access, so most papers land on a deterministic tier without an LLM.
+
+**Order + budgets** (module constants `app.TIER1_BUDGET` / `TIER2_BUDGET`;
+tier 3 is bounded by `executor.EXEC_WALL_SECONDS`):
+
+| Tier | Strategy label | Mechanism | Budget |
+|------|----------------|-----------|--------|
+| 1 | `direct_fetch` | `direct_fetch.attempt_direct_fetch` — authenticated HTTP GET of the DOI redirect chain + a `citation_pdf_url`/per-publisher ruleset, Chrome cookies exported over CDP | 20 s |
+| 2 | `scripted_browser` | `scripted_browser.attempt_scripted_fetch` — deterministic Playwright over the managed CDP Chrome (no LLM) | 45 s |
+| 3 | `codex_bridge` | `executor.run_codex` — the LLM-steered browser session | 480 s |
+
+**Per-strategy rate discipline** (`limits.RATE_RULES`, `(min_spacing_seconds,
+daily_cap)`): `direct_fetch` `(30, 100)`, `scripted_browser` `(90, 40)`,
+`codex_bridge` `(180, 20)`. `check_rate(conn, strategy)` and
+`attempts_today(conn, strategy)` consult ONLY that strategy's rows; the clocks are
+independent (a recent codex attempt never blocks a direct fetch). The module-level
+`MIN_SPACING_SECONDS`/`DAILY_CAP` remain the `codex_bridge` values for backward
+compat, and a bare `check_rate(conn)` still defaults to the codex strategy.
+
+**Ladder semantics**
+- A tier whose strategy is rate-blocked is silently SKIPPED (no attempt row). If
+  ALL three are blocked, `/download` returns `429 rate_limited` with the smallest
+  `retry_after_seconds` among them.
+- Each tier that runs writes a strategy-tagged write-ahead `paper_attempts` row.
+  Tier 1/2 outcomes resolve as `completed` / `verify_failed` / `no_pdf` / `wall` /
+  `error`. A tier-1/2 miss NEVER terminates the request — it escalates.
+- A tier-1/2 `downloaded` runs the EXACT same acceptance path as codex bytes:
+  `_within_download_window` containment + `_verify_and_finish` (mechanical gates +
+  identity verify + quarantine-on-mismatch + link + stream). On identity-verify
+  failure the candidate is quarantined and the ladder CONTINUES (a deterministic
+  URL rule can grab the wrong object; terminal `wrong_paper` stays codex-only).
+- **Classification authority:** only tier 3 (codex) produces the terminal taxonomy
+  (`wrong_paper` / `throttled` / `paywalled_no_access` / `bot_wall` / `gave_up` /
+  `auth_error` / `timeout`, §2.7). The ONE exception: if BOTH tier 1 and tier 2
+  independently returned `wall` and codex is unavailable (no persisted
+  `sandbox_mode`, or Chrome down), the wall evidence maps to a retryable
+  `502 bot_wall` instead of `selftest_required`.
+- Successful responses carry `X-Paperika-Tier: direct_fetch | scripted_browser |
+  codex_bridge`.
+
+**Pre-flight gating changes**
+- The sandbox gate (`503 selftest_required` when no persisted `sandbox_mode`) gates
+  ONLY tier 3 — it is checked at the escalation point, after tiers 1/2 have had
+  their turn.
+- Chrome pre-flight still probes, but a sick Chrome no longer fails the whole
+  request: tier 1 runs cookie-less anyway, tier 2 is skipped, and tier 3 keeps the
+  legacy `503 chrome_down`.
+- Write-ahead bookkeeping is lazy: the first tier that actually runs materializes
+  the request + run_dir, so a fully-gated request leaves no dangling `in_progress`
+  row.
+
+`/healthz` `limits` gains a per-strategy `attempts_today` map
+(`{"direct_fetch", "scripted_browser", "codex_bridge"}`) alongside the existing
+total `downloads_today`.

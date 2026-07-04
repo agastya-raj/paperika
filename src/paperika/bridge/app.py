@@ -33,6 +33,9 @@ from ..downloader import Downloader
 from ..models import LocateCandidate, ParsedInput
 from ..notifications import NotificationEvent, emit_notification_event
 from . import chrome, executor, limits
+from .direct_fetch import attempt_direct_fetch
+from .executor import run_codex
+from .scripted_browser import attempt_scripted_fetch
 
 # --- constants -------------------------------------------------------------
 
@@ -43,6 +46,11 @@ TITLE_MAX = 300
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 SALVAGE_GRACE_SECONDS = 10
 SWEEP_WINDOW_SECONDS = executor.EXEC_WALL_SECONDS + 30
+
+# Per-tier wall-clock budgets for the deterministic ladder (AGA-339). Tier 3
+# (codex) is bounded separately by executor.EXEC_WALL_SECONDS.
+TIER1_BUDGET = 20.0
+TIER2_BUDGET = 45.0
 
 
 def _utc_now() -> datetime:
@@ -280,9 +288,14 @@ class Bridge:
 
     # --- write-ahead attempt bookkeeping (raw SQL through db.transaction) ---
 
-    def write_ahead(self, *, request_id: int, paper_id: int | None, run_dir: str) -> int:
+    def write_ahead(
+        self, *, request_id: int, paper_id: int | None, run_dir: str,
+        strategy: str = "codex_bridge",
+    ) -> int:
         with self.db.transaction() as conn:
-            return limits.write_ahead_attempt(conn, request_id=request_id, paper_id=paper_id, run_dir=run_dir)
+            return limits.write_ahead_attempt(
+                conn, request_id=request_id, paper_id=paper_id, run_dir=run_dir, strategy=strategy
+            )
 
     def resolve_attempt(self, attempt_id: int, **kwargs: Any) -> None:
         with self.db.transaction() as conn:
@@ -433,6 +446,10 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
         state = bridge.state_store.load()
         with bridge.db.transaction() as conn:
             downloads_today = limits.attempts_today(conn)
+            attempts_by_strategy = {
+                strat: limits.attempts_today(conn, strat)
+                for strat in ("direct_fetch", "scripted_browser", "codex_bridge")
+            }
         body = {
             "status": status,
             "chrome": {
@@ -449,6 +466,7 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
             "limits": {
                 "active_request": "locked" if bridge.lock.locked() else None,
                 "downloads_today": downloads_today,
+                "attempts_today": attempts_by_strategy,
                 "daily_cap": limits.DAILY_CAP,
                 "min_spacing_seconds": limits.MIN_SPACING_SECONDS,
             },
@@ -554,48 +572,200 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
 async def _download_locked(
     bridge: Bridge, *, doi: str, title: str, start_url: str, requested_by: str
 ) -> Response:
-    # 4. rate pre-flight
-    with bridge.db.transaction() as conn:
-        decision = limits.check_rate(conn)
-    if not decision.allowed:
-        if decision.error_code == "cooldown":
-            return _json_error(429, "cooldown", "minimum spacing not elapsed",
-                               retry_after_seconds=decision.retry_after_seconds)
-        return _json_error(429, "daily_cap", "daily download cap reached")
-
-    # 5½. sandbox gate — refuse before any attempt row if no persisted mode
+    """The tiered download ladder (AGA-339). Deterministic tier 1 (direct HTTP
+    fetch) and tier 2 (scripted Playwright) run BEFORE the tier-3 codex executor,
+    each rate-disciplined on its OWN strategy. Tiers 1/2 only ever succeed or
+    escalate — codex stays the sole terminal-classification authority, except a
+    both-tiers bot wall with codex unavailable, mapped to a retryable 502 bot_wall."""
     state = bridge.state_store.load()
-    if not state.sandbox_mode:
-        return _json_error(503, "selftest_required", "run POST /selftest/codex first")
 
-    # 5. chrome pre-flight (fresh ws-connect probe) + idle recycle
+    # 4. rate pre-flight across all three strategies. A tier whose strategy is
+    # rate-blocked is silently skipped (no attempt row). Only when EVERY tier is
+    # blocked do we 429 — with the smallest retry_after among them.
+    with bridge.db.transaction() as conn:
+        rate = {
+            strat: limits.check_rate(conn, strat)
+            for strat in ("direct_fetch", "scripted_browser", "codex_bridge")
+        }
+    if all(not d.allowed for d in rate.values()):
+        retry = [d.retry_after_seconds for d in rate.values() if d.retry_after_seconds is not None]
+        extra = {"retry_after_seconds": min(retry)} if retry else {}
+        return _json_error(429, "rate_limited", "all download tiers are rate-limited", **extra)
+
+    # 5. chrome pre-flight. A sick Chrome no longer fails the whole request: tier 1
+    # runs cookie-less regardless, tier 2 is skipped, and tier 3 keeps the legacy
+    # 503 chrome_down behavior.
     await chrome.idle_recycle_if_stale()
-    result = await chrome.probe(fresh=True)
-    if not result.ok:
+    probe = await chrome.probe(fresh=True)
+    chrome_ok = probe.ok
+    if not chrome_ok:
         await chrome.recover()
-        result = await chrome.probe(fresh=True)
-        if not result.ok:
-            return _json_error(503, "chrome_down", "Chrome CDP unreachable")
+        probe = await chrome.probe(fresh=True)
+        chrome_ok = probe.ok
 
-    # 6. write-ahead bookkeeping (BEFORE codex spawns)
-    request_id = bridge.db.create_request(
-        raw_input=doi, inferred_title=title or None, inferred_doi=doi,
-        inferred_url=start_url, paper_id=None,
+    # 6. write-ahead bookkeeping is lazy — the FIRST tier that actually runs
+    # materializes the request + run_dir, so a fully-gated request (no eligible
+    # tier) leaves no dangling in_progress row.
+    created: dict[str, Any] = {}
+
+    def ensure_request() -> tuple[int, Path]:
+        if "request_id" not in created:
+            request_id = bridge.db.create_request(
+                raw_input=doi, inferred_title=title or None, inferred_doi=doi,
+                inferred_url=start_url, paper_id=None,
+            )
+            bridge.db.update_request_status(request_id, "in_progress")
+            run_dir = bridge.config.db_path.parent / "codex_runs" / str(request_id)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            created["request_id"] = request_id
+            created["run_dir"] = run_dir
+        return created["request_id"], created["run_dir"]
+
+    def finalize_if_created(response: Response) -> Response:
+        """Mark a materialized-but-unfinished request 'failed' before a gated
+        codex-unavailable return (review fix): a deterministic tier that ran set
+        the request in_progress, and if codex is then unavailable these early
+        returns finalize nothing — the request would dangle in_progress forever
+        (startup_sweep only reaps running ATTEMPTS, and the tier attempts are
+        already resolved). No request materialized ⇒ nothing to finalize."""
+        request_id = created.get("request_id")
+        if request_id is not None:
+            try:
+                bridge.db.update_request_status(request_id, "failed")
+            except KeyError:
+                pass
+        return response
+
+    tier_kinds: dict[str, str] = {}
+
+    # --- tier 1: direct HTTP fetch (no Chrome-health requirement) ---
+    if rate["direct_fetch"].allowed:
+        request_id, run_dir = ensure_request()
+        outcome = await _run_deterministic_tier(
+            bridge, strategy="direct_fetch", fetch_fn=attempt_direct_fetch,
+            budget=TIER1_BUDGET, request_id=request_id, run_dir=run_dir,
+            doi=doi, title=title, start_url=start_url,
+        )
+        if isinstance(outcome, Response):
+            return outcome
+        tier_kinds["direct_fetch"] = outcome
+
+    # --- tier 2: scripted Playwright (needs a healthy Chrome) ---
+    if rate["scripted_browser"].allowed and chrome_ok:
+        request_id, run_dir = ensure_request()
+        outcome = await _run_deterministic_tier(
+            bridge, strategy="scripted_browser", fetch_fn=attempt_scripted_fetch,
+            budget=TIER2_BUDGET, request_id=request_id, run_dir=run_dir,
+            doi=doi, title=title, start_url=start_url,
+        )
+        if isinstance(outcome, Response):
+            return outcome
+        tier_kinds["scripted_browser"] = outcome
+
+    # --- tier 3: codex (the terminal classification authority) ---
+    both_wall = (
+        tier_kinds.get("direct_fetch") == "wall"
+        and tier_kinds.get("scripted_browser") == "wall"
     )
-    bridge.db.update_request_status(request_id, "in_progress")
-    run_dir = bridge.config.db_path.parent / "codex_runs" / str(request_id)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    attempt_id = bridge.write_ahead(request_id=request_id, paper_id=None, run_dir=str(run_dir))
+    codex_ready = rate["codex_bridge"].allowed and bool(state.sandbox_mode) and chrome_ok
+    if codex_ready:
+        request_id, run_dir = ensure_request()
+        return await _run_codex_tier(
+            bridge, request_id=request_id, run_dir=run_dir, doi=doi, title=title,
+            start_url=start_url, sandbox_mode=state.sandbox_mode,
+        )
 
-    # 7. codex executor
+    # Codex is unavailable. Both deterministic tiers hitting a wall is the one
+    # signal strong enough to terminate without codex — map it to a retryable 502
+    # bot_wall instead of selftest_required.
+    if both_wall:
+        return _finish_wall_evidence(bridge, request_id=created["request_id"])
+    if not state.sandbox_mode:
+        return finalize_if_created(
+            _json_error(503, "selftest_required", "run POST /selftest/codex first")
+        )
+    if not chrome_ok:
+        return finalize_if_created(_json_error(503, "chrome_down", "Chrome CDP unreachable"))
+    # codex sandbox + chrome are fine but its strategy is rate-blocked.
+    decision = rate["codex_bridge"]
+    if decision.error_code == "cooldown":
+        return finalize_if_created(
+            _json_error(429, "cooldown", "minimum spacing not elapsed",
+                        retry_after_seconds=decision.retry_after_seconds)
+        )
+    return finalize_if_created(_json_error(429, "daily_cap", "daily download cap reached"))
+
+
+def _locate_downloaded(
+    bridge: Bridge, file_path: str | None, window_start: datetime, window_end: datetime
+) -> Path | None:
+    """Resolve a reported download to a trusted on-disk path (shared by codex and
+    the deterministic tiers): accept the reported file ONLY when it passes the
+    containment + mtime-window gate, else fall back to the window locator."""
+    if file_path:
+        p = Path(file_path)
+        if bridge._within_download_window(p, window_start, window_end):
+            return p
+    return bridge._locate_in_window(window_start, window_end)
+
+
+async def _run_deterministic_tier(
+    bridge: Bridge, *, strategy: str, fetch_fn: Any, budget: float,
+    request_id: int, run_dir: Path, doi: str, title: str, start_url: str,
+) -> Response | str:
+    """Run one deterministic tier (1 or 2). Writes a strategy-tagged write-ahead
+    attempt row, runs the fetcher (which never raises and only lands bytes into
+    download_dir), then either accepts via the SAME verify path codex uses (returns
+    a Response) or resolves the attempt as a non-terminal miss and returns the
+    effective miss kind for the caller to escalate on."""
+    attempt_id = bridge.write_ahead(
+        request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
+    )
+    started = _utc_now()
+    result = await fetch_fn(
+        doi=doi, title=title, start_url=start_url,
+        download_dir=bridge.config.download_dir, cdp_http_url=chrome.CDP_HTTP,
+        budget_seconds=budget,
+    )
+    ended = _utc_now()
+
+    if result.kind == "downloaded":
+        located = _locate_downloaded(bridge, result.file_path, started, ended)
+        verify = await _verify_and_finish(
+            bridge, located=located, doi=doi, title=title, request_id=request_id,
+            attempt_id=attempt_id, final_url=result.final_url, screenshot=None,
+            salvaged=False, run_dir=run_dir, tier_label=strategy,
+        )
+        if isinstance(verify, Response):
+            return verify
+        # A deterministic URL rule can grab the wrong object; codex stays the
+        # wrong_paper authority, so a tier verify-fail is quarantined (inside
+        # _verify_and_finish) but ESCALATES rather than terminating.
+        outcome = "verify_failed" if verify == "verify_failed" else "no_pdf"
+        bridge.resolve_attempt(attempt_id, outcome=outcome, message=result.notes or verify)
+        return outcome
+
+    bridge.resolve_attempt(attempt_id, outcome=result.kind, message=result.notes or result.kind)
+    return result.kind
+
+
+async def _run_codex_tier(
+    bridge: Bridge, *, request_id: int, run_dir: Path, doi: str, title: str,
+    start_url: str, sandbox_mode: str,
+) -> Response:
+    """Tier 3: the codex executor. Writes its own write-ahead row, runs codex, and
+    resolves the terminal taxonomy (§2.7) — the only tier that produces terminal
+    wrong_paper / throttled / paywalled / bot_wall / gave_up classifications."""
+    attempt_id = bridge.write_ahead(
+        request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy="codex_bridge"
+    )
     executor.write_task_json(run_dir, doi=doi, title=title, start_url=start_url)
     prompt = executor.PROMPT_TEMPLATE.format(run_dir=str(run_dir))
     started = _utc_now()
-    exec_result = await executor.run_codex(run_dir, prompt, state.sandbox_mode)
+    exec_result = await run_codex(run_dir, prompt, sandbox_mode)
     ended = _utc_now()
     screenshot = str(run_dir / "final.png") if (run_dir / "final.png").exists() else None
 
-    # 8. locate + verify (downloaded path AND salvage on bad outcomes)
     bad_outcome = exec_result.kind in {"timeout", "gave_up"}
     response = await _resolve_outcome(
         bridge, exec_result=exec_result, request_id=request_id, attempt_id=attempt_id,
@@ -603,12 +773,29 @@ async def _download_locked(
         screenshot=screenshot,
     )
 
-    # 10. chrome recovery on bad outcomes (still holding the lock)
+    # chrome recovery on bad outcomes (still holding the lock)
     if bad_outcome or exec_result.kind == "auth_error":
         rec = await chrome.recover()
         bridge.state_store.update(last_recovery_action=rec.action)
 
     return response
+
+
+def _finish_wall_evidence(bridge: Bridge, *, request_id: int) -> Response:
+    """Both deterministic tiers hit a bot wall and codex is unavailable to classify.
+    Return a retryable 502 bot_wall (honest, retryable) rather than
+    selftest_required — the tier attempt rows already recorded the two walls."""
+    _, event_type, http_status, error_code = _TAXONOMY["bot_wall"]
+    message = "tiers 1 and 2 both hit a bot wall; codex unavailable to classify"
+    try:
+        bridge.db.update_request_status(request_id, "failed")
+    except KeyError:
+        pass
+    bridge.emit(
+        event_type=event_type, request_id=request_id, paper_id=None,
+        status_after="failed", status_before="in_progress", message=message,
+    )
+    return _json_error(http_status, error_code, message, request_id=str(request_id))
 
 
 async def _resolve_outcome(
@@ -635,7 +822,7 @@ async def _resolve_outcome(
         verify = await _verify_and_finish(
             bridge, located=located, doi=doi, title=title, request_id=request_id,
             attempt_id=attempt_id, final_url=exec_result.final_url, screenshot=screenshot,
-            salvaged=False, run_dir=run_dir,
+            salvaged=False, run_dir=run_dir, tier_label="codex_bridge",
         )
         if isinstance(verify, Response):
             return verify
@@ -662,7 +849,7 @@ async def _resolve_outcome(
                 salvage = await _verify_and_finish(
                     bridge, located=located, doi=doi, title=title, request_id=request_id,
                     attempt_id=attempt_id, final_url=exec_result.final_url, screenshot=screenshot,
-                    salvaged=True, run_dir=run_dir,
+                    salvaged=True, run_dir=run_dir, tier_label="codex_bridge",
                 )
                 if isinstance(salvage, Response):
                     return salvage
@@ -698,7 +885,7 @@ def _quarantine(path: Path, *, run_dir: Path, reason: str) -> None:
 async def _verify_and_finish(
     bridge: Bridge, *, located: Path | None, doi: str, title: str, request_id: int,
     attempt_id: int, final_url: str | None, screenshot: str | None, salvaged: bool,
-    run_dir: Path,
+    run_dir: Path, tier_label: str,
 ) -> Response | str:
     """Run mechanical + identity gates; on pass, link + resolve + stream bytes.
     Returns the PDF Response on success, or a string signal the caller maps to a
@@ -731,6 +918,7 @@ async def _verify_and_finish(
         "X-Paperika-Request-Id": str(request_id),
         "X-Paperika-Sha256": sha,
         "X-Paperika-Verified": "doi" if doi else "title",
+        "X-Paperika-Tier": tier_label,
     }
     if salvaged:
         headers["X-Paperika-Salvaged"] = "true"
