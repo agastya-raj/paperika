@@ -23,3 +23,6 @@ node_modules/
 # Keep runtime state outside the repo by default
 /home/agastya/Downloads/papers/
 /home/agastya/.hermes/paper_pipeline/
+
+# AGA-260: trial-artifact dirs relocated to ~/paperika_artifacts/
+jocn_*/

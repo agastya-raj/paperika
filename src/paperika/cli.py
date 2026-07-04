@@ -9,6 +9,7 @@ from .db import Database
 from .downloader import Downloader, outcome_to_dict
 from .locator import create_locator
 from .runtime_check import collect_runtime_report, format_runtime_summary
+from .staggered import run_staggered_random_worker
 from .worker import run_worker_once
 
 
@@ -34,6 +35,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("retry-pending", help="Process queued/retrying requests that are due")
     subparsers.add_parser("run-worker-once", help="One-shot cron/Hermes-friendly retry worker")
+    staggered = subparsers.add_parser(
+        "run-staggered-random",
+        help="Long-lived random staggered worker that reuses one local Chrome/CDP attachment",
+    )
+    staggered.add_argument("--min-per-hour", type=int, default=3)
+    staggered.add_argument("--max-per-hour", type=int, default=4)
+    staggered.add_argument("--max-papers", type=int, default=None)
+    staggered.add_argument("--seed", type=int, default=None)
     return parser
 
 
@@ -76,6 +85,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "run-worker-once":
         print(json.dumps(run_worker_once(downloader), indent=2))
+        return 0
+    if args.command == "run-staggered-random":
+        print(
+            json.dumps(
+                run_staggered_random_worker(
+                    downloader,
+                    min_per_hour=args.min_per_hour,
+                    max_per_hour=args.max_per_hour,
+                    max_papers=args.max_papers,
+                    seed=args.seed,
+                ),
+                indent=2,
+            )
+        )
         return 0
 
     parser.print_help()

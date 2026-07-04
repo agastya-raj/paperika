@@ -272,6 +272,25 @@ class Database:
                 (now_iso,),
             ).fetchall()
 
+    def count_active_requests(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM paper_requests WHERE status IN ('queued', 'retrying')"
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def next_retryable_at(self) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MIN(next_retry_at)
+                FROM paper_requests
+                WHERE status IN ('queued', 'retrying')
+                  AND next_retry_at IS NOT NULL
+                """
+            ).fetchone()
+            return row[0] if row and row[0] else None
+
     def update_request_status(
         self,
         request_id: int,

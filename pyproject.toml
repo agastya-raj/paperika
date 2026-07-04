@@ -14,6 +14,10 @@ authors = [
 dependencies = [
   "requests>=2.31,<3",
   "playwright>=1.44,<2",
+  # AGA-260: institutional-download bridge (FastAPI service in src/paperika/bridge).
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
