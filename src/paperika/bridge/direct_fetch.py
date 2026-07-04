@@ -78,6 +78,16 @@ _META_CONTENT_FIRST = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# A candidate URL can serve a short HTML "delivery" interstitial instead of the
+# PDF (Optica's viewmedia.cfm → view_article.cfm "your PDF will open shortly",
+# whose only real link is the /directpdfaccess/…/file.pdf URL). Pull an
+# href/src that points at a directpdfaccess path or ends in .pdf so tier 1 can
+# follow ONE interstitial hop instead of falling through to the browser tiers.
+_INTERSTITIAL_PDF_HREF = re.compile(
+    r"""(?:href|src)\s*=\s*["']([^"']*(?:/directpdfaccess/[^"']+|\.pdf(?:\?[^"']*)?))["']""",
+    re.IGNORECASE,
+)
+
 # Test seam: when set (by tests, via monkeypatch), used as the httpx transport so
 # the ladder never touches the real network. None in production ⇒ real transport.
 _TEST_TRANSPORT: httpx.AsyncBaseTransport | None = None
@@ -304,6 +314,19 @@ def _citation_pdf_url(html_text: str, base_url: str) -> str | None:
     return None
 
 
+def _interstitial_pdf_url(html_text: str, base_url: str) -> str | None:
+    """Pull the real PDF URL out of an HTML delivery interstitial: the
+    citation_pdf_url meta if present, else the first directpdfaccess/*.pdf href.
+    Resolved against the interstitial's own URL. None if nothing PDF-ish is found."""
+    meta = _citation_pdf_url(html_text, base_url)
+    if meta:
+        return meta
+    m = _INTERSTITIAL_PDF_HREF.search(html_text)
+    if m:
+        return urljoin(base_url, html.unescape(m.group(1)).strip())
+    return None
+
+
 def _publisher_candidates(final_url: str, doi: str) -> list[str]:
     """Per-publisher PDF-URL rules keyed on the landing netloc. Easy to extend:
     add a branch that returns the article-level PDF URL(s) for a new host."""
@@ -399,30 +422,70 @@ async def _run(
         if _passes_pdf_gate(body):
             return _land(download_dir, doi, body, final_url, tried, note="landing is pdf")
 
-        # 3a/3b. Try up to 3 candidate PDF URLs in priority order.
+        # 3a/3b. Try up to 3 candidate PDF URLs in priority order. Each candidate
+        # may serve the PDF directly, a 202 "generating" (retried in place), or an
+        # HTML delivery interstitial (followed ONE hop to its directpdfaccess PDF).
         for url in _candidate_urls(final_url, doi, body)[:3]:
-            # A 202 "generating" (Optica) is retried in place a few times before
-            # this candidate is abandoned; every other status decides immediately.
-            for attempt in range(_GENERATING_RETRIES + 1):
-                try:
-                    cstatus, cbody, cfinal = await _get(client, url)
-                except httpx.HTTPError as exc:
-                    tried.append(f"GET {url} -> {type(exc).__name__}")
-                    break
-                tried.append(f"GET {url} -> {cstatus} ({cfinal})")
-                if _looks_like_wall(cstatus, cbody):
-                    wall_seen = True
-                    break
-                if _passes_pdf_gate(cbody):
-                    return _land(download_dir, doi, cbody, cfinal, tried, note="candidate pdf")
-                if cstatus in _GENERATING_STATUSES and attempt < _GENERATING_RETRIES:
-                    await asyncio.sleep(_GENERATING_BACKOFF_SECONDS)
-                    continue
-                break
+            outcome = await _resolve_candidate(client, url, download_dir, doi, tried)
+            if isinstance(outcome, DirectFetchResult):
+                return outcome
+            if outcome == "wall":
+                wall_seen = True
 
         # 5. Classify the miss.
         kind = "wall" if wall_seen else "no_pdf"
         return DirectFetchResult(kind=kind, final_url=final_url, notes=_note(kind, tried), tried=tried)
+
+
+async def _fetch_with_generating_retry(
+    client: httpx.AsyncClient, url: str, tried: list[str]
+) -> tuple[int, bytes, str] | str:
+    """GET ``url``, retrying a 202 "generating" a bounded number of times. Returns
+    (status, body, final_url), or the string ``"error"`` if the transport failed
+    (already appended to ``tried``)."""
+    for attempt in range(_GENERATING_RETRIES + 1):
+        try:
+            status, body, cfinal = await _get(client, url)
+        except httpx.HTTPError as exc:
+            tried.append(f"GET {url} -> {type(exc).__name__}")
+            return "error"
+        tried.append(f"GET {url} -> {status} ({cfinal})")
+        if status in _GENERATING_STATUSES and attempt < _GENERATING_RETRIES:
+            await asyncio.sleep(_GENERATING_BACKOFF_SECONDS)
+            continue
+        return status, body, cfinal
+    return status, body, cfinal
+
+
+async def _resolve_candidate(
+    client: httpx.AsyncClient, url: str, download_dir: Path, doi: str, tried: list[str]
+) -> DirectFetchResult | str | None:
+    """Resolve one candidate to a landed PDF, a wall, or a miss. Returns a
+    ``DirectFetchResult`` on a successful land, ``"wall"`` if a 403/challenge was
+    seen, else ``None``. Handles a single HTML-interstitial hop (Optica) to the
+    embedded directpdfaccess PDF."""
+    fetched = await _fetch_with_generating_retry(client, url, tried)
+    if fetched == "error":
+        return None
+    status, body, cfinal = fetched
+    if _looks_like_wall(status, body):
+        return "wall"
+    if _passes_pdf_gate(body):
+        return _land(download_dir, doi, body, cfinal, tried, note="candidate pdf")
+
+    # HTML interstitial: follow ONE hop to the embedded PDF (never recurse further).
+    followup = _interstitial_pdf_url(body.decode("utf-8", "replace"), cfinal)
+    if not followup or followup == url:
+        return None
+    fetched2 = await _fetch_with_generating_retry(client, followup, tried)
+    if fetched2 == "error":
+        return None
+    status2, body2, cfinal2 = fetched2
+    if _looks_like_wall(status2, body2):
+        return "wall"
+    if _passes_pdf_gate(body2):
+        return _land(download_dir, doi, body2, cfinal2, tried, note="interstitial pdf")
+    return None
 
 
 async def attempt_direct_fetch(

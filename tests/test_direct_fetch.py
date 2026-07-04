@@ -332,6 +332,33 @@ def test_optica_202_candidate_is_retried_until_pdf(tmp_path, monkeypatch):
     assert state["viewmedia_hits"] == 3  # two 202s then the PDF
 
 
+def test_optica_html_interstitial_followed_to_directpdfaccess(tmp_path, monkeypatch):
+    # JOCN's viewmedia.cfm returns 200 with a "your PDF will open shortly"
+    # interstitial whose only link is a relative /directpdfaccess/…/file.pdf.
+    # Tier 1 must follow that ONE hop to the PDF (live gap: fell to codex, 187s).
+    interstitial = (
+        b"<html><body>Your PDF will open shortly."
+        b'<a href="/directpdfaccess/KEY_408227/jocn-11-5-226.pdf?da=1&id=408227&seq=0">here</a>'
+        b"</body></html>"
+    )
+
+    def handler(request):
+        host, path = request.url.host, request.url.path
+        if host == "doi.org":
+            return httpx.Response(302, headers={"location": "https://opg.optica.org/jocn/fulltext.cfm?uri=jocn-11-5-226"})
+        if path.endswith("/fulltext.cfm"):
+            return httpx.Response(200, headers={"content-type": "text/html"}, content=b"<html>jocn abstract</html>")
+        if path.endswith("/viewmedia.cfm"):
+            return httpx.Response(200, headers={"content-type": "text/html"}, content=interstitial)
+        if "/directpdfaccess/" in path:
+            return httpx.Response(200, headers={"content-type": "application/pdf"}, content=PDF_OK)
+        return httpx.Response(404, content=b"nope")
+
+    result = _fetch(tmp_path, monkeypatch, handler, doi="10.1364/jocn.11.000226")
+    assert result.kind == "downloaded"
+    assert "interstitial pdf" in result.notes
+
+
 def test_optica_202_forever_is_no_pdf(tmp_path, monkeypatch):
     # A candidate stuck at 202 past the retry budget is abandoned as no_pdf (not
     # a wall, not an infinite loop), leaving the ladder free to escalate.
