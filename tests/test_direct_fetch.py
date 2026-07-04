@@ -303,6 +303,57 @@ def test_candidate_403_after_ok_landing_is_wall(tmp_path, monkeypatch):
     assert result.kind == "wall"
 
 
+# ------------------------------------------------- Optica 202 "generating" ---
+
+
+def test_optica_202_candidate_is_retried_until_pdf(tmp_path, monkeypatch):
+    # opg.optica.org generates the PDF on demand: the viewmedia candidate returns
+    # 202 with a "generating" body, then the real %PDF- on a later retry. Tier 1
+    # must retry the 202 in place rather than classifying no_pdf (live gap on the
+    # user's most common publisher; codex fallback cost 57s).
+    monkeypatch.setattr(direct_fetch, "_GENERATING_BACKOFF_SECONDS", 0.0)
+    state = {"viewmedia_hits": 0}
+
+    def handler(request):
+        host, path = request.url.host, request.url.path
+        if host == "doi.org":
+            return httpx.Response(302, headers={"location": "https://opg.optica.org/oe/fulltext.cfm?uri=oe-25-16-18553"})
+        if path.endswith("/fulltext.cfm"):
+            return httpx.Response(200, headers={"content-type": "text/html"}, content=b"<html>optica fulltext</html>")
+        if path.endswith("/viewmedia.cfm"):
+            state["viewmedia_hits"] += 1
+            if state["viewmedia_hits"] <= 2:
+                return httpx.Response(202, headers={"content-type": "text/html"}, content=b"<html>generating</html>")
+            return httpx.Response(200, headers={"content-type": "application/pdf"}, content=PDF_OK)
+        return httpx.Response(404, content=b"nope")
+
+    result = _fetch(tmp_path, monkeypatch, handler, doi="10.1364/oe.25.018553")
+    assert result.kind == "downloaded"
+    assert state["viewmedia_hits"] == 3  # two 202s then the PDF
+
+
+def test_optica_202_forever_is_no_pdf(tmp_path, monkeypatch):
+    # A candidate stuck at 202 past the retry budget is abandoned as no_pdf (not
+    # a wall, not an infinite loop), leaving the ladder free to escalate.
+    monkeypatch.setattr(direct_fetch, "_GENERATING_BACKOFF_SECONDS", 0.0)
+    state = {"viewmedia_hits": 0}
+
+    def handler(request):
+        host, path = request.url.host, request.url.path
+        if host == "doi.org":
+            return httpx.Response(302, headers={"location": "https://opg.optica.org/oe/fulltext.cfm?uri=oe-25-16-18553"})
+        if path.endswith("/fulltext.cfm"):
+            return httpx.Response(200, headers={"content-type": "text/html"}, content=b"<html>optica</html>")
+        if path.endswith("/viewmedia.cfm"):
+            state["viewmedia_hits"] += 1
+            return httpx.Response(202, headers={"content-type": "text/html"}, content=b"<html>generating</html>")
+        return httpx.Response(404)
+
+    result = _fetch(tmp_path, monkeypatch, handler, doi="10.1364/oe.25.018553")
+    assert result.kind == "no_pdf"
+    assert state["viewmedia_hits"] == direct_fetch._GENERATING_RETRIES + 1
+
+
 # ----------------------------------------------------------- error / budget ---
 
 

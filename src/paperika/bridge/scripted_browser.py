@@ -219,6 +219,30 @@ async def _dismiss_cookie_banner(page: object) -> None:
             continue
 
 
+async def _safe_content(page: object) -> str:
+    """Read ``page.content()`` tolerating a mid-navigation race. A publisher with a
+    multi-hop delivery interstitial (Optica) can still be navigating when we read,
+    and Playwright then raises "Unable to retrieve content because the page is
+    navigating". Wait for the DOM to settle, and on failure settle once and retry;
+    return "" if it still can't be read (an unreadable page is not a bot wall, so
+    the caller proceeds instead of collapsing the whole tier to error)."""
+    getter = getattr(page, "content", None)
+    if getter is None:
+        return ""
+    for attempt in range(2):
+        await _call_if_present(page, "wait_for_load_state", "domcontentloaded", timeout=DELIVERY_TIMEOUT_MS)
+        try:
+            return await getter()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            if attempt == 0:
+                await _settle_briefly(page)
+                continue
+            return ""
+    return ""
+
+
 async def _collect_anchors(page: object) -> list[tuple[str, str]]:
     raw = await page.eval_on_selector_all(
         "a[href]",
@@ -278,7 +302,7 @@ async def _run_scripted(
         await _settle_briefly(page)
 
         # bot-wall fast fail on the landing page.
-        landing_html = await page.content()
+        landing_html = await _safe_content(page)
         if is_challenge_html(landing_html):
             here = str(page.url)
             return ScriptedFetchResult(kind="wall", final_url=here, notes=f"bot/CAPTCHA wall at {here}", tried=tried)
@@ -309,7 +333,7 @@ async def _run_scripted(
         media_url = str(page.url)
 
         # bot-wall can also appear on the delivery hop.
-        delivery_html = await page.content()
+        delivery_html = await _safe_content(page)
         if is_challenge_html(delivery_html):
             return ScriptedFetchResult(kind="wall", final_url=media_url, notes=f"bot/CAPTCHA wall at {media_url}", tried=tried)
 

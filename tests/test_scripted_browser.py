@@ -414,3 +414,39 @@ def test_goto_failure_is_error_and_closes_page(tmp_path, monkeypatch):
     assert result.kind == "error"
     assert "ERR_TIMED_OUT" in result.notes
     assert page.closed is True
+
+
+def test_content_navigation_race_is_tolerated(tmp_path, monkeypatch):
+    """page.content() during a multi-hop delivery interstitial (Optica) raises
+    'page is navigating and changing the content'. _safe_content must swallow the
+    first race, settle, and retry — the tier proceeds to download instead of
+    collapsing to error (live gap: this failed the whole tier-2 attempt)."""
+    media_url = "https://opg.optica.org/directpdfaccess/tok/jocn.pdf"
+    anchor = "https://opg.optica.org/viewmedia.cfm?uri=jocn-17-9-D106&seq=0"
+
+    class RacingPage(FakePage):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self._content_calls = 0
+
+        async def content(self) -> str:
+            self._content_calls += 1
+            if self._content_calls == 1:
+                raise RuntimeError(
+                    "Page.content: Unable to retrieve content because the page is "
+                    "navigating and changing the content."
+                )
+            return "<html><body>article full text</body></html>"
+
+    page = RacingPage(
+        url="https://opg.optica.org/abstract.cfm?URI=jocn-17-9-D106",
+        anchors=((anchor, "PDF Article"),),
+        redirects={anchor: media_url},
+        request_map={media_url: BIG_PDF},
+    )
+    _patch_connection(monkeypatch, page)
+    result = _run(page, tmp_path)
+
+    assert result.kind == "downloaded"
+    assert page._content_calls >= 2  # first raised, retry succeeded
+    assert page.closed is True

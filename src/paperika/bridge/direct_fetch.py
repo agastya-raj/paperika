@@ -100,6 +100,14 @@ _BLOCKED_HOSTNAMES = frozenset({"localhost"})
 # Cap the manual redirect chain so a redirect loop can't spin.
 _MAX_REDIRECTS = 10
 
+# Optica (opg.optica.org) generates the article PDF on demand: the first hit on
+# viewmedia.cfm returns 202 Accepted with a "generating" HTML body, then serves
+# the real %PDF- on a retry a few seconds later. Retry a 202 candidate a bounded
+# number of times (budget-checked) before giving up on it.
+_GENERATING_STATUSES = frozenset({202})
+_GENERATING_RETRIES = 3
+_GENERATING_BACKOFF_SECONDS = 2.0
+
 
 class _BlockedTarget(httpx.HTTPError):
     """A URL / redirect hop pointed at a non-public host — refused. Subclasses
@@ -393,17 +401,24 @@ async def _run(
 
         # 3a/3b. Try up to 3 candidate PDF URLs in priority order.
         for url in _candidate_urls(final_url, doi, body)[:3]:
-            try:
-                cstatus, cbody, cfinal = await _get(client, url)
-            except httpx.HTTPError as exc:
-                tried.append(f"GET {url} -> {type(exc).__name__}")
-                continue
-            tried.append(f"GET {url} -> {cstatus} ({cfinal})")
-            if _looks_like_wall(cstatus, cbody):
-                wall_seen = True
-                continue
-            if _passes_pdf_gate(cbody):
-                return _land(download_dir, doi, cbody, cfinal, tried, note="candidate pdf")
+            # A 202 "generating" (Optica) is retried in place a few times before
+            # this candidate is abandoned; every other status decides immediately.
+            for attempt in range(_GENERATING_RETRIES + 1):
+                try:
+                    cstatus, cbody, cfinal = await _get(client, url)
+                except httpx.HTTPError as exc:
+                    tried.append(f"GET {url} -> {type(exc).__name__}")
+                    break
+                tried.append(f"GET {url} -> {cstatus} ({cfinal})")
+                if _looks_like_wall(cstatus, cbody):
+                    wall_seen = True
+                    break
+                if _passes_pdf_gate(cbody):
+                    return _land(download_dir, doi, cbody, cfinal, tried, note="candidate pdf")
+                if cstatus in _GENERATING_STATUSES and attempt < _GENERATING_RETRIES:
+                    await asyncio.sleep(_GENERATING_BACKOFF_SECONDS)
+                    continue
+                break
 
         # 5. Classify the miss.
         kind = "wall" if wall_seen else "no_pdf"
