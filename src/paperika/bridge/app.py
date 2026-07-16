@@ -49,7 +49,14 @@ SWEEP_WINDOW_SECONDS = executor.EXEC_WALL_SECONDS + 30
 
 # Per-tier wall-clock budgets for the deterministic ladder (AGA-339). Tier 3
 # (codex) is bounded separately by executor.EXEC_WALL_SECONDS.
-TIER1_BUDGET = 20.0
+# 20.0 was under the real cost of a tier-1 hit: the Optica flow (challenge
+# handshake → replay → interstitial → PDF) measures ~30-38s end to end, of which
+# ~29s is the 11.6 MB transfer itself and only ~1.4s the gate — so the old budget
+# killed a WORKING fetch as "error (budget exceeded)" (AGA-489). This is an overall
+# asyncio.timeout; direct_fetch._timeout() separately caps each REQUEST's read at
+# min(budget, 15.0) — a per-read gap cap, not a total, so a steady multi-minute
+# stream never trips it.
+TIER1_BUDGET = 60.0
 TIER2_BUDGET = 45.0
 
 
@@ -111,6 +118,13 @@ _TAXONOMY: dict[str, tuple[str, str, int, str]] = {
     "paywalled_no_access": ("no_access", "no_institutional_access", 403, "paywalled_no_access"),
     "bot_wall": ("bot_wall", "bot_wall", 502, "bot_wall"),
     "gave_up": ("executor_gave_up", "executor_failed", 502, "codex_gave_up"),
+    # A death, not a verdict (AGA-489): the executor crashed / failed its turn /
+    # exited non-zero, so it never judged the paper. Distinct from gave_up — which
+    # is terminal advice ("this paper is not obtainable, stop") — because the same
+    # underlying event used to be stamped gave_up when it self-exited and timeout
+    # when it hit the wall, i.e. the CLEANER death got the more terminal code.
+    # RETRYABLE: the caller should try again (KC keys off this error_code string).
+    "executor_died": ("executor_died", "executor_failed", 502, "executor_died"),
     "auth_error": ("auth_error", "executor_failed", 503, "codex_auth"),
     "timeout": ("timeout", "executor_failed", 504, "executor_timeout"),
 }
@@ -766,7 +780,7 @@ async def _run_codex_tier(
     ended = _utc_now()
     screenshot = str(run_dir / "final.png") if (run_dir / "final.png").exists() else None
 
-    bad_outcome = exec_result.kind in {"timeout", "gave_up"}
+    bad_outcome = exec_result.kind in {"timeout", "gave_up", "executor_died"}
     response = await _resolve_outcome(
         bridge, exec_result=exec_result, request_id=request_id, attempt_id=attempt_id,
         doi=doi, title=title, run_dir=run_dir, window_start=started, window_end=ended,
@@ -840,8 +854,10 @@ async def _resolve_outcome(
                                attempt_id=attempt_id, screenshot=screenshot,
                                message="executor reported 'downloaded' but no PDF was located")
 
-    # salvage pass on timeout/gave_up
-    if kind in {"timeout", "gave_up"}:
+    # salvage pass on timeout/gave_up/executor_died — a run that died (or timed out)
+    # may still have written the PDF before dying, so it gets the same locate+verify
+    # pass rather than being failed blind.
+    if kind in {"timeout", "gave_up", "executor_died"}:
         located = bridge._locate_in_window(window_start, window_end)
         if located is not None and bridge._mechanical_gates(located):
             ok, reason = bridge.verify_identity(doi=doi, title=title, path=located)

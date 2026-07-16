@@ -20,9 +20,11 @@ import time
 
 CODEX_BIN = "codex"
 # 240 was too tight: run 62 burned 204s on navigation alone, and run 63 was
-# killed AT Optica's "your PDF will open shortly" delivery page. Each codex
-# turn costs ~35s; the full navigate→judge→download→report chain needs slack.
-EXEC_WALL_SECONDS = 480
+# killed AT Optica's "your PDF will open shortly" delivery page. 480 then became
+# too tight in turn once the executor moved to high reasoning effort (below): a
+# TRIVIAL turn measures ~71s at high, so the navigate→judge→download→report chain
+# would simply convert "gave_up" into "timeout" at the old wall.
+EXEC_WALL_SECONDS = 900
 KILL_GRACE_SECONDS = 15
 
 # MCP servers from ~/.codex/config.toml (browserbase, brave_search, ...) are
@@ -30,9 +32,20 @@ KILL_GRACE_SECONDS = 15
 # could shadow the local CDP Chrome; disable them for every bridge invocation.
 MCP_OFF: list[str] = ["-c", "mcp_servers={}"]
 
-# Fast mode (user request): low reasoning effort cuts the ~35s/turn latency,
-# buying more exploration turns inside EXEC_WALL_SECONDS.
-REASONING_FAST: list[str] = ["-c", 'model_reasoning_effort="low"']
+# CONFIG-DIVERGENCE TRAP: model, reasoning effort and service tier are pinned HERE
+# and OVERRIDE ~/.codex/config.toml. Reading that file therefore tells an operator
+# NOTHING about what a bridge run actually used — these three lists are the truth.
+# Pinned (rather than inherited) so the bridge is self-contained and an unrelated
+# edit to config.toml can never silently change what downloads papers.
+#
+# gpt-5.6-sol at HIGH effort: the download task is judgment work (is this a wall or
+# just header chrome? is this the article PDF or a figure?), which low effort was
+# losing; the fast service tier buys back the latency high effort costs, and the
+# two compose — Sol's reasoning at fast-tier latency. All verified on the gpu host
+# with codex-cli 0.144.5.
+CODEX_MODEL: list[str] = ["-m", "gpt-5.6-sol"]
+REASONING_HIGH: list[str] = ["-c", 'model_reasoning_effort="high"']
+SERVICE_TIER_FAST: list[str] = ["-c", 'service_tier="fast"']
 
 # Final-message JSON Schema (--output-schema). Forces the executor's last message
 # into the shape the bridge parses. OpenAI strict structured outputs require
@@ -83,11 +96,14 @@ DOI and title are given in task.json. Save it to
 /home/agastya/Downloads/papers/<sanitized-doi>.pdf. The file must start with
 the bytes %PDF-.
 
-Preferred retrieval method (works even when the publisher renders PDFs inline
-instead of triggering a browser download — the most common reason a click
-"does nothing"): find the article-level PDF link, resolve it to a URL, then
-fetch the bytes through the SAME authenticated browser session and write them
-yourself:
+You choose the route to the %PDF- bytes. The following is a STRONG HINT — the
+method that usually works, not the only permitted path. If you see a better
+route, take it; judge from what the page actually shows you.
+
+Strong hint (works even when the publisher renders PDFs inline instead of
+triggering a browser download — the most common reason a click "does
+nothing"): find the article-level PDF link, resolve it to a URL, then fetch the
+bytes through the SAME authenticated browser session and write them yourself:
   1. Locate the article PDF anchor (left sidebar / toolbar "PDF" / "PDF
      Article" / "View PDF" / "Download PDF"). Read its href = pdf_url.
   2. If clicking it would pass through a "your PDF will open shortly"
@@ -101,6 +117,16 @@ Browser-native download via CDP Browser.setDownloadBehavior(behavior="allow",
 downloadPath=/home/agastya/Downloads/papers) is an acceptable fallback, but
 inline-rendered PDFs never fire a download event — prefer the fetch above.
 Only write PDF bytes you actually retrieved; never fabricate a file.
+
+Bot-challenge pages (opg.optica.org and other Imperva/Distil sites): a response
+that is HTTP 202 with a tiny "Please wait..." body containing a checkjs call is
+a JavaScript-execution BOT CHALLENGE. It is NOT a paywall, and nothing is
+"generating" — do not classify it paywalled_no_access, and do not sit waiting
+for it. A real browser clears it by RUNNING the body's script, so simply
+navigating your page to that URL (rather than fetching it) normally clears the
+gate within seconds and lands you on the delivery page; the article PDF is then
+reachable. Re-fetching the identical URL without executing its script clears
+nothing, however many times you try.
 
 Access judgment: this machine has IP-based institutional access — you are
 already "authenticated" by network address. Publisher pages routinely show
@@ -129,14 +155,24 @@ size > 10 KB, and begins with %PDF-; poll for up to 90 seconds, and NEVER
 close your page or the CDP connection while a .crdownload is still present —
 closing the page cancels it (a 0-byte file is the signature of that mistake).
 
-Hard rules:
-- At most 6 page navigations on publisher domains, and at most ONE download
-  attempt total. If a page times out, shows a CAPTCHA/bot check, or a wall
-  that blocks the article content itself (per the access-judgment test
-  above), STOP and report the matching outcome
-  (throttled / bot_wall / paywalled_no_access). Do not retry, do not press on.
-- Never log in to anything, never enter credentials, never solve CAPTCHAs.
+Budget and persistence (use your judgment inside these bounds):
+- At most 12 page navigations on publisher domains, and at most 3 download
+  attempts for THIS paper. That budget is per-paper: it never authorizes
+  fetching any paper other than the one named in task.json.
+- A transient failure is worth one bounded retry: if a page times out or an
+  attempt comes back empty, you may retry it or try one alternative route to
+  the same paper's PDF, within the budget above. Do not grind — when the
+  budget is spent, or the evidence is conclusive, stop and report the matching
+  outcome (throttled / bot_wall / paywalled_no_access / gave_up). A wall that
+  blocks the article content itself (per the access-judgment test above) is
+  conclusive on sight: report it, do not press on.
+
+Hard rules (non-negotiable, no budget or judgment overrides these):
+- Never log in to anything, never enter credentials, never solve CAPTCHAs. A
+  real CAPTCHA or hard bot block is outcome=bot_wall — report it and stop;
+  never try to defeat it.
 - Never navigate to domains unrelated to this paper's publisher or doi.org.
+- Never fabricate PDF bytes: only ever write bytes you actually retrieved.
 - Before finishing (success or failure), screenshot your page to
   {run_dir}/final.png.
 
@@ -176,7 +212,7 @@ def sandbox_flags(sandbox_mode: str) -> list[str]:
 class ExecResult:
     # Bridge-internal classification of an executor run.
     kind: str  # "downloaded" | "throttled" | "paywalled_no_access" | "bot_wall"
-    #            | "gave_up" | "timeout" | "auth_error"
+    #            | "gave_up" | "executor_died" | "timeout" | "auth_error"
     file_path: str | None = None
     final_url: str | None = None
     notes: str = ""
@@ -241,6 +277,25 @@ def classify(
     if timed_out or exit_code == 124:
         return ExecResult(kind="timeout", notes="executor exceeded the wall-clock budget", **base)
 
+    # A DEATH is not a verdict (AGA-489). Without this gate every non-timeout death
+    # — crash, turn.failed, stream error, context overflow, non-zero exit — fell
+    # through to the parse below, produced no last message, and got stamped
+    # "gave_up" / "unparseable last message": terminal advice ("stop, this paper is
+    # not obtainable") derived from the executor never having judged the paper at
+    # all. The two honest markers of a run that reached its own conclusion are a
+    # turn.completed event and a clean exit (124 is the `timeout` wrapper's code,
+    # already classified above). Anything else is executor_died — retryable.
+    if not _turn_completed(events) or exit_code not in {0, 124}:
+        return ExecResult(
+            kind="executor_died",
+            notes=(
+                "executor died before completing its turn "
+                f"(turn.completed={_turn_completed(events)}, exit={exit_code}); "
+                "no verdict was reached"
+            ),
+            **base,
+        )
+
     # Parse the structured last message.
     parsed: dict | None = None
     text = (last_message or "").strip()
@@ -258,7 +313,15 @@ def classify(
                     parsed = None
 
     if not isinstance(parsed, dict) or "outcome" not in parsed:
-        return ExecResult(kind="gave_up", notes="unparseable last message", **base)
+        # Reachable only for a run that DID complete its turn and exit 0 (the death
+        # cases are executor_died above). --output-schema is enforced, so a turn
+        # that reaches a final message emits conforming JSON by construction — an
+        # unparseable one here is an anomaly, not the model declining the paper.
+        return ExecResult(
+            kind="gave_up",
+            notes="turn completed but its final message was not schema-conforming JSON",
+            **base,
+        )
 
     outcome = parsed.get("outcome")
     notes = str(parsed.get("notes") or "")
@@ -292,7 +355,9 @@ def build_argv(
         "exec",
         "--skip-git-repo-check",
         *MCP_OFF,
-        *REASONING_FAST,
+        *CODEX_MODEL,
+        *REASONING_HIGH,
+        *SERVICE_TIER_FAST,
         *sandbox_flags(sandbox_mode),
         "-C",
         str(run_dir),
@@ -324,8 +389,9 @@ async def run_codex(
     write_schema: bool = True,
     env: dict[str, str] | None = None,
 ) -> ExecResult:
-    """Spawn ``timeout 240 codex exec ...`` with start_new_session=True; on overrun
-    killpg the whole process group (codex + spawned venv python).
+    """Spawn ``timeout <EXEC_WALL_SECONDS> codex exec ...`` with
+    start_new_session=True; on overrun killpg the whole process group (codex +
+    spawned venv python).
 
     CODEX_HOME is left unset ⇒ /home/agastya/.codex (host login).
     """

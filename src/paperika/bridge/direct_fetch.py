@@ -16,7 +16,8 @@ Security invariants (mirroring the codex-executor containment, §2.4):
 - Every fetched URL and every byte of returned HTML is treated strictly as DATA;
   none of it is ever executed or interpolated into a prompt.
 - Redirects are followed MANUALLY (httpx ``follow_redirects`` is off) and every
-  hop — plus the start URL and every candidate PDF URL — is gated through
+  hop — plus the start URL, every candidate PDF URL, and both URLs scraped out of
+  a bot-challenge body (the checkjs + replay handshake) — is gated through
   ``is_public_http_url``: http(s) scheme only, and the host must resolve
   exclusively to public/global IPs. A hop pointed at an internal target
   (loopback / link-local / private / reserved — e.g. the CDP control port
@@ -110,13 +111,40 @@ _BLOCKED_HOSTNAMES = frozenset({"localhost"})
 # Cap the manual redirect chain so a redirect loop can't spin.
 _MAX_REDIRECTS = 10
 
-# Optica (opg.optica.org) generates the article PDF on demand: the first hit on
-# viewmedia.cfm returns 202 Accepted with a "generating" HTML body, then serves
-# the real %PDF- on a retry a few seconds later. Retry a 202 candidate a bounded
-# number of times (budget-checked) before giving up on it.
-_GENERATING_STATUSES = frozenset({202})
-_GENERATING_RETRIES = 3
-_GENERATING_BACKOFF_SECONDS = 2.0
+# Imperva/Distil JavaScript-execution bot challenge (seen on opg.optica.org's
+# media endpoint). The 202 body is NOT a "PDF is generating" placeholder and the
+# gate is NOT on time: there is no Retry-After and no Location header — the whole
+# protocol lives in the body, which does
+#   fetch('/checkjs.cfm?s=<token>&x=1').then(() => location.replace('<replay>'))
+# (plus the same replay URL in a <noscript> meta refresh). The checkjs RESPONSE is
+# what sets the Imperva cookie; the replay URL then serves the real object. So the
+# gate is cleared by an ACTION — re-GETting the same URL clears nothing at any
+# retry count or delay. Two properties are load-bearing, both verified live:
+#   - the checkjs hop cannot be skipped: replaying the <noscript> target directly
+#     lands on a CAPTCHA;
+#   - the ``s=`` token is minted PER RESPONSE ⇒ always scrape it from the body at
+#     hand, never hardcode or cache it.
+# Both hops must run on the SAME client, or the cookie the gate checks is lost.
+_JS_CHALLENGE_STATUSES = frozenset({202})
+# One handshake clears the gate (~1.4s on the first try, verified); a second round
+# only covers a re-challenge. Past that it is a loop, and we refuse to spin.
+_JS_CHALLENGE_MAX_ROUNDS = 2
+# The body's own instructions, in the two places the server writes them. Kept to
+# the mechanism (fetch(...) / location.replace(...) / <noscript> refresh) rather
+# than to Optica trivia — this is an Imperva pattern, not a publisher quirk.
+_JS_CHALLENGE_CHECK_RE = re.compile(r"""fetch\(\s*["']([^"']+)["']""", re.IGNORECASE)
+_JS_CHALLENGE_REPLAY_RE = re.compile(
+    r"""location\s*\.\s*replace\(\s*["']([^"']+)["']""", re.IGNORECASE
+)
+_JS_CHALLENGE_NOSCRIPT_RE = re.compile(
+    r"""<meta\b[^>]*?\bhttp-equiv\s*=\s*["']refresh["'][^>]*?"""
+    r"""\bcontent\s*=\s*["'][^"']*?\burl\s*=\s*([^"']+)["']""",
+    re.IGNORECASE,
+)
+# How much of a challenge stub we never cleared to carry into the trace (and thus
+# into the attempt row's message), so the NEXT Imperva shape change is diagnosable
+# instead of a silent no_pdf.
+_STUB_EXCERPT_CHARS = 300
 
 
 class _BlockedTarget(httpx.HTTPError):
@@ -408,7 +436,13 @@ async def _run(
     tried: list[str],
 ) -> DirectFetchResult:
     async with _build_async_client(cookies=jar, timeout=_timeout(budget_seconds)) as client:
-        # 1-2. GET the landing page (normally https://doi.org/{doi}).
+        # 1-2. GET the landing page (normally https://doi.org/{doi}). Deliberately
+        # NOT challenge-clearing: the real doi.org chain for an Optica article lands
+        # on the MEDIA endpoint (viewmedia.cfm?uri=…&html=true), so an uncleared 202
+        # stub still carries the ``uri`` the publisher rule keys on, whereas the
+        # CLEARED landing resolves onto view_article.cfm?pdfKey=… — which may carry
+        # no ``uri`` at all and would yield zero candidates. The gate is cleared per
+        # CANDIDATE instead, where the PDF actually is.
         try:
             status, body, final_url = await _get(client, start_url)
         except httpx.HTTPError as exc:
@@ -423,8 +457,9 @@ async def _run(
             return _land(download_dir, doi, body, final_url, tried, note="landing is pdf")
 
         # 3a/3b. Try up to 3 candidate PDF URLs in priority order. Each candidate
-        # may serve the PDF directly, a 202 "generating" (retried in place), or an
-        # HTML delivery interstitial (followed ONE hop to its directpdfaccess PDF).
+        # may serve the PDF directly, a 202 JS bot challenge (cleared in place via
+        # the body's own checkjs→replay handshake), or an HTML delivery interstitial
+        # (followed ONE hop to its directpdfaccess PDF).
         for url in _candidate_urls(final_url, doi, body)[:3]:
             outcome = await _resolve_candidate(client, url, download_dir, doi, tried)
             if isinstance(outcome, DirectFetchResult):
@@ -437,24 +472,92 @@ async def _run(
         return DirectFetchResult(kind=kind, final_url=final_url, notes=_note(kind, tried), tried=tried)
 
 
-async def _fetch_with_generating_retry(
+async def _get_traced(
     client: httpx.AsyncClient, url: str, tried: list[str]
 ) -> tuple[int, bytes, str] | str:
-    """GET ``url``, retrying a 202 "generating" a bounded number of times. Returns
-    (status, body, final_url), or the string ``"error"`` if the transport failed
-    (already appended to ``tried``)."""
-    for attempt in range(_GENERATING_RETRIES + 1):
-        try:
-            status, body, cfinal = await _get(client, url)
-        except httpx.HTTPError as exc:
-            tried.append(f"GET {url} -> {type(exc).__name__}")
-            return "error"
-        tried.append(f"GET {url} -> {status} ({cfinal})")
-        if status in _GENERATING_STATUSES and attempt < _GENERATING_RETRIES:
-            await asyncio.sleep(_GENERATING_BACKOFF_SECONDS)
-            continue
-        return status, body, cfinal
+    """``_get`` plus the shared trace bookkeeping: append the hop to ``tried`` and
+    return the string ``"error"`` instead of raising, so a transport failure — or a
+    target the SSRF guard refused — is a miss the ladder escalates past, never a
+    crash."""
+    try:
+        status, body, cfinal = await _get(client, url)
+    except httpx.HTTPError as exc:
+        tried.append(f"GET {url} -> {type(exc).__name__}")
+        return "error"
+    tried.append(f"GET {url} -> {status} ({cfinal})")
     return status, body, cfinal
+
+
+def _js_challenge_urls(html_text: str, base_url: str) -> tuple[str | None, str | None]:
+    """Scrape a JS-challenge body for the two URLs it prescribes: the check hop
+    (``fetch('/checkjs.cfm?s=<token>&x=1')`` — whose response mints the cookie) and
+    the replay target (``location.replace(...)``, else the ``<noscript>`` meta
+    refresh). Both are resolved against the URL that served the challenge. Either
+    is None when the stub is not a shape we know.
+
+    The returned URLs come out of a publisher-controlled body ⇒ strictly DATA. The
+    caller fetches them through ``_get``, which gates EVERY hop with
+    ``is_public_http_url`` (SSRF containment) exactly as it does for the landing,
+    the redirect chain, and the candidates."""
+    check: str | None = None
+    m = _JS_CHALLENGE_CHECK_RE.search(html_text)
+    if m:
+        check = urljoin(base_url, html.unescape(m.group(1)).strip())
+    replay: str | None = None
+    for rx in (_JS_CHALLENGE_REPLAY_RE, _JS_CHALLENGE_NOSCRIPT_RE):
+        m = rx.search(html_text)
+        if m:
+            replay = urljoin(base_url, html.unescape(m.group(1)).strip())
+            break
+    return check, replay
+
+
+def _stub_excerpt(body: bytes) -> str:
+    """A whitespace-collapsed, truncated view of a challenge stub for the trace."""
+    text = " ".join(body[:4096].decode("utf-8", "replace").split())
+    return text[:_STUB_EXCERPT_CHARS]
+
+
+async def _fetch_clearing_challenge(
+    client: httpx.AsyncClient, url: str, tried: list[str]
+) -> tuple[int, bytes, str] | str:
+    """GET ``url``, clearing a JavaScript-execution bot challenge (a 202 whose body
+    carries its own instructions) by performing the handshake that body prescribes:
+    GET the per-response checkjs URL on THIS client — so the cookie its response
+    sets is in the jar — then GET the replay URL and return that response instead.
+
+    Returns the post-handshake (status, body, final_url) for the caller's existing
+    candidate/interstitial resolution, or ``"error"`` if the FIRST GET failed (i.e.
+    the URL itself is unreachable/refused). Every other way this can go wrong — a
+    stub we cannot read, a scraped URL the SSRF guard refuses, a hop that fails, a
+    gate that will not clear — is NON-FATAL: the challenge response is returned
+    as-is, so it resolves to an ordinary miss (the landing WAS reachable), with the
+    stub body carried into ``tried`` for diagnosis."""
+    fetched = await _get_traced(client, url, tried)
+    for _ in range(_JS_CHALLENGE_MAX_ROUNDS):
+        if isinstance(fetched, str):
+            return fetched
+        status, body, cfinal = fetched
+        if status not in _JS_CHALLENGE_STATUSES:
+            return fetched
+        # Scraped fresh from THIS response: the s= token is per-response.
+        check_url, replay_url = _js_challenge_urls(body.decode("utf-8", "replace"), cfinal)
+        if not check_url or not replay_url:
+            break
+        # Both hops go through _get ⇒ both are SSRF-gated. A refused/failed hop
+        # (already traced) leaves the challenge response in ``fetched`` ⇒ miss.
+        checked = await _get_traced(client, check_url, tried)
+        if isinstance(checked, str):
+            break
+        replayed = await _get_traced(client, replay_url, tried)
+        if isinstance(replayed, str):
+            break
+        fetched = replayed
+    if not isinstance(fetched, str) and fetched[0] in _JS_CHALLENGE_STATUSES:
+        # Still gated: either the stub is not the shape we know, or the handshake
+        # stopped working. Carry the body so the change is diagnosable.
+        tried.append(f"unresolved {fetched[0]} challenge stub: {_stub_excerpt(fetched[1])}")
+    return fetched
 
 
 async def _resolve_candidate(
@@ -464,7 +567,7 @@ async def _resolve_candidate(
     ``DirectFetchResult`` on a successful land, ``"wall"`` if a 403/challenge was
     seen, else ``None``. Handles a single HTML-interstitial hop (Optica) to the
     embedded directpdfaccess PDF."""
-    fetched = await _fetch_with_generating_retry(client, url, tried)
+    fetched = await _fetch_clearing_challenge(client, url, tried)
     if fetched == "error":
         return None
     status, body, cfinal = fetched
@@ -477,7 +580,7 @@ async def _resolve_candidate(
     followup = _interstitial_pdf_url(body.decode("utf-8", "replace"), cfinal)
     if not followup or followup == url:
         return None
-    fetched2 = await _fetch_with_generating_retry(client, followup, tried)
+    fetched2 = await _fetch_clearing_challenge(client, followup, tried)
     if fetched2 == "error":
         return None
     status2, body2, cfinal2 = fetched2
