@@ -208,6 +208,17 @@ if last:
 sys.exit(0)
 """
 
+# A codex that DIES mid-turn (AGA-489): turn.failed, no turn.completed, no last
+# message, non-zero exit — a crash / stream error / context overflow, i.e. every
+# non-timeout death. Not an auth failure (no refresh-token/401 markers).
+_STUB_CRASH = r"""
+import sys, json
+print(json.dumps({"type": "thread.started", "thread_id": "x"}))
+print(json.dumps({"type": "turn.started"}))
+print(json.dumps({"type": "turn.failed", "error": {"message": "stream disconnected before completion"}}))
+sys.exit(1)
+"""
+
 _STUB_SELFTEST_OK = r"""
 import sys, os, json
 argv = sys.argv
@@ -403,6 +414,67 @@ def test_executor_jsonl_gaveup(cfg, tmp_path, monkeypatch):
     res = asyncio.run(executor.run_codex(tmp_path / "run", "prompt", "bypass"))
     assert res.kind == "gave_up"
     argv_unused = res  # bypass argv asserted elsewhere
+
+
+def test_executor_died_when_turn_never_completed(cfg, tmp_path, monkeypatch):
+    """AGA-489: a codex that dies mid-turn (turn.failed + non-zero exit, no
+    turn.completed) is executor_died — a DEATH, not the model's verdict. It used to
+    fall through to 'unparseable last message' ⇒ gave_up ⇒ terminal."""
+    _install_stub_codex(tmp_path, monkeypatch, script_body=_STUB_CRASH)
+    import asyncio
+    res = asyncio.run(executor.run_codex(tmp_path / "run", "prompt", "workspace-write"))
+    assert res.kind == "executor_died"
+    assert "died before completing" in res.notes
+
+
+def test_classify_no_turn_completed_is_executor_died():
+    """The gate proper: no turn.completed event ⇒ executor_died, even on exit 0 and
+    even with events present (stream cut, context overflow, silent self-exit)."""
+    res = executor.classify(
+        exit_code=0, events=[{"type": "turn.started"}], last_message="", stderr="",
+        timed_out=False, wall_seconds=447.0,
+    )
+    assert res.kind == "executor_died"
+    # the note names the real cause, not the old "unparseable last message" lie
+    assert "turn.completed=False" in res.notes
+
+
+def test_classify_nonzero_exit_is_executor_died():
+    """The other half of the gate: a completed turn but a non-zero exit (124 is the
+    `timeout` wrapper's code, classified timeout upstream) is still a death."""
+    res = executor.classify(
+        exit_code=1, events=[{"type": "turn.completed"}], last_message="", stderr="",
+        timed_out=False, wall_seconds=12.0,
+    )
+    assert res.kind == "executor_died"
+    assert "exit=1" in res.notes
+
+
+def test_classify_completed_turn_still_yields_the_models_verdict():
+    """The gate must not swallow real verdicts: a completed turn + clean exit +
+    schema-conforming message still classifies from the message."""
+    msg = json.dumps({"outcome": "paywalled_no_access", "file_path": None,
+                      "final_url": "https://pub.example.org/a", "notes": "no access"})
+    res = executor.classify(
+        exit_code=0, events=[{"type": "turn.completed"}], last_message=msg, stderr="",
+        timed_out=False, wall_seconds=30.0,
+    )
+    assert res.kind == "paywalled_no_access"
+
+
+def test_executor_argv_pins_model_effort_and_service_tier(cfg, tmp_path, monkeypatch):
+    """AGA-489: model/effort/service-tier are pinned in the argv, NOT inherited from
+    ~/.codex/config.toml — the bridge must be self-contained (and config.toml must
+    not be read as evidence of what a run used)."""
+    _install_stub_codex(tmp_path, monkeypatch, script_body=_STUB_DOWNLOADED)
+    monkeypatch.setenv("STUB_PDF_PATH", str(tmp_path / "none.pdf"))
+    run_dir = tmp_path / "run"
+    import asyncio
+    asyncio.run(executor.run_codex(run_dir, "prompt", "workspace-write"))
+    argv = json.loads((run_dir / "argv.json").read_text())
+    assert argv[argv.index("-m") + 1] == "gpt-5.6-sol"
+    assert 'model_reasoning_effort="high"' in argv
+    assert 'service_tier="fast"' in argv
 
 
 def test_executor_bypass_argv(cfg, tmp_path, monkeypatch):
@@ -953,6 +1025,25 @@ def _fake_codex_recorder(counter, *, kind="gave_up"):
         counter["n"] += 1
         return executor.ExecResult(kind=kind, notes=f"fake codex {kind}")
     return _fake
+
+
+def test_executor_died_maps_to_the_retryable_executor_died_code(cfg, monkeypatch):
+    """AGA-489: a dead executor must NOT reach the caller as terminal codex_gave_up.
+    It gets its own error_code (executor_died), which KC treats as retryable — the
+    same underlying event no longer gets opposite advice depending on whether it
+    self-exited (was: gave_up ⇒ 'stop forever') or hit the wall (timeout ⇒ 'retry')."""
+    _seed_sandbox_mode(cfg)
+    codex = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind="executor_died"))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.died", "title": "Dead Executor Paper"})
+    assert resp.status_code == 502
+    assert resp.json()["error_code"] == "executor_died"
+    con = _conn(cfg)
+    att = con.execute("SELECT outcome FROM paper_attempts ORDER BY id DESC LIMIT 1").fetchone()
+    assert att["outcome"] == "executor_died"
+    con.close()
 
 
 def test_ladder_escalates_through_tiers_then_codex(cfg, monkeypatch):
