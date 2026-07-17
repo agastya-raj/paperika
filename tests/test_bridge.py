@@ -204,7 +204,7 @@ for i, a in enumerate(argv):
 print(json.dumps({"type": "turn.completed"}))
 if last:
     with open(last, "w") as fh:
-        fh.write("this is not json at all")
+        fh.write(json.dumps({"outcome": "gave_up", "notes": "no PDF path on the page"}))
 sys.exit(0)
 """
 
@@ -409,11 +409,13 @@ def test_executor_jsonl_timeout(cfg, tmp_path, monkeypatch):
 
 
 def test_executor_jsonl_gaveup(cfg, tmp_path, monkeypatch):
+    """A GENUINE self-report of outcome=='gave_up' (the model examined the paper
+    and declined it) stays terminal through the full run_codex→classify stack.
+    The unparseable-message anomaly is now executor_died, covered separately."""
     _install_stub_codex(tmp_path, monkeypatch, script_body=_STUB_GAVEUP)
     import asyncio
     res = asyncio.run(executor.run_codex(tmp_path / "run", "prompt", "bypass"))
     assert res.kind == "gave_up"
-    argv_unused = res  # bypass argv asserted elsewhere
 
 
 def test_executor_died_when_turn_never_completed(cfg, tmp_path, monkeypatch):
@@ -460,6 +462,56 @@ def test_classify_completed_turn_still_yields_the_models_verdict():
         timed_out=False, wall_seconds=30.0,
     )
     assert res.kind == "paywalled_no_access"
+
+
+def test_classify_unparseable_completed_turn_is_executor_died():
+    """AGA-493: a completed turn + clean exit whose final message is NOT
+    schema-conforming JSON is an output ANOMALY (truncated/garbled), not the model
+    declining the paper — so it classifies retryable executor_died, not the
+    terminal gave_up that used to silently, permanently abandon the paper."""
+    res = executor.classify(
+        exit_code=0, events=[{"type": "turn.completed"}],
+        last_message="not json at all", stderr="", timed_out=False, wall_seconds=30.0,
+    )
+    assert res.kind == "executor_died"
+    assert "schema-conforming" in res.notes
+
+
+def test_classify_genuine_gave_up_stays_terminal():
+    """AGA-493: the one genuinely terminal self-report — outcome=='gave_up' — must
+    still map to gave_up (KC treats codex_gave_up as terminal)."""
+    msg = json.dumps({"outcome": "gave_up", "notes": "examined the page, no PDF path"})
+    res = executor.classify(
+        exit_code=0, events=[{"type": "turn.completed"}], last_message=msg, stderr="",
+        timed_out=False, wall_seconds=30.0,
+    )
+    assert res.kind == "gave_up"
+
+
+def test_classify_unrecognized_outcome_is_executor_died():
+    """AGA-493: an outcome value outside the --output-schema enum is an anomaly,
+    routed to retryable executor_died rather than terminal gave_up."""
+    msg = json.dumps({"outcome": "banana"})
+    res = executor.classify(
+        exit_code=0, events=[{"type": "turn.completed"}], last_message=msg, stderr="",
+        timed_out=False, wall_seconds=30.0,
+    )
+    assert res.kind == "executor_died"
+    assert "banana" in res.notes
+
+
+@pytest.mark.parametrize("bad_outcome", [[], {}, ["throttled"], {"k": "v"}])
+def test_classify_non_string_outcome_is_executor_died_not_crash(bad_outcome):
+    """AGA-493 regression: a completed turn whose outcome is an unhashable JSON value
+    ([] / {}) must classify retryable executor_died, not raise TypeError on the
+    membership test and 500 with the write-ahead attempt left unresolved."""
+    msg = json.dumps({"outcome": bad_outcome})
+    res = executor.classify(
+        exit_code=0, events=[{"type": "turn.completed"}], last_message=msg, stderr="",
+        timed_out=False, wall_seconds=30.0,
+    )
+    assert res.kind == "executor_died"
+    assert "unrecognized outcome" in res.notes
 
 
 def test_executor_argv_pins_model_effort_and_service_tier(cfg, tmp_path, monkeypatch):
@@ -535,6 +587,50 @@ def test_healthz_authenticated_full_detail(cfg):
     resp = client.get("/healthz", headers=_auth())
     body = resp.json()
     assert "chrome" in body and "codex" in body and "limits" in body and "version" in body
+
+
+def _seed_full_state(cfg: PaperikaConfig, **fields) -> None:
+    state_path = cfg.db_path.parent / "bridge_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(fields), encoding="utf-8")
+
+
+def test_healthz_codex_usable_false_without_selftest(cfg):
+    """AGA-493: no selftest state ⇒ codex_usable is False even if auth.json exists
+    on the host — file-presence is not proof codex works."""
+    body = _client(cfg).get("/healthz", headers=_auth()).json()
+    assert body["codex"]["codex_usable"] is False
+
+
+def test_healthz_codex_usable_true_on_fresh_passing_selftest(cfg):
+    _seed_full_state(
+        cfg, sandbox_mode="workspace-write", last_selftest_ok=True,
+        last_selftest_at=_now().isoformat(),
+    )
+    body = _client(cfg).get("/healthz", headers=_auth()).json()
+    assert body["codex"]["codex_usable"] is True
+
+
+def test_healthz_codex_usable_false_on_stale_selftest(cfg):
+    """A months-old passing selftest is not evidence codex works today (AGA-493)."""
+    old = (_now() - timedelta(days=bridge_app.SELFTEST_MAX_AGE_DAYS + 1)).isoformat()
+    _seed_full_state(
+        cfg, sandbox_mode="workspace-write", last_selftest_ok=True, last_selftest_at=old,
+    )
+    body = _client(cfg).get("/healthz", headers=_auth()).json()
+    assert body["codex"]["codex_usable"] is False
+
+
+def test_healthz_codex_usable_false_on_future_selftest(cfg):
+    """AGA-493: a future last_selftest_at (clock skew / corrupted state) must not
+    pass the freshness check — a negative age would otherwise latch codex_usable
+    true until that future instant + MAX_AGE."""
+    future = (_now() + timedelta(days=3)).isoformat()
+    _seed_full_state(
+        cfg, sandbox_mode="workspace-write", last_selftest_ok=True, last_selftest_at=future,
+    )
+    body = _client(cfg).get("/healthz", headers=_auth()).json()
+    assert body["codex"]["codex_usable"] is False
 
 
 # ------------------------------------------------------ healthz probe cache ---
@@ -1044,6 +1140,61 @@ def test_executor_died_maps_to_the_retryable_executor_died_code(cfg, monkeypatch
     att = con.execute("SELECT outcome FROM paper_attempts ORDER BY id DESC LIMIT 1").fetchone()
     assert att["outcome"] == "executor_died"
     con.close()
+
+
+def test_auth_error_clears_sandbox_so_broken_codex_stops_being_attempted(cfg, monkeypatch):
+    """AGA-493: a runtime codex auth_error clears the readiness latch, so the NEXT
+    request does not re-attempt a broken codex — it surfaces needs-operator
+    (selftest_required) after the deterministic tiers miss, instead of burning the
+    wall on every request while the token stays revoked."""
+    _seed_sandbox_mode(cfg)
+    codex = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind="auth_error"))
+    client = TestClient(bridge_app.create_app(cfg))
+
+    # 1st request: codex runs, returns auth_error (503 codex_auth), clears the latch.
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.auth", "title": "Auth Paper One"})
+    assert resp.status_code == 503 and resp.json()["error_code"] == "codex_auth"
+    assert codex["n"] == 1
+    state = json.loads((cfg.db_path.parent / "bridge_state.json").read_text())
+    assert state["sandbox_mode"] is None and state["last_selftest_ok"] is False
+
+    # Clear the 1st request's attempt rows so the 2nd request is gated ONLY by the
+    # cleared sandbox latch, not by the tiers' per-strategy cooldowns.
+    con = _conn(cfg)
+    con.execute("DELETE FROM paper_attempts")
+    con.commit()
+    con.close()
+
+    # 2nd request: codex_ready is now false ⇒ codex NOT attempted; needs-operator.
+    resp2 = client.post("/download", headers=_auth(),
+                        json={"doi": "10.1364/jocn.auth2", "title": "Auth Paper Two"})
+    assert resp2.status_code == 503 and resp2.json()["error_code"] == "selftest_required"
+    assert codex["n"] == 1  # codex was NOT called the second time
+
+
+def test_auth_error_clears_sandbox_before_chrome_recovery(cfg, monkeypatch):
+    """AGA-493: the auth_error latch clear must run BEFORE chrome recovery. Recovery
+    awaits up to ~30s; a failure/cancellation there (shutdown / client disconnect)
+    must not skip the clear and leave a known-broken codex latched ready. Regression:
+    with the clear ordered after recovery, a raising recover() left sandbox_mode set."""
+    _seed_sandbox_mode(cfg)
+    codex = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind="auth_error"))
+
+    async def _boom_recover():
+        raise RuntimeError("recovery blew up mid-await")
+    monkeypatch.setattr(chrome, "recover", _boom_recover)
+
+    # raise_server_exceptions=False: the failing recover surfaces as a 500 rather than
+    # crashing the test — the invariant under test is the persisted latch, not the code.
+    client = TestClient(bridge_app.create_app(cfg), raise_server_exceptions=False)
+    client.post("/download", headers=_auth(),
+                json={"doi": "10.1364/jocn.authboom", "title": "Auth Boom Paper"})
+    assert codex["n"] == 1
+    state = json.loads((cfg.db_path.parent / "bridge_state.json").read_text())
+    assert state["sandbox_mode"] is None and state["last_selftest_ok"] is False
 
 
 def test_ladder_escalates_through_tiers_then_codex(cfg, monkeypatch):

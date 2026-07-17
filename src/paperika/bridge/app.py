@@ -427,6 +427,30 @@ def _parse_iso(value: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+# A selftest older than this is treated as stale for the /healthz codex_usable
+# signal — codex auth/CLI can rot silently between requests (a revoked ChatGPT
+# token still leaves auth.json on disk), so a months-old "ok" is not evidence
+# codex works today (AGA-493).
+SELFTEST_MAX_AGE_DAYS = 14
+
+
+def _codex_usable(state: BridgeState) -> bool:
+    """Honest 'is the codex tier actually usable right now' derived from the
+    readiness latch — the last selftest passed, its sandbox mode is still set
+    (not cleared by a runtime auth_error), and the selftest is not stale. This is
+    what /healthz reports instead of bare auth.json file-presence (AGA-493)."""
+    if not (state.last_selftest_ok and state.sandbox_mode):
+        return False
+    last_at = _parse_iso(state.last_selftest_at)
+    if last_at is None:
+        return False
+    age = _utc_now() - last_at
+    # Require a non-negative age: a future last_selftest_at (clock skew / corrupted
+    # state file) would otherwise pass the <= MAX_AGE check and latch codex_usable
+    # true until that future instant + MAX_AGE (AGA-493).
+    return timedelta(0) <= age <= timedelta(days=SELFTEST_MAX_AGE_DAYS)
+
+
 def create_app(config: PaperikaConfig | None = None) -> FastAPI:
     bridge = build_bridge(config)
 
@@ -472,7 +496,11 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 "probe_age_seconds": int(result.age_seconds() or 0),
             },
             "codex": {
+                # auth_json_present is a raw signal only — a revoked token still
+                # leaves the file, so it does NOT prove codex works. codex_usable
+                # is the honest derived answer (AGA-493).
                 "auth_json_present": Path("/home/agastya/.codex/auth.json").exists(),
+                "codex_usable": _codex_usable(state),
                 "last_selftest_ok": state.last_selftest_ok,
                 "last_selftest_at": state.last_selftest_at,
                 "sandbox_mode": state.sandbox_mode,
@@ -786,6 +814,18 @@ async def _run_codex_tier(
         doi=doi, title=title, run_dir=run_dir, window_start=started, window_end=ended,
         screenshot=screenshot,
     )
+
+    # A runtime auth_error means the host's codex login is dead (revoked refresh
+    # token / 401). Retrying it just burns the wall on every request while the
+    # token stays revoked. Clear the readiness latch so codex_ready flips false
+    # and the ladder surfaces selftest_required (needs-operator) until an operator
+    # re-logs-in and re-runs POST /selftest/codex — instead of silently
+    # re-attempting a broken codex forever (AGA-493). KC already treats codex_auth
+    # as needs-operator, so the two ends agree. Done BEFORE chrome recovery: that
+    # awaits up to ~30s, and a CancelledError (shutdown / disconnect) mid-recovery
+    # must not skip the clear and leave a known-broken codex latched ready.
+    if exec_result.kind == "auth_error":
+        bridge.state_store.update(sandbox_mode=None, last_selftest_ok=False)
 
     # chrome recovery on bad outcomes (still holding the lock)
     if bad_outcome or exec_result.kind == "auth_error":
