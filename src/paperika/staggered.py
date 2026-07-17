@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import random
 import time
-from typing import Any, Callable
+from typing import Callable
 
 from .downloader import Downloader
 from .worker import run_worker_once

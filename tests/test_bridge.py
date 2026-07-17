@@ -1379,7 +1379,7 @@ def test_gated_codex_miss_does_not_leak_in_progress_request(cfg):
 
 
 def test_healthz_reports_per_strategy_attempts(cfg):
-    bridge = bridge_app.build_bridge(cfg)
+    bridge_app.build_bridge(cfg)  # side effect: creates the DB schema _conn() reads
     con = _conn(cfg)
     con.execute("INSERT INTO paper_requests (raw_input, status, created_at, updated_at) VALUES ('x','in_progress',?,?)",
                 (limits.iso(_now()), limits.iso(_now())))
