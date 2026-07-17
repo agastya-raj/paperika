@@ -23,12 +23,12 @@ import subprocess
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from ..config import PaperikaConfig
-from ..db import Database, normalize_title
+from ..db import Database
 from ..downloader import Downloader
 from ..models import LocateCandidate, ParsedInput
 from ..notifications import NotificationEvent, emit_notification_event
@@ -376,7 +376,6 @@ def startup_sweep(bridge: Bridge) -> None:
     for row in rows:
         request_id = row["request_id"]
         started = row["started_at"]
-        run_dir = row["run_dir"]
         # Recover doi/title from the request row for the salvage verify.
         req = bridge.db.get_request(request_id)
         doi = (req["inferred_doi"] if req else None) or ""
