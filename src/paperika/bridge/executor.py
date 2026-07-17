@@ -316,9 +316,15 @@ def classify(
         # Reachable only for a run that DID complete its turn and exit 0 (the death
         # cases are executor_died above). --output-schema is enforced, so a turn
         # that reaches a final message emits conforming JSON by construction — an
-        # unparseable one here is an anomaly, not the model declining the paper.
+        # unparseable one here is an ANOMALY (truncated / empty / garbled final
+        # message), NOT the model examining the paper and declining it. Classify it
+        # retryable (executor_died) so a one-off output glitch retries instead of
+        # collapsing to the terminal codex_gave_up and permanently abandoning a
+        # recoverable paper (AGA-493). Like every executor_died it still flows
+        # through salvage first, so a PDF written before the garbled message is
+        # recovered.
         return ExecResult(
-            kind="gave_up",
+            kind="executor_died",
             notes="turn completed but its final message was not schema-conforming JSON",
             **base,
         )
@@ -329,10 +335,25 @@ def classify(
     final_url = parsed.get("final_url")
     if outcome == "downloaded":
         return ExecResult(kind="downloaded", file_path=file_path, final_url=final_url, notes=notes, **base)
-    if outcome in {"throttled", "paywalled_no_access", "bot_wall"}:
+    # isinstance guard: a completed turn could emit a non-string outcome (JSON [] / {}),
+    # which is unhashable — a bare `in {...}` membership test would raise TypeError and
+    # 500 instead of classifying. Non-string outcomes fall through to executor_died below
+    # like any other off-schema anomaly (AGA-493).
+    if isinstance(outcome, str) and outcome in {"throttled", "paywalled_no_access", "bot_wall"}:
         return ExecResult(kind=outcome, final_url=final_url, notes=notes, **base)
-    # "gave_up" or anything unexpected
-    return ExecResult(kind="gave_up", final_url=final_url, notes=notes or "executor gave up", **base)
+    if outcome == "gave_up":
+        # The model examined the paper and declined it — the one genuinely
+        # terminal self-report (KC maps codex_gave_up → terminal). Distinct from
+        # the anomaly cases above, which are retryable executor_died (AGA-493).
+        return ExecResult(kind="gave_up", final_url=final_url, notes=notes or "executor gave up", **base)
+    # An outcome value outside the --output-schema enum is an anomaly, not a
+    # verdict on the paper — treat it retryable like the unparseable case (AGA-493).
+    return ExecResult(
+        kind="executor_died",
+        final_url=final_url,
+        notes=notes or f"executor returned an unrecognized outcome: {outcome!r}",
+        **base,
+    )
 
 
 def build_argv(
