@@ -199,24 +199,57 @@ def test_update_request_status_success_after_success_still_applies(tmp_path: Pat
     assert row["paper_id"] == paper_b
 
 
-def test_update_request_status_allow_reopen_bypasses_the_guard(tmp_path: Path):
-    """MEDIUM review round-2 finding 2: the guard's purpose is only "a stale
-    failure must not overwrite a success", not "success is forever" — a caller
-    that explicitly opts in via allow_reopen (e.g. downloader.py's legitimate
-    force_redownload retry) can still transition an already-successful request
-    to a non-success status."""
+def test_update_request_status_compare_and_set_allows_legitimate_reopen(tmp_path: Path):
+    """MEDIUM review round-3 finding 1: the guard's purpose is only "a stale
+    failure must not overwrite a success", not "success is forever". A caller
+    that supplies expected_status matching the row's ACTUAL current status
+    (compare-and-set — not a bare caller-asserted allow_reopen=True, which
+    review round 2's fix used and round 3 found unconditionally bypassed the
+    guard for every caller, race or not) can still transition an
+    already-successful request to a non-success status — this is how
+    downloader.py's legitimate force_redownload retry works."""
     db = _make_db(tmp_path)
     request_id = db.create_request(
-        raw_input="10.1000/allow-reopen", inferred_title="t",
-        inferred_doi="10.1000/allow-reopen", inferred_url=None, paper_id=None,
+        raw_input="10.1000/legit-reopen", inferred_title="t",
+        inferred_doi="10.1000/legit-reopen", inferred_url=None, paper_id=None,
     )
     db.update_request_status(request_id, "completed")
     blocked = db.update_request_status(request_id, "failed")
     assert blocked is False
-    applied = db.update_request_status(request_id, "failed", allow_reopen=True)
+    applied = db.update_request_status(request_id, "failed", expected_status="completed")
     assert applied is True
     row = db.get_request(request_id)
     assert row["status"] == "failed"
+
+
+def test_update_request_status_compare_and_set_blocks_stale_worker_after_success(tmp_path: Path):
+    """HIGH review round-3 finding 1: two workers read the same request at
+    status='queued'. The FASTER worker succeeds first (status -> 'downloaded').
+    The SLOWER worker's failure write, using expected_status='queued' (what IT
+    read before doing its work), must no-op — CAS correctly detects the row
+    moved on, unlike the previous unconditional allow_reopen=True (round 2's
+    fix) which would have resurrected it regardless of any race."""
+    db = _make_db(tmp_path)
+    request_id = db.create_request(
+        raw_input="10.1000/race-two-workers", inferred_title="t",
+        inferred_doi="10.1000/race-two-workers", inferred_url=None, paper_id=None,
+    )
+    # Both workers' view at read time: status is the DEFAULT 'queued'.
+    paper_id = db.upsert_located_paper(LocateCandidate(title="Race Two Workers Paper"))
+    applied_a = db.update_request_status(request_id, "downloaded", paper_id=paper_id, expected_status="queued")
+    assert applied_a is True
+
+    applied_b = db.update_request_status(
+        request_id, "retrying",
+        manual=ManualIntervention(reason="stale failure"),
+        expected_status="queued",
+    )
+    assert applied_b is False
+
+    row = db.get_request(request_id)
+    assert row["status"] == "downloaded"
+    assert row["paper_id"] == paper_id
+    assert row["manual_reason"] is None
 
 
 def test_update_request_status_non_success_still_applies_before_any_success(tmp_path: Path):

@@ -223,21 +223,22 @@ class Downloader:
             )
             if self._requires_manual_intervention(message):
                 final_status = "manual_intervention"
-                self.db.update_request_status(
+                # expected_status=previous_status (AGA-596 review round 3,
+                # finding 1): compare-and-set instead of an unconditional
+                # allow_reopen — only apply this write if the row's status is
+                # STILL what THIS call read at the top of process_request. A
+                # concurrent worker that already changed it (a genuine success,
+                # or another failure) makes this a no-op, same as the plain
+                # success guard everywhere else, but without also blocking a
+                # legitimate force_redownload reopen-then-fail.
+                applied = self.db.update_request_status(
                     request_id,
                     final_status,
                     attempt_count=attempt_number,
                     next_retry_at=None,
                     manual=manual,
                     paper_id=paper_id,
-                    # Reaching here past the completed_deduped/downloaded early-
-                    # return guard (line ~144) means this request is either fresh
-                    # or an explicit force_redownload reopen of an already-
-                    # successful one — never a stale concurrent write racing a
-                    # success, which is the ONLY thing the success-status guard
-                    # in update_request_status protects against (AGA-596 review
-                    # round 2, finding 2).
-                    allow_reopen=True,
+                    expected_status=previous_status,
                 )
                 return DownloadOutcome(
                     request_id=request_id,
@@ -254,18 +255,18 @@ class Downloader:
                         message=message,
                         attempt_number=attempt_number,
                         manual=manual,
-                    ),
+                    ) if applied else [],
                 )
             if should_retry(attempt_number):
                 final_status = "retrying"
-                self.db.update_request_status(
+                applied = self.db.update_request_status(
                     request_id,
                     final_status,
                     attempt_count=attempt_number,
                     next_retry_at=next_retry_at(attempt_number).isoformat(),
                     manual=manual,
                     paper_id=paper_id,
-                    allow_reopen=True,  # see the manual_intervention branch above
+                    expected_status=previous_status,  # see the branch above
                 )
                 return DownloadOutcome(
                     request_id=request_id,
@@ -282,17 +283,17 @@ class Downloader:
                         message=message,
                         attempt_number=attempt_number,
                         manual=manual,
-                    ),
+                    ) if applied else [],
                 )
             final_status = "permanent_failure"
-            self.db.update_request_status(
+            applied = self.db.update_request_status(
                 request_id,
                 final_status,
                 attempt_count=attempt_number,
                 next_retry_at=None,
                 manual=manual,
                 paper_id=paper_id,
-                allow_reopen=True,  # see the manual_intervention branch above
+                expected_status=previous_status,  # see the branch above
             )
             return DownloadOutcome(
                 request_id=request_id,
@@ -309,7 +310,7 @@ class Downloader:
                     message=message,
                     attempt_number=attempt_number,
                     manual=manual,
-                ),
+                ) if applied else [],
             )
 
     def retry_pending(self, browser: Any | None = None) -> list[DownloadOutcome]:

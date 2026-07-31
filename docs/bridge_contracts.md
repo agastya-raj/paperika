@@ -146,7 +146,18 @@ CREATE TABLE paper_links (
   normalized title).
 - `create_request(raw_input, inferred_title, inferred_doi, inferred_url, paper_id, force_redownload=False) -> int`
   (inserts status `'queued'`).
-- `update_request_status(request_id, status, attempt_count=None, next_retry_at=None, manual=None, paper_id=None)`.
+- `update_request_status(request_id, status, attempt_count=None, next_retry_at=None, manual=None, paper_id=None, expected_status=None) -> bool`
+  — returns True if the row was actually updated, False if a guard turned it
+  into a no-op (AGA-596 review round 2/3): a non-success status can't overwrite
+  a row already in a success status (`downloaded`/`completed_deduped`/
+  `completed`) UNLESS `expected_status` is given AND still matches the row's
+  CURRENT status (compare-and-set — downloader.py's `process_request` passes
+  the status it read at the top of its own call, so a legitimate
+  force_redownload reopen-then-fail applies but a stale concurrent write from
+  elsewhere no-ops). The bridge never passes `expected_status`; every bridge
+  call site relies on the plain success-status guard and MUST check the
+  returned bool before emitting a status-change notification for a "failed"
+  transition (a guarded no-op means the persisted row did not actually change).
 - `record_attempt(request_id, paper_id, attempt_number, status, strategy, message=None, screenshot_path=None, page_title=None, current_url=None) -> int`
   — note: does NOT write the new `started_at/outcome/run_dir` columns, so the
   bridge issues its own INSERT/UPDATE for write-ahead rows (it still uses

@@ -322,80 +322,93 @@ class Database:
         next_retry_at: str | None = None,
         manual: ManualIntervention | None = None,
         paper_id: int | None = None,
-        allow_reopen: bool = False,
+        expected_status: str | None = None,
     ) -> bool:
-        """Returns True if the row was actually updated, False if the
-        success-status guard below turned this into a no-op (AGA-596 review round
-        2, finding 2) — callers that emit a status-change notification/event MUST
-        check this before doing so, or they can report a status the row never
-        actually reached. Raises KeyError only when ``request_id`` doesn't exist
-        at all (a guarded no-op is NOT an error — the row exists, the write was
-        just intentionally skipped)."""
+        """Returns True if the row was actually updated, False if a guard below
+        turned this into a no-op (AGA-596 review round 2/3) — callers that emit a
+        status-change notification/event MUST check this before doing so, or
+        they can report a status the row never actually reached. Raises KeyError
+        only when ``request_id`` doesn't exist at all (a guarded no-op is NOT an
+        error — the row exists, the write was just skipped).
+
+        Two independent guard mechanisms, never both active at once:
+        - Default (``expected_status=None``): the success-status guard — a
+          transition to a NON-success status cannot overwrite a row whose
+          CURRENT status is already in ``_SUCCESS_STATUSES`` (protects against
+          an unintentional stale write resurrecting an already-succeeded
+          request). This is the only guard for callers that never supply
+          ``expected_status`` — in particular every bridge call site.
+        - ``expected_status`` (compare-and-set, AGA-596 review round 3 finding
+          1): downloader.py's ``process_request`` reads the row once at the top
+          (``previous_status``) and does real work (network I/O) before writing
+          back. An earlier fix let those writes bypass the success guard via a
+          caller-asserted ``allow_reopen=True`` — unconditional at all three
+          call sites — so a legitimate force_redownload reopen-then-fail wasn't
+          blocked, but it ALSO let a genuinely stale concurrent write (a second
+          worker racing the same request) bypass it just as freely:
+          ``force_redownload`` is fixed at request-creation and never cleared
+          (verified in code — clearing it would break the documented repeated
+          `process-request <id>` CLI retry workflow), so it cannot distinguish
+          "this specific call is the deliberate reopen" from "some other call
+          reached this same code". Passing ``expected_status=previous_status``
+          instead requires the row's status to still equal what THIS caller
+          last read; ANY concurrent write since then (a success OR another
+          failure) makes it a no-op. That is a strictly stronger, more precise
+          guard than the success-set check, so it fully replaces the success
+          guard for a CAS call rather than composing with it.
+        """
         now = utc_now()
         # A request reaching a SUCCESS status must never keep showing a stale
         # operator handoff from an earlier failed attempt (AGA-596 P5 follow-up):
         # clear manual_* unconditionally on success, regardless of whether `manual`
         # was passed. Every other status keeps the only-overwrite-when-supplied
         # (COALESCE) behavior, so a later transition without a fresh
-        # ManualIntervention cannot erase a still-relevant handoff.
+        # ManualIntervention cannot erase a still-relevant handoff. This applies
+        # under EITHER guard mechanism below.
         is_success = 1 if status in _SUCCESS_STATUSES else 0
-        # allow_reopen (AGA-596 review round 2, finding 2): the success-status
-        # guard below exists to stop a STALE, unintentional write from resurrecting
-        # a request that already succeeded (e.g. a slower concurrent worker's
-        # late-arriving failure). It must NOT also block a caller's deliberate
-        # reopening of an already-successful request. Verified in code: downloader.
-        # py's force_redownload path has no distinct "requeue" status of its own —
-        # skipping its completed_deduped/downloaded early-return guard falls
-        # straight through to a fresh download attempt, whose OWN outcome (success
-        # again, or manual_intervention/retrying/permanent_failure) is the very
-        # next status write. Those three failure-outcome call sites pass
-        # allow_reopen=True; nothing else in this codebase does, so the guard
-        # stays fully protective everywhere else (in particular, every bridge
-        # call site).
-        bypass_guard = 1 if allow_reopen else 0
+        manual_params = (
+            is_success, manual.reason if manual else None,
+            is_success, manual.screenshot_path if manual else None,
+            is_success, manual.page_title if manual else None,
+            is_success, manual.current_url if manual else None,
+            is_success, manual.suggested_next_action if manual else None,
+        )
+        set_clause = """
+            SET status = ?,
+                attempt_count = COALESCE(?, attempt_count),
+                next_retry_at = ?,
+                manual_reason = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_reason) END,
+                manual_screenshot_path = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_screenshot_path) END,
+                manual_page_title = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_page_title) END,
+                manual_current_url = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_current_url) END,
+                manual_suggested_next_action = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_suggested_next_action) END,
+                paper_id = COALESCE(?, paper_id),
+                updated_at = ?
+        """
         with self.transaction() as conn:
             existing = conn.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
             if not existing:
                 raise KeyError(f"Request {request_id} not found")
-            # WHERE-clause guard: a NON-success status update must not overwrite a
-            # request that has ALREADY reached a success status, unless the caller
-            # explicitly opted in via allow_reopen. `status` inside the WHERE
-            # clause refers to the row's CURRENT (pre-update) value, per standard
-            # UPDATE semantics — this is a single guarded statement, not a separate
-            # read-then-write, so there is no check-then-act gap. A transition that
-            # is ITSELF a success status is never blocked.
-            cursor = conn.execute(
-                f"""
-                UPDATE paper_requests
-                SET status = ?,
-                    attempt_count = COALESCE(?, attempt_count),
-                    next_retry_at = ?,
-                    manual_reason = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_reason) END,
-                    manual_screenshot_path = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_screenshot_path) END,
-                    manual_page_title = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_page_title) END,
-                    manual_current_url = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_current_url) END,
-                    manual_suggested_next_action = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_suggested_next_action) END,
-                    paper_id = COALESCE(?, paper_id),
-                    updated_at = ?
-                WHERE id = ?
-                  AND NOT (status IN ({_SUCCESS_STATUSES_SQL}) AND ? = 0 AND ? = 0)
-                """,
-                (
-                    status,
-                    attempt_count,
-                    next_retry_at,
-                    is_success, manual.reason if manual else None,
-                    is_success, manual.screenshot_path if manual else None,
-                    is_success, manual.page_title if manual else None,
-                    is_success, manual.current_url if manual else None,
-                    is_success, manual.suggested_next_action if manual else None,
-                    paper_id,
-                    now,
-                    request_id,
-                    is_success,
-                    bypass_guard,
-                ),
-            )
+            if expected_status is not None:
+                cursor = conn.execute(
+                    f"UPDATE paper_requests {set_clause} WHERE id = ? AND status = ?",
+                    (status, attempt_count, next_retry_at, *manual_params, paper_id, now,
+                     request_id, expected_status),
+                )
+            else:
+                # `status` inside the WHERE clause refers to the row's CURRENT
+                # (pre-update) value, per standard UPDATE semantics — this is a
+                # single guarded statement, not a separate read-then-write, so
+                # there is no check-then-act gap. A transition that is ITSELF a
+                # success status is never blocked.
+                cursor = conn.execute(
+                    f"""
+                    UPDATE paper_requests {set_clause}
+                    WHERE id = ? AND NOT (status IN ({_SUCCESS_STATUSES_SQL}) AND ? = 0)
+                    """,
+                    (status, attempt_count, next_retry_at, *manual_params, paper_id, now,
+                     request_id, is_success),
+                )
             return cursor.rowcount > 0
 
     def record_attempt(
