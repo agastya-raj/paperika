@@ -30,7 +30,7 @@ from pydantic import BaseModel
 from ..config import PaperikaConfig
 from ..db import Database
 from ..downloader import Downloader
-from ..models import LocateCandidate, ParsedInput
+from ..models import LocateCandidate, ManualIntervention, ParsedInput
 from ..notifications import NotificationEvent, emit_notification_event
 from . import chrome, executor, limits
 from .direct_fetch import attempt_direct_fetch
@@ -58,6 +58,16 @@ SWEEP_WINDOW_SECONDS = executor.EXEC_WALL_SECONDS + 30
 # stream never trips it.
 TIER1_BUDGET = 60.0
 TIER2_BUDGET = 45.0
+
+# GET /requests/{id}/screenshot (AGA-596 P3) media type by file extension. Bridge
+# screenshots are codex's final.png; the downloader.py queue path (a separate
+# consumer of the same schema) can also leave a .txt fallback when Playwright is
+# unavailable, so this stays a lookup rather than a hardcoded image/png.
+_SCREENSHOT_MEDIA_TYPES: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
 
 
 def _utc_now() -> datetime:
@@ -117,6 +127,20 @@ _TAXONOMY: dict[str, tuple[str, str, int, str]] = {
     "throttled": ("throttled", "download_throttled", 429, "throttled"),
     "paywalled_no_access": ("no_access", "no_institutional_access", 403, "paywalled_no_access"),
     "bot_wall": ("bot_wall", "bot_wall", 502, "bot_wall"),
+    # Both deterministic tiers walled and codex was unavailable to classify — a
+    # DISTINCT error_code from codex-confirmed "bot_wall" (AGA-596 P1), still a
+    # retryable 502. Review finding 4 (2026-07-31): KC main does NOT yet contain
+    # this code in RETRYABLE_CODES today — its sources/paperika.py only documents
+    # the future addition in a comment ("have _finish_wall_evidence emit a
+    # distinct retryable code... add it to RETRYABLE_CODES when it lands"). The KC
+    # side must ship first (separate commit/PR) before this bridge change is
+    # retryable end-to-end; until then KC treats this error_code as unknown/
+    # non-retryable, same as it would treat bare "bot_wall". The notification
+    # event_type stays the documented "bot_wall" (unchanged contract) — only the
+    # HTTP error_code differs.
+    "bot_wall_unclassified": (
+        "bot_wall_unclassified", "bot_wall", 502, "bot_wall_unclassified",
+    ),
     "gave_up": ("executor_gave_up", "executor_failed", 502, "codex_gave_up"),
     # A death, not a verdict (AGA-489): the executor crashed / failed its turn /
     # exited non-zero, so it never judged the paper. Distinct from gave_up — which
@@ -315,6 +339,75 @@ class Bridge:
         with self.db.transaction() as conn:
             limits.resolve_attempt(conn, attempt_id, **kwargs)
 
+    def wall_evidence(
+        self, request_id: int, *, exclude_attempt_id: int | None = None
+    ) -> tuple[list[str], str | None, str | None]:
+        """Bot-wall evidence for this request, read back from ``paper_attempts``
+        — durable (survives a bridge restart) rather than an in-memory value
+        computed only during the single /download call that ran the tiers.
+        Matches BOTH a deterministic tier's ``outcome='wall'`` AND codex's own
+        confirmed wall (``outcome='bot_wall'`` — a DIFFERENT string, since
+        codex's terminal taxonomy resolves its attempt with the kind name
+        itself, see ``_TAXONOMY``). Missing the latter (review round-3 finding
+        2) meant a crash between codex's attempt being resolved and the
+        request's own status update left the sweep with NO evidence at all,
+        even though codex had already confirmed the wall with its own URL and
+        screenshot. Returns ``(walled/confirming strategies in run order, the
+        LAST such row's current_url, that row's screenshot_path)`` — a tier's
+        ``current_url``/``screenshot_path`` is persisted onto its own attempt
+        row at resolve time (see ``_run_deterministic_tier`` / ``_finish_failure``),
+        so this survives even if the bridge crashes before the request itself
+        is updated. ``exclude_attempt_id``: a live finish (``_finish_failure``)
+        calls ``resolve_attempt`` for ITS OWN attempt (which may itself just
+        have been written ``outcome='bot_wall'``) before calling this — pass
+        that attempt's id so a codex-confirmed wall doesn't self-report as its
+        own "prior" evidence."""
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT strategy, current_url, screenshot_path FROM paper_attempts "
+                "WHERE request_id = ? AND outcome IN ('wall', 'bot_wall') AND id != ? "
+                "ORDER BY id ASC",
+                (request_id, exclude_attempt_id if exclude_attempt_id is not None else -1),
+            ).fetchall()
+        walled_tiers = [row["strategy"] for row in rows if row["strategy"]]
+        last_wall_url = rows[-1]["current_url"] if rows else None
+        last_screenshot = rows[-1]["screenshot_path"] if rows else None
+        return walled_tiers, last_wall_url, last_screenshot
+
+    # --- screenshot lookup + containment (AGA-596 P3) ---
+
+    def _screenshot_allowed_roots(self) -> list[Path]:
+        """Roots a served screenshot must resolve inside: the downloader's failure-
+        screenshot dir and the bridge's own codex run-dir tree (where codex's
+        final.png lands). Mirrors the containment idiom in
+        ``_within_download_window`` — never trust a DB-stored path blindly."""
+        return [
+            self.config.screenshot_dir.resolve(),
+            (self.config.db_path.parent / "codex_runs").resolve(),
+        ]
+
+    def resolve_screenshot_path(self, raw: str) -> Path | None:
+        try:
+            resolved = Path(raw).resolve()
+        except OSError:
+            return None
+        if not any(root in resolved.parents for root in self._screenshot_allowed_roots()):
+            return None
+        return resolved if resolved.is_file() else None
+
+    def latest_attempt_screenshot(self, request_id: int) -> str | None:
+        """The most recent non-null ``paper_attempts.screenshot_path`` for this
+        request — fallback when the request itself carries no
+        ``manual_screenshot_path`` (e.g. an older request predating AGA-596 P2)."""
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT screenshot_path FROM paper_attempts "
+                "WHERE request_id = ? AND screenshot_path IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (request_id,),
+            ).fetchone()
+        return row["screenshot_path"] if row else None
+
 
 # --- auth dependency (§2.2) -----------------------------------------------
 
@@ -370,7 +463,12 @@ def _paperika_version() -> str:
 
 
 def startup_sweep(bridge: Bridge) -> None:
-    """On every start: salvage-first over stale outcome='running' rows (§2.3)."""
+    """On every start: salvage-first over stale outcome='running' rows (§2.3),
+    then reap any request left dangling 'in_progress' with no running attempt at
+    all (review round-2 finding 1) — a crash AFTER an attempt is resolved but
+    BEFORE the request itself receives its terminal status transition (or before
+    the next tier's attempt row is even created) otherwise leaves the request
+    in_progress forever, with any wall evidence trapped in paper_attempts."""
     with bridge.db.transaction() as conn:
         rows = limits.running_attempts(conn)
     for row in rows:
@@ -405,14 +503,81 @@ def startup_sweep(bridge: Bridge) -> None:
                     salvaged = True
         if not salvaged:
             bridge.resolve_attempt(row["id"], outcome="interrupted", message="bridge restarted mid-run")
+            # If some OTHER, already-resolved attempt for this request (a
+            # deterministic tier, or codex itself) recorded a wall before THIS
+            # row's strategy was interrupted by the restart, that evidence must
+            # not be lost (review round-2 finding 1) — it is durable in
+            # paper_attempts, so surface it here too.
+            walled_tiers, last_wall_url, last_screenshot = bridge.wall_evidence(request_id)
+            manual = None
+            if walled_tiers:
+                current_url = _preferred_current_url(bridge, request_id, last_wall_url)
+                manual = ManualIntervention(
+                    reason=(
+                        f"{' and '.join(walled_tiers)} hit a bot/CAPTCHA wall; the bridge "
+                        f"restarted while {row['strategy']} was running, before the request "
+                        "could reach a terminal status"
+                    ),
+                    screenshot_path=last_screenshot,
+                    page_title=None,
+                    current_url=current_url,
+                    suggested_next_action=_wall_suggested_action(current_url),
+                )
             try:
-                bridge.db.update_request_status(request_id, "failed")
+                applied = bridge.db.update_request_status(request_id, "failed", manual=manual)
             except KeyError:
-                pass
+                applied = False
+            # Skip the notification when the guard turned this into a no-op
+            # (review round-2 finding 2) — status_after="failed" would otherwise
+            # misreport a request that is actually still in whatever state it was
+            # already in (only possible if it had somehow already reached success).
+            if applied:
+                bridge.emit(
+                    event_type="executor_failed", request_id=request_id, paper_id=row["paper_id"],
+                    status_after="failed", status_before="in_progress",
+                    message="bridge restarted mid-run (subtype=interrupted)",
+                )
+
+    # Second pass: requests stuck 'in_progress' with no terminal status of their
+    # own. No "still has a running attempt" exclusion is needed here (review
+    # round-3 finding 4): the loop above is synchronous and, for EVERY row it
+    # reaps, unconditionally transitions that row's request away from
+    # 'in_progress' (to 'completed' or 'failed' — never blocked, since
+    # 'in_progress' is never in _SUCCESS_STATUSES) before this query runs. So by
+    # construction, any request still 'in_progress' here already has zero
+    # running attempts — this is restart-idempotent under the documented
+    # single-process startup model (only one sweep runs, synchronously, before
+    # the app serves its first request).
+    with bridge.db.transaction() as conn:
+        stuck_requests = conn.execute(
+            "SELECT id FROM paper_requests WHERE status = 'in_progress'"
+        ).fetchall()
+    for stuck in stuck_requests:
+        request_id = stuck["id"]
+        walled_tiers, last_wall_url, last_screenshot = bridge.wall_evidence(request_id)
+        manual = None
+        if walled_tiers:
+            current_url = _preferred_current_url(bridge, request_id, last_wall_url)
+            manual = ManualIntervention(
+                reason=(
+                    f"{' and '.join(walled_tiers)} hit a bot/CAPTCHA wall; the bridge "
+                    "restarted before the request reached a terminal status"
+                ),
+                screenshot_path=last_screenshot,
+                page_title=None,
+                current_url=current_url,
+                suggested_next_action=_wall_suggested_action(current_url),
+            )
+        try:
+            applied = bridge.db.update_request_status(request_id, "failed", manual=manual)
+        except KeyError:
+            applied = False
+        if applied:
             bridge.emit(
-                event_type="executor_failed", request_id=request_id, paper_id=row["paper_id"],
+                event_type="executor_failed", request_id=request_id, paper_id=None,
                 status_after="failed", status_before="in_progress",
-                message="bridge restarted mid-run (subtype=interrupted)",
+                message="bridge restarted before the request reached a terminal status "
+                        "(subtype=stuck_in_progress)",
             )
 
 
@@ -566,8 +731,38 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
             content={
                 "request": dict(req),
                 "attempts": [dict(a) for a in attempts],
+                # DERIVED, not stored (review finding 2, 2026-07-31): a count of
+                # this request's paper_attempts rows (tier attempts). Deliberately
+                # NOT written into paper_requests.attempt_count — that column is
+                # downloader.py's whole-request retry counter, and writing a
+                # per-tier count into it corrupted that path's backoff/retry
+                # budget. See the column comment in db.py's SCHEMA_SQL.
+                "tier_attempt_count": len(attempts),
             },
         )
+
+    # --- /requests/{id}/screenshot (AGA-596 P3) ---
+
+    @app.get("/requests/{request_id}/screenshot")
+    async def get_request_screenshot(request_id: int, request: Request) -> Response:
+        """Serve the request's stored manual-handoff screenshot (falling back to
+        the latest attempt's screenshot) as image bytes. The bridge is docker0-only
+        (no shell access needed by KC/an operator) — this is what KC's own
+        screenshot proxy fetches from."""
+        denied = require_token(request)
+        if denied is not None:
+            return denied
+        req = bridge.db.get_request(request_id)
+        if req is None:
+            return _json_error(404, "not_found", f"request {request_id} unknown")
+        raw_path = req["manual_screenshot_path"] or bridge.latest_attempt_screenshot(request_id)
+        if not raw_path:
+            return _json_error(404, "not_found", "no screenshot recorded for this request")
+        path = bridge.resolve_screenshot_path(raw_path)
+        if path is None:
+            return _json_error(404, "not_found", "screenshot file is missing or outside the allowed area")
+        media_type = _SCREENSHOT_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
+        return Response(content=path.read_bytes(), media_type=media_type)
 
     # --- /download ---
 
@@ -617,7 +812,8 @@ async def _download_locked(
     fetch) and tier 2 (scripted Playwright) run BEFORE the tier-3 codex executor,
     each rate-disciplined on its OWN strategy. Tiers 1/2 only ever succeed or
     escalate — codex stays the sole terminal-classification authority, except a
-    both-tiers bot wall with codex unavailable, mapped to a retryable 502 bot_wall."""
+    both-tiers bot wall with codex unavailable, mapped to a retryable 502
+    bot_wall_unclassified (AGA-596 P1)."""
     state = bridge.state_store.load()
 
     # 4. rate pre-flight across all three strategies. A tier whose strategy is
@@ -666,15 +862,46 @@ async def _download_locked(
         """Mark a materialized-but-unfinished request 'failed' before a gated
         codex-unavailable return (review fix): a deterministic tier that ran set
         the request in_progress, and if codex is then unavailable these early
-        returns finalize nothing — the request would dangle in_progress forever
-        (startup_sweep only reaps running ATTEMPTS, and the tier attempts are
-        already resolved). No request materialized ⇒ nothing to finalize."""
+        returns finalize nothing themselves — the request would otherwise dangle
+        in_progress until the NEXT bridge restart's startup_sweep (a backstop for
+        a crash, not the normal path here; this finalizes it synchronously, right
+        now). No request materialized ⇒ nothing to finalize.
+
+        If a SINGLE deterministic tier walled (both_wall was false — the OTHER
+        tier missed/skipped/errored, so this isn't the both-tiers-wall path) and
+        codex is merely unavailable (selftest_required/chrome_down/cooldown/
+        daily_cap), that wall evidence is durable in paper_attempts and must not
+        be silently discarded either (review round-3 finding 3): build and
+        persist the same ManualIntervention handoff a live wall finish would,
+        and emit the same notification. The response's own HTTP status/
+        error_code is unchanged either way — only the persisted row and the
+        notification gain the handoff."""
         request_id = created.get("request_id")
         if request_id is not None:
+            walled_tiers, last_wall_url, last_screenshot = bridge.wall_evidence(request_id)
+            manual = None
+            if walled_tiers:
+                current_url = _preferred_current_url(bridge, request_id, last_wall_url)
+                manual = ManualIntervention(
+                    reason=(
+                        f"{' and '.join(walled_tiers)} hit a bot/CAPTCHA wall; codex was "
+                        "unavailable to classify further"
+                    ),
+                    screenshot_path=last_screenshot,
+                    page_title=None,
+                    current_url=current_url,
+                    suggested_next_action=_wall_suggested_action(current_url),
+                )
             try:
-                bridge.db.update_request_status(request_id, "failed")
+                applied = bridge.db.update_request_status(request_id, "failed", manual=manual)
             except KeyError:
-                pass
+                applied = False
+            if applied and manual is not None:
+                bridge.emit(
+                    event_type="bot_wall", request_id=request_id, paper_id=None,
+                    status_after="failed", status_before="in_progress",
+                    message=f"{' and '.join(walled_tiers)} hit a bot/CAPTCHA wall; codex unavailable",
+                )
         return response
 
     tier_kinds: dict[str, str] = {}
@@ -718,7 +945,7 @@ async def _download_locked(
 
     # Codex is unavailable. Both deterministic tiers hitting a wall is the one
     # signal strong enough to terminate without codex — map it to a retryable 502
-    # bot_wall instead of selftest_required.
+    # bot_wall_unclassified instead of selftest_required (AGA-596 P1).
     if both_wall:
         return _finish_wall_evidence(bridge, request_id=created["request_id"])
     if not state.sandbox_mode:
@@ -758,7 +985,10 @@ async def _run_deterministic_tier(
     attempt row, runs the fetcher (which never raises and only lands bytes into
     download_dir), then either accepts via the SAME verify path codex uses (returns
     a Response) or resolves the attempt as a non-terminal miss and returns the
-    effective miss kind for the caller to escalate on."""
+    effective miss kind for the caller to escalate on. The fetcher's final_url is
+    persisted onto the attempt row itself (``current_url``, review finding 1) —
+    durable evidence a later finish can read back via ``bridge.wall_evidence``
+    even across a bridge restart, rather than an in-memory value."""
     attempt_id = bridge.write_ahead(
         request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
     )
@@ -783,10 +1013,12 @@ async def _run_deterministic_tier(
         # wrong_paper authority, so a tier verify-fail is quarantined (inside
         # _verify_and_finish) but ESCALATES rather than terminating.
         outcome = "verify_failed" if verify == "verify_failed" else "no_pdf"
-        bridge.resolve_attempt(attempt_id, outcome=outcome, message=result.notes or verify)
+        bridge.resolve_attempt(attempt_id, outcome=outcome, message=result.notes or verify,
+                               current_url=result.final_url)
         return outcome
 
-    bridge.resolve_attempt(attempt_id, outcome=result.kind, message=result.notes or result.kind)
+    bridge.resolve_attempt(attempt_id, outcome=result.kind, message=result.notes or result.kind,
+                           current_url=result.final_url)
     return result.kind
 
 
@@ -834,20 +1066,76 @@ async def _run_codex_tier(
     return response
 
 
+def _preferred_current_url(bridge: Bridge, request_id: int, *candidates: str | None) -> str | None:
+    """First non-None of ``candidates`` (already in caller-supplied preference
+    order — e.g. codex's own final_url, then the last deterministic tier's wall
+    URL), else the request's own stored ``inferred_url`` (the DOI/source URL the
+    ladder started from). For every request the bridge itself creates,
+    ``ensure_request()`` always passes a computed, non-None ``start_url`` here —
+    but ``Database.create_request()`` itself accepts ``inferred_url=None`` (used
+    by callers outside the bridge, e.g. downloader.py's freeform-query enqueue
+    path), so this is NOT a universal invariant of the column (review round-3
+    finding 5 — the previous docstring overclaimed it always holds a value).
+    This function tolerates that: with no non-None candidate and no
+    inferred_url, it returns None — never a crash. Never leave a
+    ManualIntervention's current_url NULL when the request row DOES hold a
+    usable URL though (AGA-596 review round 2, finding 3) — codex's
+    OUTCOME_SCHEMA explicitly permits a null final_url."""
+    for candidate in candidates:
+        if candidate:
+            return candidate
+    req = bridge.db.get_request(request_id)
+    return req["inferred_url"] if req else None
+
+
+def _wall_suggested_action(current_url: str | None) -> str:
+    """Operator-facing next step for a human-solvable bot/CAPTCHA wall (AGA-596
+    L1) — the bridge cannot solve a CAPTCHA itself, so hand the operator the
+    concrete steps instead of a bare error code."""
+    target = current_url or "the publisher page for this DOI"
+    return (
+        f"Open {target} in a browser, solve the CAPTCHA/verification if shown, "
+        "download the PDF yourself, then add it to Knowledge Center via the inbox "
+        "upload (Upgrade PDF) instead of retrying automatically."
+    )
+
+
 def _finish_wall_evidence(bridge: Bridge, *, request_id: int) -> Response:
     """Both deterministic tiers hit a bot wall and codex is unavailable to classify.
-    Return a retryable 502 bot_wall (honest, retryable) rather than
-    selftest_required — the tier attempt rows already recorded the two walls."""
-    _, event_type, http_status, error_code = _TAXONOMY["bot_wall"]
-    message = "tiers 1 and 2 both hit a bot wall; codex unavailable to classify"
-    try:
-        bridge.db.update_request_status(request_id, "failed")
-    except KeyError:
-        pass
-    bridge.emit(
-        event_type=event_type, request_id=request_id, paper_id=None,
-        status_after="failed", status_before="in_progress", message=message,
+    Return a retryable 502 bot_wall_unclassified (honest, retryable, and distinct
+    from codex-confirmed bot_wall — AGA-596 P1) rather than selftest_required — the
+    tier attempt rows already recorded the two walls. Also populate the request's
+    ManualIntervention (AGA-596 P2): neither deterministic tier captures a
+    screenshot or page title (not in either fetcher's result schema), so those
+    stay None. current_url comes from ``bridge.wall_evidence`` (durable — read
+    back from paper_attempts, not an in-memory value from this call)."""
+    _, event_type, http_status, error_code = _TAXONOMY["bot_wall_unclassified"]
+    message = "direct_fetch and scripted_browser both hit a bot wall; codex unavailable to classify"
+    # codex never ran in this path (codex_ready was false), so its 'bot_wall'
+    # outcome can't appear here — the screenshot is always None regardless.
+    walled_tiers, last_wall_url, _last_screenshot = bridge.wall_evidence(request_id)
+    tiers_desc = " and ".join(walled_tiers) if walled_tiers else "the deterministic tiers"
+    current_url = _preferred_current_url(bridge, request_id, last_wall_url)
+    manual = ManualIntervention(
+        reason=f"{tiers_desc} hit a bot/CAPTCHA wall; no classifier available (codex unavailable)",
+        screenshot_path=None,
+        page_title=None,
+        current_url=current_url,
+        suggested_next_action=_wall_suggested_action(current_url),
     )
+    try:
+        applied = bridge.db.update_request_status(request_id, "failed", manual=manual)
+    except KeyError:
+        applied = False
+    # A guarded no-op (review round-2 finding 2) means the request had somehow
+    # already reached a success status — the persisted row did NOT change to
+    # "failed", so don't emit a notification claiming it did. The HTTP response
+    # below still accurately describes what THIS attempt did.
+    if applied:
+        bridge.emit(
+            event_type=event_type, request_id=request_id, paper_id=None,
+            status_after="failed", status_before="in_progress", message=message,
+        )
     return _json_error(http_status, error_code, message, request_id=str(request_id))
 
 
@@ -885,13 +1173,15 @@ async def _resolve_outcome(
             # actually ran and failed.
             return _finish_failure(bridge, kind="wrong_paper", request_id=request_id,
                                    attempt_id=attempt_id, screenshot=screenshot,
-                                   message="downloaded PDF failed identity verification")
+                                   message="downloaded PDF failed identity verification",
+                                   final_url=exec_result.final_url)
         # No locatable candidate at all (codex MISREPORTED 'downloaded' — nothing
         # was ever verified). Treat as a retryable executor failure, not a
         # terminal wrong_paper claim (review fix, finding 4a).
         return _finish_failure(bridge, kind="gave_up", request_id=request_id,
                                attempt_id=attempt_id, screenshot=screenshot,
-                               message="executor reported 'downloaded' but no PDF was located")
+                               message="executor reported 'downloaded' but no PDF was located",
+                               final_url=exec_result.final_url)
 
     # salvage pass on timeout/gave_up/executor_died — a run that died (or timed out)
     # may still have written the PDF before dying, so it gets the same locate+verify
@@ -917,11 +1207,16 @@ async def _resolve_outcome(
                             reason=f"salvage candidate failed verification: {reason}")
         # salvage found nothing valid ⇒ original failure taxonomy
         return _finish_failure(bridge, kind=kind, request_id=request_id, attempt_id=attempt_id,
-                               screenshot=screenshot, message=exec_result.notes or kind)
+                               screenshot=screenshot, message=exec_result.notes or kind,
+                               final_url=exec_result.final_url)
 
-    # terminal failures (throttled/paywalled/bot_wall/gave_up-with-no-file/auth)
+    # terminal failures (throttled/paywalled/bot_wall/gave_up-with-no-file/auth).
+    # _finish_failure reads deterministic-tier wall evidence itself (bridge.
+    # wall_evidence) and populates ManualIntervention whenever it exists, not only
+    # when kind == "bot_wall" (review finding 1, 2026-07-31).
     return _finish_failure(bridge, kind=kind, request_id=request_id, attempt_id=attempt_id,
-                           screenshot=screenshot, message=exec_result.notes or kind)
+                           screenshot=screenshot, message=exec_result.notes or kind,
+                           final_url=exec_result.final_url)
 
 
 def _quarantine(path: Path, *, run_dir: Path, reason: str) -> None:
@@ -980,20 +1275,65 @@ async def _verify_and_finish(
     return Response(content=data, media_type="application/pdf", headers=headers)
 
 
+def _codex_wall_reason(walled_tiers: list[str], kind: str) -> str:
+    """Operator-facing reason for a bot-wall ManualIntervention originating from
+    (or alongside) the codex tier — review finding 1 (2026-07-31): populated
+    whenever deterministic-tier wall evidence exists, not only when codex itself
+    confirms bot_wall, so a post-escalation codex crash/timeout/auth failure
+    cannot discard proven wall evidence."""
+    if not walled_tiers:
+        return "codex classified this request as a bot/CAPTCHA wall"
+    tiers = " and ".join(walled_tiers)
+    if kind == "bot_wall":
+        return f"{tiers} hit a bot/CAPTCHA wall before escalating; codex confirmed bot_wall"
+    return (
+        f"{tiers} hit a bot/CAPTCHA wall before escalating; codex's own result was "
+        f"'{kind}' (not a confirmed wall, but the tier evidence still stands)"
+    )
+
+
 def _finish_failure(
     bridge: Bridge, *, kind: str, request_id: int, attempt_id: int,
-    screenshot: str | None, message: str,
+    screenshot: str | None, message: str, final_url: str | None = None,
 ) -> Response:
     outcome, event_type, http_status, error_code = _TAXONOMY[kind]
-    bridge.resolve_attempt(attempt_id, outcome=outcome, message=message, screenshot_path=screenshot)
-    try:
-        bridge.db.update_request_status(request_id, "failed")
-    except KeyError:
-        pass
-    bridge.emit(
-        event_type=event_type, request_id=request_id, paper_id=None,
-        status_after="failed", status_before="in_progress", message=message,
+    bridge.resolve_attempt(attempt_id, outcome=outcome, message=message, screenshot_path=screenshot,
+                           current_url=final_url)
+    # Deterministic-tier (or a PRIOR codex run's) wall evidence is read back from
+    # paper_attempts (durable — review finding 1), not threaded in-memory through
+    # the call chain. exclude_attempt_id=attempt_id: the resolve_attempt call just
+    # above may itself have written outcome='bot_wall' for THIS attempt (when
+    # kind == "bot_wall") — exclude it so a codex-confirmed wall doesn't
+    # self-report as its own prior evidence (review round-3 finding 2).
+    walled_tiers, last_wall_url, _last_screenshot = bridge.wall_evidence(
+        request_id, exclude_attempt_id=attempt_id
     )
+    manual = None
+    if kind == "bot_wall" or walled_tiers:
+        # Preference order for current_url (AGA-596 review round 2, finding 3):
+        # codex's own final_url, else the last deterministic tier's wall URL,
+        # else the request's own stored inferred_url — codex's OUTCOME_SCHEMA
+        # permits a null final_url, and a codex-only wall with no prior
+        # deterministic wall must still get a usable URL, not a bare NULL.
+        current_url = _preferred_current_url(bridge, request_id, final_url, last_wall_url)
+        manual = ManualIntervention(
+            reason=_codex_wall_reason(walled_tiers, kind),
+            screenshot_path=screenshot,
+            page_title=None,
+            current_url=current_url,
+            suggested_next_action=_wall_suggested_action(current_url),
+        )
+    try:
+        applied = bridge.db.update_request_status(request_id, "failed", manual=manual)
+    except KeyError:
+        applied = False
+    # Skip the notification on a guarded no-op (review round-2 finding 2) — the
+    # persisted row did not actually change to "failed" in that case.
+    if applied:
+        bridge.emit(
+            event_type=event_type, request_id=request_id, paper_id=None,
+            status_after="failed", status_before="in_progress", message=message,
+        )
     return _json_error(http_status, error_code, message, request_id=str(request_id),
                        screenshot=screenshot)
 

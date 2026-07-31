@@ -48,6 +48,7 @@ CREATE TABLE paper_requests (
     force_redownload INTEGER NOT NULL DEFAULT 0,
     next_retry_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 0,
     manual_reason TEXT,
     manual_screenshot_path TEXT,
     manual_page_title TEXT,
@@ -57,6 +58,13 @@ CREATE TABLE paper_requests (
     updated_at TEXT NOT NULL
 )
 ```
+`revision` (AGA-596 review round 4) is a pure optimistic-concurrency-control
+token — bumped by 1 on every `update_request_status` write that actually
+applies (never on a guarded no-op); NOT present in the 2026-06-13 snapshot
+above, retrofitted onto pre-existing databases by
+`db._ensure_request_revision_column` (idempotent `ALTER TABLE ... ADD COLUMN`,
+run from `Database.init()`). See §3's `update_request_status` entry for the
+CAS contract that reads/writes it.
 
 ### paper_attempts (AFTER the bridge migration)
 Original live schema lacked `started_at/finished_at/outcome/run_dir`. The design
@@ -146,7 +154,25 @@ CREATE TABLE paper_links (
   normalized title).
 - `create_request(raw_input, inferred_title, inferred_doi, inferred_url, paper_id, force_redownload=False) -> int`
   (inserts status `'queued'`).
-- `update_request_status(request_id, status, attempt_count=None, next_retry_at=None, manual=None, paper_id=None)`.
+- `update_request_status(request_id, status, attempt_count=None, next_retry_at=None, manual=None, paper_id=None, expected_revision=None) -> bool`
+  — `paper_requests.revision` is a pure CAS token, bumped by 1 on every write
+  this method actually applies (never on a guarded no-op). Returns True if the
+  row was actually updated, False if a guard turned it into a no-op (AGA-596
+  review round 2/3/4): a non-success status can't overwrite a row already in a
+  success status (`downloaded`/`completed_deduped`/`completed`) UNLESS
+  `expected_revision` is given AND still matches the row's CURRENT revision
+  (compare-and-set — downloader.py's `process_request` passes the revision it
+  read at the top of its own call, so a legitimate force_redownload
+  reopen-then-fail applies but a stale concurrent write from elsewhere
+  no-ops). Revision-based CAS (not status-string CAS, used through round 3)
+  because status-only comparison has an ABA hole: two force_redownload workers
+  can both read status='downloaded'; the faster one re-downloads and writes
+  'downloaded' again (same string, genuinely newer row); a slower worker's
+  stale expected-status check would still match. The bridge never passes
+  `expected_revision`; every bridge call site relies on the plain
+  success-status guard and MUST check the returned bool before emitting a
+  status-change notification for a "failed" transition (a guarded no-op means
+  the persisted row did not actually change).
 - `record_attempt(request_id, paper_id, attempt_number, status, strategy, message=None, screenshot_path=None, page_title=None, current_url=None) -> int`
   — note: does NOT write the new `started_at/outcome/run_dir` columns, so the
   bridge issues its own INSERT/UPDATE for write-ahead rows (it still uses
@@ -258,7 +284,8 @@ compat, and a bare `check_rate(conn)` still defaults to the codex strategy.
   `auth_error` / `timeout`, §2.7). The ONE exception: if BOTH tier 1 and tier 2
   independently returned `wall` and codex is unavailable (no persisted
   `sandbox_mode`, or Chrome down), the wall evidence maps to a retryable
-  `502 bot_wall` instead of `selftest_required`.
+  `502 bot_wall_unclassified` (AGA-596 P1 — distinct from codex-confirmed
+  `bot_wall`) instead of `selftest_required`.
 - Successful responses carry `X-Paperika-Tier: direct_fetch | scripted_browser |
   codex_bridge`.
 

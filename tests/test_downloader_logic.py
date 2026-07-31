@@ -505,6 +505,30 @@ def test_process_request_moves_to_retrying_on_failure_and_persists_png_artifact(
     assert Path(outcome.manual.screenshot_path).exists()
 
 
+def test_force_redownload_after_success_can_transition_off_downloaded_on_failure(tmp_path: Path):
+    """AGA-596 review round 2, finding 2: update_request_status's stale-failure
+    guard (added to protect a success from a stale concurrent overwrite) must
+    NOT also block a legitimate force_redownload reopen of an already-successful
+    request when the fresh attempt then fails — the request must actually
+    transition off "downloaded", not get stuck silently showing a success that
+    no longer reflects what just happened."""
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+
+    downloader = FailingArtifactDownloader(config, db, chrome_results=[None], doi_result=None)
+    queued = downloader.enqueue("10.1000/force-redownload-fail", force_redownload=True)
+    request_id = queued["request_id"]
+    db.update_request_status(request_id, "downloaded")  # simulate an earlier success
+
+    outcome = downloader.process_request(request_id)
+
+    assert outcome.status in {"retrying", "manual_intervention", "permanent_failure"}
+    row = db.get_request(request_id)
+    assert row["status"] == outcome.status  # NOT stuck at "downloaded"
+
+
 def test_completed_request_is_not_reprocessed(tmp_path: Path):
     config = build_config(tmp_path)
     config.ensure_runtime_dirs()

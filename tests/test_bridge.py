@@ -376,6 +376,127 @@ def test_startup_sweep_salvages_landed_pdf(cfg):
     con.close()
 
 
+def test_startup_sweep_interrupted_running_attempt_surfaces_prior_wall_evidence(cfg):
+    """Deletion-sensitivity for the interrupted-branch wall-handoff block (review
+    round-2 finding 4): a PRIOR deterministic-tier wall (already resolved, not
+    the running attempt itself) must still populate ManualIntervention when the
+    codex attempt that was 'running' at crash time is reaped as 'interrupted'."""
+    bridge = bridge_app.build_bridge(cfg)
+    rid = bridge.db.create_request(raw_input="10.1364/crash2", inferred_title="Crash Paper Two",
+                                   inferred_doi="10.1364/crash2", inferred_url=None, paper_id=None)
+    bridge.db.update_request_status(rid, "in_progress")
+    run_dir = cfg.db_path.parent / "codex_runs" / str(rid)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # tier 1 walled and was already resolved before codex ran.
+    tier_aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir=str(run_dir), strategy="direct_fetch")
+    bridge.resolve_attempt(tier_aid, outcome="wall", current_url="https://pub.example/interrupted-wall")
+    # codex's own attempt is still 'running' when the bridge crashes.
+    codex_aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir=str(run_dir), strategy="codex_bridge")
+
+    bridge_app.startup_sweep(bridge)
+
+    con = _conn(cfg)
+    att = con.execute("SELECT outcome FROM paper_attempts WHERE id = ?", (codex_aid,)).fetchone()
+    assert att["outcome"] == "interrupted"
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (rid,)).fetchone()
+    assert row["status"] == "failed"
+    assert row["manual_reason"] is not None
+    assert "direct_fetch" in row["manual_reason"]
+    # The reason must name the ACTUAL interrupted strategy (codex_bridge here),
+    # not a hardcoded "codex" claim regardless of which tier was running
+    # (review round-3 finding 5).
+    assert "codex_bridge" in row["manual_reason"]
+    assert row["manual_current_url"] == "https://pub.example/interrupted-wall"
+    con.close()
+
+
+def test_startup_sweep_reaps_request_stuck_in_progress_with_no_running_attempts(cfg):
+    """HIGH review round-2 finding 1: a crash AFTER an attempt is resolved
+    (outcome='wall') but BEFORE the request itself receives its terminal status
+    transition leaves the request 'in_progress' forever with no 'running'
+    attempt left for the existing sweep loop to catch. startup_sweep's second
+    pass must also reap requests in this exact state — finalizing them 'failed'
+    and building a ManualIntervention from the trapped wall evidence."""
+    bridge = bridge_app.build_bridge(cfg)
+    rid = bridge.db.create_request(raw_input="10.1364/crash3", inferred_title="Crash Paper Three",
+                                   inferred_doi="10.1364/crash3", inferred_url=None, paper_id=None)
+    bridge.db.update_request_status(rid, "in_progress")
+    run_dir = cfg.db_path.parent / "codex_runs" / str(rid)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir=str(run_dir), strategy="scripted_browser")
+    # The attempt was resolved before the bridge crashed — no 'running' attempt
+    # remains for the FIRST sweep loop, but the request itself never received
+    # its terminal status transition.
+    bridge.resolve_attempt(aid, outcome="wall", message="bot/CAPTCHA wall",
+                           current_url="https://pub.example/crash-wall")
+
+    bridge_app.startup_sweep(bridge)
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (rid,)).fetchone()
+    assert row["status"] == "failed"
+    assert row["manual_reason"] is not None
+    assert "scripted_browser" in row["manual_reason"]
+    assert row["manual_current_url"] == "https://pub.example/crash-wall"
+    events = list(cfg.notification_dir.glob("*executor_failed*.json"))
+    assert events
+    con.close()
+
+
+def test_startup_sweep_recovers_codex_confirmed_wall_evidence_after_crash(cfg):
+    """MEDIUM review round-3 finding 2: codex's OWN confirmed-wall attempt is
+    resolved with outcome='bot_wall' (a DIFFERENT string than the deterministic
+    tiers' 'wall') — wall_evidence() must include it too, or a crash between
+    that resolve and the request's own status update leaves the sweep unable
+    to recover the URL/screenshot at all."""
+    bridge = bridge_app.build_bridge(cfg)
+    rid = bridge.db.create_request(raw_input="10.1364/crash4", inferred_title="Crash Paper Four",
+                                   inferred_doi="10.1364/crash4", inferred_url=None, paper_id=None)
+    bridge.db.update_request_status(rid, "in_progress")
+    run_dir = cfg.db_path.parent / "codex_runs" / str(rid)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    shot = run_dir / "final.png"
+    shot.write_bytes(b"\x89PNG\r\n\x1a\ncrash-wall-screenshot")
+    aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir=str(run_dir), strategy="codex_bridge")
+    # codex resolved its OWN wall confirmation (outcome='bot_wall', not 'wall')
+    # — then the bridge crashed before update_request_status ran.
+    bridge.resolve_attempt(aid, outcome="bot_wall", current_url="https://pub.example/codex-crash-wall",
+                           screenshot_path=str(shot))
+
+    bridge_app.startup_sweep(bridge)
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (rid,)).fetchone()
+    assert row["status"] == "failed"
+    assert row["manual_reason"] is not None
+    assert "codex_bridge" in row["manual_reason"]
+    assert row["manual_current_url"] == "https://pub.example/codex-crash-wall"
+    assert row["manual_screenshot_path"] == str(shot)
+    con.close()
+
+
+def test_finish_failure_skips_notification_on_guarded_no_op(cfg):
+    """MEDIUM review round-2 finding 2: when the request has already reached a
+    success status (e.g. a race with some other writer), _finish_failure's
+    status update becomes a guarded no-op — no notification claiming
+    status_after="failed" should be emitted, and the persisted row must stay
+    exactly as it was."""
+    bridge = bridge_app.build_bridge(cfg)
+    rid = bridge.db.create_request(raw_input="10.1364/guarded", inferred_title="Guarded Paper",
+                                   inferred_doi="10.1364/guarded", inferred_url=None, paper_id=None)
+    bridge.db.update_request_status(rid, "completed")  # already succeeded
+    run_dir = cfg.db_path.parent / "codex_runs" / str(rid)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir=str(run_dir), strategy="codex_bridge")
+
+    bridge_app._finish_failure(bridge, kind="gave_up", request_id=rid, attempt_id=aid,
+                               screenshot=None, message="stale failure after success")
+
+    row = bridge.db.get_request(rid)
+    assert row["status"] == "completed"
+    assert not list(cfg.notification_dir.glob("*executor_failed*.json"))
+
+
 # ----------------------------------------------------------------- executor ---
 
 
@@ -549,6 +670,7 @@ def test_unauthenticated_protected_endpoints_401(cfg):
         ("post", "/download", {"doi": "10.1364/x", "title": "t"}),
         ("post", "/selftest/codex", None),
         ("get", "/requests/1", None),
+        ("get", "/requests/1/screenshot", None),
     ]
     for method, path, body in cases:
         resp = client.post(path, json=body) if method == "post" else client.get(path)
@@ -1358,8 +1480,11 @@ def test_ladder_chrome_down_tier1_attempted_cookieless_tier2_skipped(cfg, monkey
 def test_gated_codex_miss_does_not_leak_in_progress_request(cfg):
     """Finding 2: tiers 1/2 run and escalate (autouse stub ⇒ no_pdf) but codex is
     unavailable (no sandbox mode), so the ladder returns selftest_required. The
-    request the tiers materialized must be finalized 'failed', never left dangling
-    'in_progress' (startup_sweep only reaps running ATTEMPTS, not the request)."""
+    request the tiers materialized must be finalized 'failed' by
+    finalize_if_created synchronously, right in this /download call — not left
+    dangling 'in_progress' waiting on the NEXT bridge restart's startup_sweep
+    (that sweep is a crash backstop, not the mechanism for this normal gated
+    return)."""
     # no _seed_sandbox_mode ⇒ codex gated ⇒ selftest_required after the tiers miss
     client = TestClient(bridge_app.create_app(cfg))
     resp = client.post("/download", headers=_auth(),
@@ -1376,6 +1501,50 @@ def test_gated_codex_miss_does_not_leak_in_progress_request(cfg):
         "SELECT outcome FROM paper_attempts ORDER BY id").fetchall()]
     assert outcomes and all(o != "running" for o in outcomes)
     con.close()
+
+
+def test_finalize_if_created_populates_handoff_when_single_tier_walled_and_chrome_down(cfg, monkeypatch):
+    """MEDIUM review round-3 finding 3: a SINGLE deterministic wall (direct_fetch
+    walls, scripted_browser is SKIPPED because chrome is down — NOT the
+    both-tiers-wall path) with codex unavailable for an UNRELATED reason
+    (chrome_down) must still get a ManualIntervention — codex being merely
+    unavailable must not discard real wall evidence from the one tier that ran.
+    The HTTP status/error_code (503/chrome_down) stay unchanged."""
+    _seed_sandbox_mode(cfg)
+
+    async def _down_probe(*, fresh=False, cdp_http=chrome.CDP_HTTP):
+        return chrome.ProbeResult(False, error="cdp down", checked_at=_now())
+    monkeypatch.setattr(chrome, "probe", _down_probe)
+
+    async def _wall_direct(**kwargs):
+        return direct_fetch.DirectFetchResult(kind="wall", final_url="https://pub.example/single-wall")
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _wall_direct)
+
+    tier2 = {"n": 0}
+
+    async def _t2(**kwargs):
+        tier2["n"] += 1
+        return scripted_browser.ScriptedFetchResult(kind="no_pdf")
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _t2)
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.singlewall", "title": "Single Wall Paper"})
+    assert resp.status_code == 503
+    assert resp.json()["error_code"] == "chrome_down"
+    assert tier2["n"] == 0  # scripted_browser genuinely skipped (chrome down)
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status"] == "failed"
+    assert row["manual_reason"] is not None
+    assert "direct_fetch" in row["manual_reason"]
+    assert row["manual_current_url"] == "https://pub.example/single-wall"
+    assert "inbox" in row["manual_suggested_next_action"].lower()
+    con.close()
+
+    events = list(cfg.notification_dir.glob("*_bot_wall.json"))
+    assert events
 
 
 def test_healthz_reports_per_strategy_attempts(cfg):
@@ -1399,3 +1568,420 @@ def test_healthz_reports_per_strategy_attempts(cfg):
         "direct_fetch": 2, "scripted_browser": 1, "codex_bridge": 3,
     }
     assert body["limits"]["downloads_today"] == 6
+
+
+# --------------------------------------- AGA-596 L1: actionable CAPTCHA walls ---
+
+
+def test_both_tiers_wall_codex_unavailable_emits_bot_wall_unclassified_with_manual(cfg, monkeypatch):
+    """P1+P2+P5: both deterministic tiers hitting a bot wall with codex unavailable
+    must surface the DISTINCT retryable bot_wall_unclassified code (bare bot_wall is
+    treated as terminal by KC) and populate the request's ManualIntervention so an
+    operator has something actionable — reason names both walled tiers, current_url
+    comes from the walled tier's final_url, screenshot/page_title stay None (never
+    captured by either deterministic fetcher)."""
+    # no _seed_sandbox_mode ⇒ codex is unavailable (codex_ready is False)
+
+    async def _wall_direct(**kwargs):
+        return direct_fetch.DirectFetchResult(kind="wall", final_url="https://pub.example/tier1-wall")
+
+    async def _wall_scripted(**kwargs):
+        return scripted_browser.ScriptedFetchResult(kind="wall", final_url="https://pub.example/tier2-wall")
+
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _wall_direct)
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _wall_scripted)
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.wall", "title": "Both Wall Paper"})
+    assert resp.status_code == 502
+    assert resp.json()["error_code"] == "bot_wall_unclassified"
+    request_id = int(resp.json()["request_id"])
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
+    assert row["status"] == "failed"
+    # attempt_count (downloader.py's whole-request retry counter) is untouched by
+    # bridge finishes (review finding 2) — the tier count is a DERIVED field on
+    # GET /requests/{id} instead (asserted below), never written to this column.
+    assert row["attempt_count"] == 0
+    assert "direct_fetch" in row["manual_reason"] and "scripted_browser" in row["manual_reason"]
+    assert row["manual_current_url"] == "https://pub.example/tier2-wall"  # last walled tier
+    assert row["manual_screenshot_path"] is None
+    assert row["manual_page_title"] is None
+    assert "https://pub.example/tier2-wall" in row["manual_suggested_next_action"]
+    assert "inbox" in row["manual_suggested_next_action"].lower()
+    con.close()
+
+    detail = client.get(f"/requests/{request_id}", headers=_auth()).json()
+    assert detail["tier_attempt_count"] == 2  # direct_fetch + scripted_browser
+
+    # Review round-2 finding 4: the notification event_type must stay the
+    # documented "bot_wall" (unchanged contract) even though the HTTP
+    # error_code is the new, distinct "bot_wall_unclassified".
+    events = list(cfg.notification_dir.glob(f"*request_{request_id}_bot_wall.json"))
+    assert events
+    assert json.loads(events[0].read_text())["event_type"] == "bot_wall"
+
+
+def test_codex_confirmed_bot_wall_populates_manual_with_no_prior_wall(cfg, monkeypatch):
+    """P2: codex's own terminal bot_wall classification also gets a
+    ManualIntervention, even when neither deterministic tier walled first (they
+    missed with no_pdf via the autouse stub) — reason names codex as the sole
+    classifier, current_url comes from exec_result.final_url."""
+    _seed_sandbox_mode(cfg)
+
+    async def _fake_codex_bot_wall(run_dir, prompt, sandbox_mode):
+        return executor.ExecResult(
+            kind="bot_wall", final_url="https://pub.example/codex-wall", notes="codex bot wall"
+        )
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_bot_wall)
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.codexwall", "title": "Codex Wall Paper"})
+    assert resp.status_code == 502
+    assert resp.json()["error_code"] == "bot_wall"
+    request_id = int(resp.json()["request_id"])
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
+    assert row["attempt_count"] == 0  # untouched by bridge finishes (review finding 2)
+    assert row["manual_reason"] == "codex classified this request as a bot/CAPTCHA wall"
+    assert row["manual_current_url"] == "https://pub.example/codex-wall"
+    assert "https://pub.example/codex-wall" in row["manual_suggested_next_action"]
+    con.close()
+
+    detail = client.get(f"/requests/{request_id}", headers=_auth()).json()
+    assert detail["tier_attempt_count"] == 3  # direct_fetch + scripted_browser + codex_bridge
+
+
+def test_codex_confirmed_bot_wall_with_null_final_url_falls_back_to_request_url(cfg, monkeypatch):
+    """MEDIUM review round-2 finding 3: codex's OUTCOME_SCHEMA explicitly permits
+    final_url=null. A codex-only bot_wall (no prior deterministic wall, so no
+    fallback wall URL either) with a null final_url must still get a usable
+    current_url — the request's own stored inferred_url (the DOI/source URL the
+    ladder started from) — never a bare NULL when a usable URL is available."""
+    _seed_sandbox_mode(cfg)
+
+    async def _fake_codex_bot_wall_null_url(run_dir, prompt, sandbox_mode):
+        return executor.ExecResult(kind="bot_wall", final_url=None, notes="codex bot wall, no url")
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_bot_wall_null_url)
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.nullurl", "title": "Null URL Paper"})
+    assert resp.status_code == 502
+    request_id = int(resp.json()["request_id"])
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
+    assert row["manual_current_url"] == "https://doi.org/10.1364/jocn.nullurl"
+    con.close()
+
+
+def test_codex_confirmed_bot_wall_after_deterministic_walls_names_both_tiers(cfg, monkeypatch):
+    """P2: when both deterministic tiers walled before escalating to codex, and
+    codex confirms bot_wall, the manual reason names which tiers walled first —
+    _finish_failure reads that evidence back from paper_attempts via
+    bridge.wall_evidence (durable; not threaded in-memory through the call
+    chain, review round-2 finding 1)."""
+    _seed_sandbox_mode(cfg)
+
+    async def _wall_direct(**kwargs):
+        return direct_fetch.DirectFetchResult(kind="wall", final_url="https://pub.example/tier1-wall")
+
+    async def _wall_scripted(**kwargs):
+        return scripted_browser.ScriptedFetchResult(kind="wall", final_url="https://pub.example/tier2-wall")
+
+    async def _fake_codex_bot_wall(run_dir, prompt, sandbox_mode):
+        return executor.ExecResult(
+            kind="bot_wall", final_url="https://pub.example/codex-wall", notes="codex bot wall"
+        )
+
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _wall_direct)
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _wall_scripted)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_bot_wall)
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.codexwall2", "title": "Codex Wall After Ladder"})
+    assert resp.status_code == 502
+    assert resp.json()["error_code"] == "bot_wall"
+    request_id = int(resp.json()["request_id"])
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
+    assert row["attempt_count"] == 0  # untouched by bridge finishes (review finding 2)
+    assert "direct_fetch" in row["manual_reason"] and "scripted_browser" in row["manual_reason"]
+    assert "codex confirmed bot_wall" in row["manual_reason"]
+    assert row["manual_current_url"] == "https://pub.example/codex-wall"
+    con.close()
+
+    detail = client.get(f"/requests/{request_id}", headers=_auth()).json()
+    assert detail["tier_attempt_count"] == 3
+
+
+def test_get_request_reports_derived_tier_attempt_count_not_stored_column(cfg, monkeypatch):
+    """Review finding 2 (2026-07-31): paper_requests.attempt_count is
+    downloader.py's whole-request retry counter (its own backoff/retry budget) —
+    writing a per-tier count into it there would start a downloader retry at the
+    wrong backoff step and burn retries the request never actually used. The
+    bridge must NEVER write to that column; the tier-attempt count is instead a
+    DERIVED field (a COUNT of paper_attempts rows) surfaced only in the GET
+    /requests/{id} response."""
+    _seed_sandbox_mode(cfg)
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _tier_download_stub())
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.attemptcount", "title": "Attempt Count Paper"})
+    assert resp.status_code == 200, resp.text
+    request_id = int(resp.headers["X-Paperika-Request-Id"])
+
+    con = _conn(cfg)
+    row = con.execute(
+        "SELECT attempt_count FROM paper_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    assert row["attempt_count"] == 0  # stored column is never touched by the bridge
+    con.close()
+
+    detail = client.get(f"/requests/{request_id}", headers=_auth()).json()
+    assert detail["tier_attempt_count"] == 1  # one real tier attempt, derived from paper_attempts
+    assert len(detail["attempts"]) == 1
+
+
+def test_post_escalation_codex_failure_does_not_discard_wall_evidence(cfg, monkeypatch):
+    """HIGH review finding 1 (2026-07-31): both deterministic tiers wall, codex
+    passes preflight (sandbox seeded) but then dies mid-run (executor_died) —
+    NOT a confirmed bot_wall. The request must still get a ManualIntervention
+    naming the walled tiers, because that evidence is real regardless of what
+    codex's own run did afterward."""
+    _seed_sandbox_mode(cfg)
+
+    async def _wall_direct(**kwargs):
+        return direct_fetch.DirectFetchResult(kind="wall", final_url="https://pub.example/tier1-wall")
+
+    async def _wall_scripted(**kwargs):
+        return scripted_browser.ScriptedFetchResult(kind="wall", final_url="https://pub.example/tier2-wall")
+
+    async def _fake_codex_died(run_dir, prompt, sandbox_mode):
+        return executor.ExecResult(kind="executor_died", notes="codex crashed mid-turn")
+
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _wall_direct)
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _wall_scripted)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_died)
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.postescalation", "title": "Post Escalation Paper"})
+    assert resp.status_code == 502
+    assert resp.json()["error_code"] == "executor_died"  # codex's own (retryable) verdict, unchanged
+    request_id = int(resp.json()["request_id"])
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
+    assert row["manual_reason"] is not None
+    assert "direct_fetch" in row["manual_reason"] and "scripted_browser" in row["manual_reason"]
+    assert "executor_died" in row["manual_reason"]
+    # Preference order: codex's own final_url (None here) falls back to the last
+    # deterministic tier's wall URL.
+    assert row["manual_current_url"] == "https://pub.example/tier2-wall"
+    assert "inbox" in row["manual_suggested_next_action"].lower()
+    con.close()
+
+
+# ------------------------------------------- AGA-596 P3: screenshot endpoint ---
+
+
+def test_screenshot_endpoint_serves_manual_screenshot_path(cfg):
+    bridge_app.build_bridge(cfg)
+    shot = cfg.db_path.parent / "codex_runs" / "42" / "final.png"
+    shot.parent.mkdir(parents=True, exist_ok=True)
+    shot.write_bytes(b"\x89PNG\r\n\x1a\nfake-codex-screenshot")
+    con = _conn(cfg)
+    con.execute(
+        "INSERT INTO paper_requests (id, raw_input, status, manual_screenshot_path, created_at, updated_at) "
+        "VALUES (42, 'x', 'failed', ?, ?, ?)",
+        (str(shot), limits.iso(_now()), limits.iso(_now())),
+    )
+    con.commit()
+    con.close()
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.get("/requests/42/screenshot", headers=_auth())
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/png"
+    assert resp.content == shot.read_bytes()
+
+
+def test_screenshot_endpoint_falls_back_to_latest_attempt_screenshot(cfg):
+    """No manual_screenshot_path on the request itself ⇒ fall back to the latest
+    paper_attempts.screenshot_path for that request."""
+    bridge_app.build_bridge(cfg)
+    shot = cfg.screenshot_dir / "attempt_shot.png"
+    shot.parent.mkdir(parents=True, exist_ok=True)
+    shot.write_bytes(b"\x89PNG\r\n\x1a\nfake-attempt-screenshot")
+    con = _conn(cfg)
+    con.execute(
+        "INSERT INTO paper_requests (id, raw_input, status, created_at, updated_at) "
+        "VALUES (7, 'x', 'failed', ?, ?)",
+        (limits.iso(_now()), limits.iso(_now())),
+    )
+    con.execute(
+        "INSERT INTO paper_attempts (request_id, attempt_number, status, strategy, screenshot_path, created_at) "
+        "VALUES (7, 1, 'failed', 'codex_bridge', ?, ?)",
+        (str(shot), limits.iso(_now())),
+    )
+    con.commit()
+    con.close()
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.get("/requests/7/screenshot", headers=_auth())
+    assert resp.status_code == 200
+    assert resp.content == shot.read_bytes()
+
+
+def test_screenshot_endpoint_fallback_is_scoped_to_the_request(cfg):
+    """Review finding 5 (2026-07-31): the fallback-to-latest-attempt query must be
+    scoped by request_id — if that WHERE clause were ever dropped, this test
+    (unlike the single-request fallback test above) would catch it, because
+    request 21's screenshot must never leak into request 22's response."""
+    bridge_app.build_bridge(cfg)
+    other_shot = cfg.screenshot_dir / "request_21_attempt.png"
+    other_shot.parent.mkdir(parents=True, exist_ok=True)
+    other_shot.write_bytes(b"\x89PNG\r\n\x1a\nbelongs-to-request-21")
+    con = _conn(cfg)
+    con.execute(
+        "INSERT INTO paper_requests (id, raw_input, status, created_at, updated_at) "
+        "VALUES (21, 'x', 'failed', ?, ?)",
+        (limits.iso(_now()), limits.iso(_now())),
+    )
+    con.execute(
+        "INSERT INTO paper_attempts (request_id, attempt_number, status, strategy, screenshot_path, created_at) "
+        "VALUES (21, 1, 'failed', 'codex_bridge', ?, ?)",
+        (str(other_shot), limits.iso(_now())),
+    )
+    # Request 22 has no screenshot of its own (no manual_screenshot_path, no
+    # attempt screenshot) — its fallback query must not pick up request 21's row.
+    con.execute(
+        "INSERT INTO paper_requests (id, raw_input, status, created_at, updated_at) "
+        "VALUES (22, 'y', 'failed', ?, ?)",
+        (limits.iso(_now()), limits.iso(_now())),
+    )
+    con.commit()
+    con.close()
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.get("/requests/22/screenshot", headers=_auth())
+    assert resp.status_code == 404
+
+
+def test_screenshot_endpoint_404_rejects_symlink_escape(cfg, tmp_path):
+    """Review finding 5 (2026-07-31): a symlink INSIDE an allowed root (screenshot_
+    dir) pointing OUTSIDE it must not be served — lexical (string-prefix)
+    containment would miss this; resolved containment (Path.resolve() follows the
+    symlink to its real target before the containment check) must not."""
+    bridge_app.build_bridge(cfg)
+    outside = tmp_path / "outside" / "secret.png"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_bytes(b"not-for-you")
+    link = cfg.screenshot_dir / "escape_link.png"
+    cfg.screenshot_dir.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside)
+
+    con = _conn(cfg)
+    con.execute(
+        "INSERT INTO paper_requests (id, raw_input, status, manual_screenshot_path, created_at, updated_at) "
+        "VALUES (23, 'x', 'failed', ?, ?, ?)",
+        (str(link), limits.iso(_now()), limits.iso(_now())),
+    )
+    con.commit()
+    con.close()
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.get("/requests/23/screenshot", headers=_auth())
+    assert resp.status_code == 404
+
+
+def test_screenshot_endpoint_404_when_no_screenshot_recorded(cfg):
+    bridge_app.build_bridge(cfg)
+    con = _conn(cfg)
+    con.execute(
+        "INSERT INTO paper_requests (id, raw_input, status, created_at, updated_at) "
+        "VALUES (9, 'x', 'failed', ?, ?)",
+        (limits.iso(_now()), limits.iso(_now())),
+    )
+    con.commit()
+    con.close()
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.get("/requests/9/screenshot", headers=_auth())
+    assert resp.status_code == 404
+    assert resp.json()["error_code"] == "not_found"
+
+
+def test_screenshot_endpoint_404_unknown_request(cfg):
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.get("/requests/999/screenshot", headers=_auth())
+    assert resp.status_code == 404
+
+
+def test_screenshot_endpoint_rejects_path_outside_allowed_roots(cfg, tmp_path):
+    """Containment gate (mirrors _within_download_window, §2.4): a
+    manual_screenshot_path pointing outside screenshot_dir/codex_runs must never be
+    served, even if the file exists on disk."""
+    bridge_app.build_bridge(cfg)
+    outside = tmp_path / "outside" / "secret.png"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_bytes(b"not-for-you")
+    con = _conn(cfg)
+    con.execute(
+        "INSERT INTO paper_requests (id, raw_input, status, manual_screenshot_path, created_at, updated_at) "
+        "VALUES (5, 'x', 'failed', ?, ?, ?)",
+        (str(outside), limits.iso(_now()), limits.iso(_now())),
+    )
+    con.commit()
+    con.close()
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.get("/requests/5/screenshot", headers=_auth())
+    assert resp.status_code == 404
+
+
+def test_wall_manual_cleared_by_a_later_success_status(cfg, monkeypatch):
+    """AGA-596 P5 follow-up: a request that later reaches a SUCCESS status must
+    never keep showing a stale CAPTCHA-wall handoff. Exercises the invariant
+    through the bridge's own Database wiring (not just db.py directly): a wall
+    populates manual_*, then a later "completed" transition (e.g. an operator
+    resolving the request out-of-band) must clear it."""
+    # no _seed_sandbox_mode ⇒ codex unavailable ⇒ both walls -> bot_wall_unclassified
+    async def _wall_direct(**kwargs):
+        return direct_fetch.DirectFetchResult(kind="wall", final_url="https://pub.example/tier1-wall")
+
+    async def _wall_scripted(**kwargs):
+        return scripted_browser.ScriptedFetchResult(kind="wall", final_url="https://pub.example/tier2-wall")
+
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _wall_direct)
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _wall_scripted)
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.wallcleared", "title": "Wall Then Success Paper"})
+    request_id = int(resp.json()["request_id"])
+
+    con = _conn(cfg)
+    row = con.execute("SELECT manual_reason FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
+    assert row["manual_reason"] is not None  # sanity: the wall really did populate it
+    con.close()
+
+    bridge = bridge_app.build_bridge(cfg)
+    bridge.db.update_request_status(request_id, "completed")
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
+    assert row["status"] == "completed"
+    assert row["manual_reason"] is None
+    assert row["manual_screenshot_path"] is None
+    assert row["manual_page_title"] is None
+    assert row["manual_current_url"] is None
+    assert row["manual_suggested_next_action"] is None
+    con.close()

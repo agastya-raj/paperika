@@ -212,9 +212,14 @@ def resolve_attempt(
     paper_id: int | None = None,
     message: str | None = None,
     screenshot_path: str | None = None,
+    current_url: str | None = None,
     now: datetime | None = None,
 ) -> None:
-    """UPDATE the write-ahead row with its final outcome + finished_at."""
+    """UPDATE the write-ahead row with its final outcome + finished_at.
+    ``current_url`` (AGA-596 review finding 1) persists a tier's ``final_url`` on
+    its OWN attempt row — durable evidence (survives a bridge restart) that a
+    later finish can read back via ``paper_attempts.current_url``, instead of
+    depending on an in-memory value computed during the same /download call."""
     now = now or utc_now()
     status = "downloaded" if outcome in _SUCCESS_OUTCOMES else "failed"
     conn.execute(
@@ -222,10 +227,11 @@ def resolve_attempt(
         UPDATE paper_attempts
         SET outcome = ?, status = ?, finished_at = ?, message = COALESCE(?, message),
             paper_id = COALESCE(?, paper_id),
-            screenshot_path = COALESCE(?, screenshot_path)
+            screenshot_path = COALESCE(?, screenshot_path),
+            current_url = COALESCE(?, current_url)
         WHERE id = ?
         """,
-        (outcome, status, iso(now), message, paper_id, screenshot_path, attempt_id),
+        (outcome, status, iso(now), message, paper_id, screenshot_path, current_url, attempt_id),
     )
     conn.commit()
 

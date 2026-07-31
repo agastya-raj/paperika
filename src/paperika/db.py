@@ -16,6 +16,19 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# paper_requests.status values meaning "a paper was actually obtained" — used by
+# update_request_status to decide whether a stale manual_* operator handoff must
+# be cleared (AGA-596 P5 follow-up), and to guard against a stale non-success
+# transition overwriting a request that already succeeded (AGA-596 review
+# finding 3). The two callers spell success differently: downloader.py's
+# queue-retry path uses "downloaded"/"completed_deduped"; the bridge uses
+# "completed".
+_SUCCESS_STATUSES = frozenset({"downloaded", "completed_deduped", "completed"})
+# Same set, pre-rendered as a SQL literal list for the WHERE-clause guard below —
+# built from _SUCCESS_STATUSES (not duplicated by hand) so the two can't drift.
+_SUCCESS_STATUSES_SQL = ", ".join(f"'{s}'" for s in sorted(_SUCCESS_STATUSES))
+
+
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 
@@ -61,7 +74,29 @@ CREATE TABLE IF NOT EXISTS paper_requests (
     priority INTEGER NOT NULL DEFAULT 100,
     force_redownload INTEGER NOT NULL DEFAULT 0,
     next_retry_at TEXT,
+    -- attempt_count counts WHOLE-REQUEST retries (downloader.py's queue-retry
+    -- path bumps it per pass through process_request). It is a distinct counter
+    -- from paper_attempts.attempt_number, which counts per-request TIER attempts
+    -- (direct_fetch/scripted_browser/codex_bridge) inside the bridge's ladder.
+    -- The bridge NEVER writes to this column — an earlier revision briefly did
+    -- (AGA-596 P4), which would have corrupted downloader.py's own retry
+    -- backoff/budget semantics for that counter; reverted (AGA-596 review round
+    -- 2, finding 2). The tier-attempt count is instead a DERIVED field (a COUNT
+    -- of paper_attempts rows) surfaced only in the bridge's GET /requests/{id}
+    -- response.
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    -- revision is a pure optimistic-concurrency-control token (AGA-596 review
+    -- round 4, finding 1) — NOT a semantic/operator-facing counter like
+    -- attempt_count. update_request_status bumps it by 1 on every write it
+    -- actually applies (never on a guarded no-op). A CAS caller's
+    -- expected_revision must equal the row's CURRENT revision, not just its
+    -- status string: status-only CAS has an ABA hole — e.g. two
+    -- force_redownload workers both read status='downloaded'; the faster one
+    -- re-downloads and writes 'downloaded' again (same STRING, but a genuinely
+    -- newer row); the slower one's stale expected_status='downloaded' would
+    -- still match and clobber that newer success. revision always changes on
+    -- a real write, so it catches this where status alone cannot.
+    revision INTEGER NOT NULL DEFAULT 0,
     manual_reason TEXT,
     manual_screenshot_path TEXT,
     manual_page_title TEXT,
@@ -91,6 +126,24 @@ CREATE INDEX IF NOT EXISTS idx_paper_attempts_request_id ON paper_attempts(reque
 """
 
 
+def _ensure_request_revision_column(conn: sqlite3.Connection) -> None:
+    """Idempotent ``ALTER TABLE ... ADD COLUMN`` for ``paper_requests.revision``
+    (AGA-596 review round 4, finding 1). ``CREATE TABLE IF NOT EXISTS`` in
+    SCHEMA_SQL only creates the column on a brand-new database — it silently
+    no-ops on a database whose ``paper_requests`` table already existed before
+    this column was added (in particular the deployed gpu-box DB), so a
+    pre-existing table needs this retrofit. Mirrors the same idiom the bridge
+    already uses for its own ``paper_attempts`` columns (see
+    ``bridge/limits.py:ensure_bridge_columns``), but lives here — not
+    bridge-only — because ``paper_requests`` and its CAS use of ``revision``
+    are shared by both downloader.py and the bridge, and this runs from
+    ``Database.init()``, the one common entry point both go through."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(paper_requests)")}
+    if "revision" not in existing:
+        conn.execute("ALTER TABLE paper_requests ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+
+
 @dataclass(slots=True)
 class Database:
     path: Path
@@ -109,6 +162,7 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA_SQL)
+            _ensure_request_revision_column(conn)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -299,41 +353,96 @@ class Database:
         next_retry_at: str | None = None,
         manual: ManualIntervention | None = None,
         paper_id: int | None = None,
-    ) -> None:
+        expected_revision: int | None = None,
+    ) -> bool:
+        """Returns True if the row was actually updated, False if a guard below
+        turned this into a no-op (AGA-596 review round 2/3/4) — callers that
+        emit a status-change notification/event MUST check this before doing
+        so, or they can report a status the row never actually reached. Raises
+        KeyError only when ``request_id`` doesn't exist at all (a guarded
+        no-op is NOT an error — the row exists, the write was just skipped).
+
+        Two independent guard mechanisms, never both active at once:
+        - Default (``expected_revision=None``): the success-status guard — a
+          transition to a NON-success status cannot overwrite a row whose
+          CURRENT status is already in ``_SUCCESS_STATUSES`` (protects against
+          an unintentional stale write resurrecting an already-succeeded
+          request). This is the only guard for callers that never supply
+          ``expected_revision`` — in particular every bridge call site.
+        - ``expected_revision`` (compare-and-set on ``paper_requests.revision``,
+          AGA-596 review round 4 finding 1): downloader.py's
+          ``process_request`` reads the row once at the top and does real work
+          (network I/O) before writing back. Round 3 CAS'd on ``expected_status``
+          (the STATUS STRING read at that same moment) instead — replacing an
+          even earlier, unconditional ``allow_reopen=True`` that let ANY
+          concurrent write bypass the success guard, race or not — but
+          status-only CAS has an ABA hole: two force_redownload workers can
+          both read status='downloaded'; the faster one re-downloads and
+          writes 'downloaded' AGAIN (same STRING, genuinely newer row); the
+          slower one's stale expected_status='downloaded' would still match
+          and clobber that newer success. ``revision`` is bumped by 1 on every
+          write this method actually applies (never on a guarded no-op, under
+          either mechanism), so it always differs after a real write even when
+          the status string cycles back to what it was — CAS on it is
+          therefore strictly stronger than status-only CAS and fully replaces
+          the success guard for a CAS call rather than composing with it.
+        """
         now = utc_now()
+        # A request reaching a SUCCESS status must never keep showing a stale
+        # operator handoff from an earlier failed attempt (AGA-596 P5 follow-up):
+        # clear manual_* unconditionally on success, regardless of whether `manual`
+        # was passed. Every other status keeps the only-overwrite-when-supplied
+        # (COALESCE) behavior, so a later transition without a fresh
+        # ManualIntervention cannot erase a still-relevant handoff. This applies
+        # under EITHER guard mechanism below.
+        is_success = 1 if status in _SUCCESS_STATUSES else 0
+        manual_params = (
+            is_success, manual.reason if manual else None,
+            is_success, manual.screenshot_path if manual else None,
+            is_success, manual.page_title if manual else None,
+            is_success, manual.current_url if manual else None,
+            is_success, manual.suggested_next_action if manual else None,
+        )
+        # revision = revision + 1 fires only when the WHERE clause matches (i.e.
+        # only on an ACTUALLY applied write) — a guarded no-op never bumps it.
+        set_clause = """
+            SET status = ?,
+                attempt_count = COALESCE(?, attempt_count),
+                revision = revision + 1,
+                next_retry_at = ?,
+                manual_reason = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_reason) END,
+                manual_screenshot_path = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_screenshot_path) END,
+                manual_page_title = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_page_title) END,
+                manual_current_url = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_current_url) END,
+                manual_suggested_next_action = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_suggested_next_action) END,
+                paper_id = COALESCE(?, paper_id),
+                updated_at = ?
+        """
         with self.transaction() as conn:
             existing = conn.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
             if not existing:
                 raise KeyError(f"Request {request_id} not found")
-            conn.execute(
-                """
-                UPDATE paper_requests
-                SET status = ?,
-                    attempt_count = COALESCE(?, attempt_count),
-                    next_retry_at = ?,
-                    manual_reason = ?,
-                    manual_screenshot_path = ?,
-                    manual_page_title = ?,
-                    manual_current_url = ?,
-                    manual_suggested_next_action = ?,
-                    paper_id = COALESCE(?, paper_id),
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    status,
-                    attempt_count,
-                    next_retry_at,
-                    manual.reason if manual else None,
-                    manual.screenshot_path if manual else None,
-                    manual.page_title if manual else None,
-                    manual.current_url if manual else None,
-                    manual.suggested_next_action if manual else None,
-                    paper_id,
-                    now,
-                    request_id,
-                ),
-            )
+            if expected_revision is not None:
+                cursor = conn.execute(
+                    f"UPDATE paper_requests {set_clause} WHERE id = ? AND revision = ?",
+                    (status, attempt_count, next_retry_at, *manual_params, paper_id, now,
+                     request_id, expected_revision),
+                )
+            else:
+                # `status` inside the WHERE clause refers to the row's CURRENT
+                # (pre-update) value, per standard UPDATE semantics — this is a
+                # single guarded statement, not a separate read-then-write, so
+                # there is no check-then-act gap. A transition that is ITSELF a
+                # success status is never blocked.
+                cursor = conn.execute(
+                    f"""
+                    UPDATE paper_requests {set_clause}
+                    WHERE id = ? AND NOT (status IN ({_SUCCESS_STATUSES_SQL}) AND ? = 0)
+                    """,
+                    (status, attempt_count, next_retry_at, *manual_params, paper_id, now,
+                     request_id, is_success),
+                )
+            return cursor.rowcount > 0
 
     def record_attempt(
         self,

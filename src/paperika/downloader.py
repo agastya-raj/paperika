@@ -140,6 +140,11 @@ class Downloader:
                 publisher_hint=detect_publisher(request_row["inferred_url"]),
             )
         previous_status = request_row["status"]
+        # Captured at the same moment as previous_status, before any real work
+        # (network I/O) runs — this row's optimistic-concurrency-control token
+        # for the three failure branches below (AGA-596 review round 4,
+        # finding 1: status alone has an ABA hole a revision CAS does not).
+        previous_revision = request_row["revision"]
         paper_id = request_row["paper_id"]
         if previous_status in {"completed_deduped", "downloaded"} and not request_row["force_redownload"]:
             paper_row = self.db.find_verified_pdf(doi=parsed.doi, title=parsed.title)
@@ -223,14 +228,29 @@ class Downloader:
             )
             if self._requires_manual_intervention(message):
                 final_status = "manual_intervention"
-                self.db.update_request_status(
+                # expected_revision=previous_revision (AGA-596 review round 4,
+                # finding 1 — was expected_status, which has an ABA hole; see
+                # update_request_status's docstring): only apply this write if
+                # the row's revision is STILL what THIS call read at the top of
+                # process_request. A concurrent worker that already changed it
+                # (a genuine success, or another failure — even one that leaves
+                # the status STRING unchanged) makes this a no-op, same as the
+                # plain success guard everywhere else, but without also
+                # blocking a legitimate force_redownload reopen-then-fail.
+                applied = self.db.update_request_status(
                     request_id,
                     final_status,
                     attempt_count=attempt_number,
                     next_retry_at=None,
                     manual=manual,
                     paper_id=paper_id,
+                    expected_revision=previous_revision,
                 )
+                if not applied:
+                    return self._superseded_outcome(
+                        request_id=request_id, attempt_number=attempt_number,
+                        kind=final_status, message=message,
+                    )
                 return DownloadOutcome(
                     request_id=request_id,
                     paper_id=paper_id,
@@ -250,14 +270,20 @@ class Downloader:
                 )
             if should_retry(attempt_number):
                 final_status = "retrying"
-                self.db.update_request_status(
+                applied = self.db.update_request_status(
                     request_id,
                     final_status,
                     attempt_count=attempt_number,
                     next_retry_at=next_retry_at(attempt_number).isoformat(),
                     manual=manual,
                     paper_id=paper_id,
+                    expected_revision=previous_revision,  # see the branch above
                 )
+                if not applied:
+                    return self._superseded_outcome(
+                        request_id=request_id, attempt_number=attempt_number,
+                        kind=final_status, message=message,
+                    )
                 return DownloadOutcome(
                     request_id=request_id,
                     paper_id=paper_id,
@@ -276,14 +302,20 @@ class Downloader:
                     ),
                 )
             final_status = "permanent_failure"
-            self.db.update_request_status(
+            applied = self.db.update_request_status(
                 request_id,
                 final_status,
                 attempt_count=attempt_number,
                 next_retry_at=None,
                 manual=manual,
                 paper_id=paper_id,
+                expected_revision=previous_revision,  # see the branch above
             )
+            if not applied:
+                return self._superseded_outcome(
+                    request_id=request_id, attempt_number=attempt_number,
+                    kind=final_status, message=message,
+                )
             return DownloadOutcome(
                 request_id=request_id,
                 paper_id=paper_id,
@@ -950,6 +982,32 @@ class Downloader:
             if self._is_pdf_file(path):
                 return path
         return None
+
+    def _superseded_outcome(
+        self, *, request_id: int, attempt_number: int, kind: str, message: str,
+    ) -> DownloadOutcome:
+        """A CAS no-op (``expected_revision`` mismatch) means some OTHER write
+        already changed this request since ``process_request`` read it at the
+        top — e.g. a faster concurrent worker's success. Never report the STALE
+        outcome THIS call computed as if it had been persisted (review round 5,
+        finding 1: the faster worker's success must not be masked by the slower
+        worker's failure message in CLI/worker output). Re-read the row and
+        describe what is ACTUALLY there instead."""
+        row = self.db.get_request(request_id)
+        current_status = row["status"] if row else kind
+        current_paper_id = row["paper_id"] if row else None
+        return DownloadOutcome(
+            request_id=request_id,
+            paper_id=current_paper_id,
+            status=current_status,
+            message=(
+                f"Superseded: this attempt's outcome ({kind}: {message}) was not "
+                f"applied — a concurrent update already left the request as "
+                f"'{current_status}'."
+            ),
+            deduped=current_status == "completed_deduped",
+            attempt_number=attempt_number,
+        )
 
     def _requires_manual_intervention(self, message: str) -> bool:
         lowered = message.lower()
