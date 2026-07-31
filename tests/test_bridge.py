@@ -376,6 +376,115 @@ def test_startup_sweep_salvages_landed_pdf(cfg):
     con.close()
 
 
+def test_startup_sweep_interrupted_running_attempt_surfaces_prior_wall_evidence(cfg):
+    """Deletion-sensitivity for the interrupted-branch wall-handoff block (review
+    round-2 finding 4): a PRIOR deterministic-tier wall (already resolved, not
+    the running attempt itself) must still populate ManualIntervention when the
+    codex attempt that was 'running' at crash time is reaped as 'interrupted'."""
+    bridge = bridge_app.build_bridge(cfg)
+    rid = bridge.db.create_request(raw_input="10.1364/crash2", inferred_title="Crash Paper Two",
+                                   inferred_doi="10.1364/crash2", inferred_url=None, paper_id=None)
+    bridge.db.update_request_status(rid, "in_progress")
+    run_dir = cfg.db_path.parent / "codex_runs" / str(rid)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # tier 1 walled and was already resolved before codex ran.
+    tier_aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir=str(run_dir), strategy="direct_fetch")
+    bridge.resolve_attempt(tier_aid, outcome="wall", current_url="https://pub.example/interrupted-wall")
+    # codex's own attempt is still 'running' when the bridge crashes.
+    codex_aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir=str(run_dir), strategy="codex_bridge")
+
+    bridge_app.startup_sweep(bridge)
+
+    con = _conn(cfg)
+    att = con.execute("SELECT outcome FROM paper_attempts WHERE id = ?", (codex_aid,)).fetchone()
+    assert att["outcome"] == "interrupted"
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (rid,)).fetchone()
+    assert row["status"] == "failed"
+    assert row["manual_reason"] is not None
+    assert "direct_fetch" in row["manual_reason"]
+    assert row["manual_current_url"] == "https://pub.example/interrupted-wall"
+    con.close()
+
+
+def test_startup_sweep_reaps_request_stuck_in_progress_with_no_running_attempts(cfg):
+    """HIGH review round-2 finding 1: a crash AFTER an attempt is resolved
+    (outcome='wall') but BEFORE the request itself receives its terminal status
+    transition leaves the request 'in_progress' forever with no 'running'
+    attempt left for the existing sweep loop to catch. startup_sweep's second
+    pass must also reap requests in this exact state — finalizing them 'failed'
+    and building a ManualIntervention from the trapped wall evidence."""
+    bridge = bridge_app.build_bridge(cfg)
+    rid = bridge.db.create_request(raw_input="10.1364/crash3", inferred_title="Crash Paper Three",
+                                   inferred_doi="10.1364/crash3", inferred_url=None, paper_id=None)
+    bridge.db.update_request_status(rid, "in_progress")
+    run_dir = cfg.db_path.parent / "codex_runs" / str(rid)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir=str(run_dir), strategy="scripted_browser")
+    # The attempt was resolved before the bridge crashed — no 'running' attempt
+    # remains for the FIRST sweep loop, but the request itself never received
+    # its terminal status transition.
+    bridge.resolve_attempt(aid, outcome="wall", message="bot/CAPTCHA wall",
+                           current_url="https://pub.example/crash-wall")
+
+    bridge_app.startup_sweep(bridge)
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (rid,)).fetchone()
+    assert row["status"] == "failed"
+    assert row["manual_reason"] is not None
+    assert "scripted_browser" in row["manual_reason"]
+    assert row["manual_current_url"] == "https://pub.example/crash-wall"
+    events = list(cfg.notification_dir.glob("*executor_failed*.json"))
+    assert events
+    con.close()
+
+
+def test_startup_sweep_leaves_a_genuinely_dangling_but_not_stuck_request_alone(cfg):
+    """The stuck-in-progress reap must not touch a request that DOES still have
+    a running attempt — that one is (and should be) reaped by the first loop,
+    not double-processed by the second."""
+    bridge = bridge_app.build_bridge(cfg)
+    rid = bridge.db.create_request(raw_input="10.1364/still-running", inferred_title="Still Running Paper",
+                                   inferred_doi="10.1364/still-running", inferred_url=None, paper_id=None)
+    bridge.db.update_request_status(rid, "in_progress")
+    run_dir = cfg.db_path.parent / "codex_runs" / str(rid)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    bridge.write_ahead(request_id=rid, paper_id=None, run_dir=str(run_dir), strategy="codex_bridge")
+
+    bridge_app.startup_sweep(bridge)
+
+    # Reaped exactly once, by the first loop (outcome='interrupted', not still
+    # 'running'), and the request is 'failed' — not left in_progress.
+    con = _conn(cfg)
+    att = con.execute("SELECT outcome FROM paper_attempts WHERE request_id = ?", (rid,)).fetchone()
+    assert att["outcome"] == "interrupted"
+    row = con.execute("SELECT status FROM paper_requests WHERE id = ?", (rid,)).fetchone()
+    assert row["status"] == "failed"
+    con.close()
+
+
+def test_finish_failure_skips_notification_on_guarded_no_op(cfg):
+    """MEDIUM review round-2 finding 2: when the request has already reached a
+    success status (e.g. a race with some other writer), _finish_failure's
+    status update becomes a guarded no-op — no notification claiming
+    status_after="failed" should be emitted, and the persisted row must stay
+    exactly as it was."""
+    bridge = bridge_app.build_bridge(cfg)
+    rid = bridge.db.create_request(raw_input="10.1364/guarded", inferred_title="Guarded Paper",
+                                   inferred_doi="10.1364/guarded", inferred_url=None, paper_id=None)
+    bridge.db.update_request_status(rid, "completed")  # already succeeded
+    run_dir = cfg.db_path.parent / "codex_runs" / str(rid)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir=str(run_dir), strategy="codex_bridge")
+
+    bridge_app._finish_failure(bridge, kind="gave_up", request_id=rid, attempt_id=aid,
+                               screenshot=None, message="stale failure after success")
+
+    row = bridge.db.get_request(rid)
+    assert row["status"] == "completed"
+    assert not list(cfg.notification_dir.glob("*executor_failed*.json"))
+
+
 # ----------------------------------------------------------------- executor ---
 
 
@@ -1448,6 +1557,13 @@ def test_both_tiers_wall_codex_unavailable_emits_bot_wall_unclassified_with_manu
     detail = client.get(f"/requests/{request_id}", headers=_auth()).json()
     assert detail["tier_attempt_count"] == 2  # direct_fetch + scripted_browser
 
+    # Review round-2 finding 4: the notification event_type must stay the
+    # documented "bot_wall" (unchanged contract) even though the HTTP
+    # error_code is the new, distinct "bot_wall_unclassified".
+    events = list(cfg.notification_dir.glob(f"*request_{request_id}_bot_wall.json"))
+    assert events
+    assert json.loads(events[0].read_text())["event_type"] == "bot_wall"
+
 
 def test_codex_confirmed_bot_wall_populates_manual_with_no_prior_wall(cfg, monkeypatch):
     """P2: codex's own terminal bot_wall classification also gets a
@@ -1481,11 +1597,36 @@ def test_codex_confirmed_bot_wall_populates_manual_with_no_prior_wall(cfg, monke
     assert detail["tier_attempt_count"] == 3  # direct_fetch + scripted_browser + codex_bridge
 
 
+def test_codex_confirmed_bot_wall_with_null_final_url_falls_back_to_request_url(cfg, monkeypatch):
+    """MEDIUM review round-2 finding 3: codex's OUTCOME_SCHEMA explicitly permits
+    final_url=null. A codex-only bot_wall (no prior deterministic wall, so no
+    fallback wall URL either) with a null final_url must still get a usable
+    current_url — the request's own stored inferred_url (the DOI/source URL the
+    ladder started from) — never a bare NULL when a usable URL is available."""
+    _seed_sandbox_mode(cfg)
+
+    async def _fake_codex_bot_wall_null_url(run_dir, prompt, sandbox_mode):
+        return executor.ExecResult(kind="bot_wall", final_url=None, notes="codex bot wall, no url")
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_bot_wall_null_url)
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.nullurl", "title": "Null URL Paper"})
+    assert resp.status_code == 502
+    request_id = int(resp.json()["request_id"])
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
+    assert row["manual_current_url"] == "https://doi.org/10.1364/jocn.nullurl"
+    con.close()
+
+
 def test_codex_confirmed_bot_wall_after_deterministic_walls_names_both_tiers(cfg, monkeypatch):
     """P2: when both deterministic tiers walled before escalating to codex, and
     codex confirms bot_wall, the manual reason names which tiers walled first —
-    the walled_tiers thread from _download_locked through _run_codex_tier /
-    _resolve_outcome into _finish_failure."""
+    _finish_failure reads that evidence back from paper_attempts via
+    bridge.wall_evidence (durable; not threaded in-memory through the call
+    chain, review round-2 finding 1)."""
     _seed_sandbox_mode(cfg)
 
     async def _wall_direct(**kwargs):

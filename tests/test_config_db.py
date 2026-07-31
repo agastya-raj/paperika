@@ -166,10 +166,14 @@ def test_update_request_status_stale_failure_after_success_does_not_overwrite(tm
     )
     db.update_request_status(request_id, "completed", paper_id=paper_id)
     # A stale failure (e.g. a slower worker's outcome) commits after the success.
-    db.update_request_status(
+    # The return value must make the guarded no-op detectable (review round-2
+    # finding 2) — a caller emitting a status-change notification needs this to
+    # know it must skip the emit.
+    applied = db.update_request_status(
         request_id, "failed",
         manual=ManualIntervention(reason="stale bot wall", screenshot_path="/tmp/stale.png"),
     )
+    assert applied is False
     row = db.get_request(request_id)
     assert row["status"] == "completed"
     assert row["paper_id"] == paper_id
@@ -189,9 +193,30 @@ def test_update_request_status_success_after_success_still_applies(tmp_path: Pat
         inferred_doi="10.1000/race-success-success", inferred_url=None, paper_id=None,
     )
     db.update_request_status(request_id, "completed", paper_id=paper_a)
-    db.update_request_status(request_id, "completed", paper_id=paper_b)
+    applied = db.update_request_status(request_id, "completed", paper_id=paper_b)
+    assert applied is True
     row = db.get_request(request_id)
     assert row["paper_id"] == paper_b
+
+
+def test_update_request_status_allow_reopen_bypasses_the_guard(tmp_path: Path):
+    """MEDIUM review round-2 finding 2: the guard's purpose is only "a stale
+    failure must not overwrite a success", not "success is forever" — a caller
+    that explicitly opts in via allow_reopen (e.g. downloader.py's legitimate
+    force_redownload retry) can still transition an already-successful request
+    to a non-success status."""
+    db = _make_db(tmp_path)
+    request_id = db.create_request(
+        raw_input="10.1000/allow-reopen", inferred_title="t",
+        inferred_doi="10.1000/allow-reopen", inferred_url=None, paper_id=None,
+    )
+    db.update_request_status(request_id, "completed")
+    blocked = db.update_request_status(request_id, "failed")
+    assert blocked is False
+    applied = db.update_request_status(request_id, "failed", allow_reopen=True)
+    assert applied is True
+    row = db.get_request(request_id)
+    assert row["status"] == "failed"
 
 
 def test_update_request_status_non_success_still_applies_before_any_success(tmp_path: Path):
@@ -204,7 +229,8 @@ def test_update_request_status_non_success_still_applies_before_any_success(tmp_
         inferred_doi="10.1000/race-normal-failure", inferred_url=None, paper_id=None,
     )
     db.update_request_status(request_id, "in_progress")
-    db.update_request_status(request_id, "failed", manual=ManualIntervention(reason="bot wall"))
+    applied = db.update_request_status(request_id, "failed", manual=ManualIntervention(reason="bot wall"))
+    assert applied is True
     row = db.get_request(request_id)
     assert row["status"] == "failed"
     assert row["manual_reason"] == "bot wall"

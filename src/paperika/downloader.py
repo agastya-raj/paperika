@@ -230,6 +230,14 @@ class Downloader:
                     next_retry_at=None,
                     manual=manual,
                     paper_id=paper_id,
+                    # Reaching here past the completed_deduped/downloaded early-
+                    # return guard (line ~144) means this request is either fresh
+                    # or an explicit force_redownload reopen of an already-
+                    # successful one — never a stale concurrent write racing a
+                    # success, which is the ONLY thing the success-status guard
+                    # in update_request_status protects against (AGA-596 review
+                    # round 2, finding 2).
+                    allow_reopen=True,
                 )
                 return DownloadOutcome(
                     request_id=request_id,
@@ -257,6 +265,7 @@ class Downloader:
                     next_retry_at=next_retry_at(attempt_number).isoformat(),
                     manual=manual,
                     paper_id=paper_id,
+                    allow_reopen=True,  # see the manual_intervention branch above
                 )
                 return DownloadOutcome(
                     request_id=request_id,
@@ -283,6 +292,7 @@ class Downloader:
                 next_retry_at=None,
                 manual=manual,
                 paper_id=paper_id,
+                allow_reopen=True,  # see the manual_intervention branch above
             )
             return DownloadOutcome(
                 request_id=request_id,

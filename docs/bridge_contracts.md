@@ -258,7 +258,8 @@ compat, and a bare `check_rate(conn)` still defaults to the codex strategy.
   `auth_error` / `timeout`, §2.7). The ONE exception: if BOTH tier 1 and tier 2
   independently returned `wall` and codex is unavailable (no persisted
   `sandbox_mode`, or Chrome down), the wall evidence maps to a retryable
-  `502 bot_wall` instead of `selftest_required`.
+  `502 bot_wall_unclassified` (AGA-596 P1 — distinct from codex-confirmed
+  `bot_wall`) instead of `selftest_required`.
 - Successful responses carry `X-Paperika-Tier: direct_fetch | scripted_browser |
   codex_bridge`.
 

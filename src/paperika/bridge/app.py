@@ -447,7 +447,12 @@ def _paperika_version() -> str:
 
 
 def startup_sweep(bridge: Bridge) -> None:
-    """On every start: salvage-first over stale outcome='running' rows (§2.3)."""
+    """On every start: salvage-first over stale outcome='running' rows (§2.3),
+    then reap any request left dangling 'in_progress' with no running attempt at
+    all (review round-2 finding 1) — a crash AFTER an attempt is resolved but
+    BEFORE the request itself receives its terminal status transition (or before
+    the next tier's attempt row is even created) otherwise leaves the request
+    in_progress forever, with any wall evidence trapped in paper_attempts."""
     with bridge.db.transaction() as conn:
         rows = limits.running_attempts(conn)
     for row in rows:
@@ -488,6 +493,7 @@ def startup_sweep(bridge: Bridge) -> None:
             walled_tiers, last_wall_url = bridge.wall_evidence(request_id)
             manual = None
             if walled_tiers:
+                current_url = _preferred_current_url(bridge, request_id, last_wall_url)
                 manual = ManualIntervention(
                     reason=(
                         f"{' and '.join(walled_tiers)} hit a bot/CAPTCHA wall; codex was "
@@ -495,17 +501,59 @@ def startup_sweep(bridge: Bridge) -> None:
                     ),
                     screenshot_path=None,
                     page_title=None,
-                    current_url=last_wall_url,
-                    suggested_next_action=_wall_suggested_action(last_wall_url),
+                    current_url=current_url,
+                    suggested_next_action=_wall_suggested_action(current_url),
                 )
             try:
-                bridge.db.update_request_status(request_id, "failed", manual=manual)
+                applied = bridge.db.update_request_status(request_id, "failed", manual=manual)
             except KeyError:
-                pass
+                applied = False
+            # Skip the notification when the guard turned this into a no-op
+            # (review round-2 finding 2) — status_after="failed" would otherwise
+            # misreport a request that is actually still in whatever state it was
+            # already in (only possible if it had somehow already reached success).
+            if applied:
+                bridge.emit(
+                    event_type="executor_failed", request_id=request_id, paper_id=row["paper_id"],
+                    status_after="failed", status_before="in_progress",
+                    message="bridge restarted mid-run (subtype=interrupted)",
+                )
+
+    # Second pass: requests stuck 'in_progress' with NO running attempt left at
+    # all — the loop above only reaps rows reachable via a 'running' attempt, so
+    # a crash after that attempt was already resolved (or before any attempt for
+    # this request even started) is otherwise invisible to it.
+    with bridge.db.transaction() as conn:
+        stuck_requests = conn.execute(
+            "SELECT id FROM paper_requests WHERE status = 'in_progress' "
+            "AND id NOT IN (SELECT DISTINCT request_id FROM paper_attempts WHERE outcome = 'running')"
+        ).fetchall()
+    for stuck in stuck_requests:
+        request_id = stuck["id"]
+        walled_tiers, last_wall_url = bridge.wall_evidence(request_id)
+        manual = None
+        if walled_tiers:
+            current_url = _preferred_current_url(bridge, request_id, last_wall_url)
+            manual = ManualIntervention(
+                reason=(
+                    f"{' and '.join(walled_tiers)} hit a bot/CAPTCHA wall; the bridge "
+                    "restarted before the request reached a terminal status"
+                ),
+                screenshot_path=None,
+                page_title=None,
+                current_url=current_url,
+                suggested_next_action=_wall_suggested_action(current_url),
+            )
+        try:
+            applied = bridge.db.update_request_status(request_id, "failed", manual=manual)
+        except KeyError:
+            applied = False
+        if applied:
             bridge.emit(
-                event_type="executor_failed", request_id=request_id, paper_id=row["paper_id"],
+                event_type="executor_failed", request_id=request_id, paper_id=None,
                 status_after="failed", status_before="in_progress",
-                message="bridge restarted mid-run (subtype=interrupted)",
+                message="bridge restarted before the request reached a terminal status "
+                        "(subtype=stuck_in_progress)",
             )
 
 
@@ -740,7 +788,8 @@ async def _download_locked(
     fetch) and tier 2 (scripted Playwright) run BEFORE the tier-3 codex executor,
     each rate-disciplined on its OWN strategy. Tiers 1/2 only ever succeed or
     escalate — codex stays the sole terminal-classification authority, except a
-    both-tiers bot wall with codex unavailable, mapped to a retryable 502 bot_wall."""
+    both-tiers bot wall with codex unavailable, mapped to a retryable 502
+    bot_wall_unclassified (AGA-596 P1)."""
     state = bridge.state_store.load()
 
     # 4. rate pre-flight across all three strategies. A tier whose strategy is
@@ -962,6 +1011,21 @@ async def _run_codex_tier(
     return response
 
 
+def _preferred_current_url(bridge: Bridge, request_id: int, *candidates: str | None) -> str | None:
+    """First non-None of ``candidates`` (already in caller-supplied preference
+    order — e.g. codex's own final_url, then the last deterministic tier's wall
+    URL), else the request's own stored ``inferred_url`` (the DOI/source URL the
+    ladder started from, set once at request-creation time and always present).
+    Never leave a ManualIntervention's current_url NULL when the request row
+    holds a usable URL (AGA-596 review round 2, finding 3) — codex's
+    OUTCOME_SCHEMA explicitly permits a null final_url."""
+    for candidate in candidates:
+        if candidate:
+            return candidate
+    req = bridge.db.get_request(request_id)
+    return req["inferred_url"] if req else None
+
+
 def _wall_suggested_action(current_url: str | None) -> str:
     """Operator-facing next step for a human-solvable bot/CAPTCHA wall (AGA-596
     L1) — the bridge cannot solve a CAPTCHA itself, so hand the operator the
@@ -987,21 +1051,27 @@ def _finish_wall_evidence(bridge: Bridge, *, request_id: int) -> Response:
     message = "direct_fetch and scripted_browser both hit a bot wall; codex unavailable to classify"
     walled_tiers, last_wall_url = bridge.wall_evidence(request_id)
     tiers_desc = " and ".join(walled_tiers) if walled_tiers else "the deterministic tiers"
+    current_url = _preferred_current_url(bridge, request_id, last_wall_url)
     manual = ManualIntervention(
         reason=f"{tiers_desc} hit a bot/CAPTCHA wall; no classifier available (codex unavailable)",
         screenshot_path=None,
         page_title=None,
-        current_url=last_wall_url,
-        suggested_next_action=_wall_suggested_action(last_wall_url),
+        current_url=current_url,
+        suggested_next_action=_wall_suggested_action(current_url),
     )
     try:
-        bridge.db.update_request_status(request_id, "failed", manual=manual)
+        applied = bridge.db.update_request_status(request_id, "failed", manual=manual)
     except KeyError:
-        pass
-    bridge.emit(
-        event_type=event_type, request_id=request_id, paper_id=None,
-        status_after="failed", status_before="in_progress", message=message,
-    )
+        applied = False
+    # A guarded no-op (review round-2 finding 2) means the request had somehow
+    # already reached a success status — the persisted row did NOT change to
+    # "failed", so don't emit a notification claiming it did. The HTTP response
+    # below still accurately describes what THIS attempt did.
+    if applied:
+        bridge.emit(
+            event_type=event_type, request_id=request_id, paper_id=None,
+            status_after="failed", status_before="in_progress", message=message,
+        )
     return _json_error(http_status, error_code, message, request_id=str(request_id))
 
 
@@ -1170,9 +1240,12 @@ def _finish_failure(
     walled_tiers, last_wall_url = bridge.wall_evidence(request_id)
     manual = None
     if kind == "bot_wall" or walled_tiers:
-        # Preference order for current_url: codex's own final_url, else the last
-        # deterministic tier's wall URL.
-        current_url = final_url or last_wall_url
+        # Preference order for current_url (AGA-596 review round 2, finding 3):
+        # codex's own final_url, else the last deterministic tier's wall URL,
+        # else the request's own stored inferred_url — codex's OUTCOME_SCHEMA
+        # permits a null final_url, and a codex-only wall with no prior
+        # deterministic wall must still get a usable URL, not a bare NULL.
+        current_url = _preferred_current_url(bridge, request_id, final_url, last_wall_url)
         manual = ManualIntervention(
             reason=_codex_wall_reason(walled_tiers, kind),
             screenshot_path=screenshot,
@@ -1181,13 +1254,16 @@ def _finish_failure(
             suggested_next_action=_wall_suggested_action(current_url),
         )
     try:
-        bridge.db.update_request_status(request_id, "failed", manual=manual)
+        applied = bridge.db.update_request_status(request_id, "failed", manual=manual)
     except KeyError:
-        pass
-    bridge.emit(
-        event_type=event_type, request_id=request_id, paper_id=None,
-        status_after="failed", status_before="in_progress", message=message,
-    )
+        applied = False
+    # Skip the notification on a guarded no-op (review round-2 finding 2) — the
+    # persisted row did not actually change to "failed" in that case.
+    if applied:
+        bridge.emit(
+            event_type=event_type, request_id=request_id, paper_id=None,
+            status_after="failed", status_before="in_progress", message=message,
+        )
     return _json_error(http_status, error_code, message, request_id=str(request_id),
                        screenshot=screenshot)
 

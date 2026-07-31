@@ -77,10 +77,13 @@ CREATE TABLE IF NOT EXISTS paper_requests (
     -- attempt_count counts WHOLE-REQUEST retries (downloader.py's queue-retry
     -- path bumps it per pass through process_request). It is a distinct counter
     -- from paper_attempts.attempt_number, which counts per-request TIER attempts
-    -- (direct_fetch/scripted_browser/codex_bridge) inside the bridge's ladder —
-    -- the bridge passes paper_attempts' max attempt_number here on every finish
-    -- so operators don't see a request stuck at 0 while attempts accumulate
-    -- (AGA-596 P4).
+    -- (direct_fetch/scripted_browser/codex_bridge) inside the bridge's ladder.
+    -- The bridge NEVER writes to this column — an earlier revision briefly did
+    -- (AGA-596 P4), which would have corrupted downloader.py's own retry
+    -- backoff/budget semantics for that counter; reverted (AGA-596 review round
+    -- 2, finding 2). The tier-attempt count is instead a DERIVED field (a COUNT
+    -- of paper_attempts rows) surfaced only in the bridge's GET /requests/{id}
+    -- response.
     attempt_count INTEGER NOT NULL DEFAULT 0,
     manual_reason TEXT,
     manual_screenshot_path TEXT,
@@ -319,7 +322,15 @@ class Database:
         next_retry_at: str | None = None,
         manual: ManualIntervention | None = None,
         paper_id: int | None = None,
-    ) -> None:
+        allow_reopen: bool = False,
+    ) -> bool:
+        """Returns True if the row was actually updated, False if the
+        success-status guard below turned this into a no-op (AGA-596 review round
+        2, finding 2) — callers that emit a status-change notification/event MUST
+        check this before doing so, or they can report a status the row never
+        actually reached. Raises KeyError only when ``request_id`` doesn't exist
+        at all (a guarded no-op is NOT an error — the row exists, the write was
+        just intentionally skipped)."""
         now = utc_now()
         # A request reaching a SUCCESS status must never keep showing a stale
         # operator handoff from an earlier failed attempt (AGA-596 P5 follow-up):
@@ -328,21 +339,32 @@ class Database:
         # (COALESCE) behavior, so a later transition without a fresh
         # ManualIntervention cannot erase a still-relevant handoff.
         is_success = 1 if status in _SUCCESS_STATUSES else 0
+        # allow_reopen (AGA-596 review round 2, finding 2): the success-status
+        # guard below exists to stop a STALE, unintentional write from resurrecting
+        # a request that already succeeded (e.g. a slower concurrent worker's
+        # late-arriving failure). It must NOT also block a caller's deliberate
+        # reopening of an already-successful request. Verified in code: downloader.
+        # py's force_redownload path has no distinct "requeue" status of its own —
+        # skipping its completed_deduped/downloaded early-return guard falls
+        # straight through to a fresh download attempt, whose OWN outcome (success
+        # again, or manual_intervention/retrying/permanent_failure) is the very
+        # next status write. Those three failure-outcome call sites pass
+        # allow_reopen=True; nothing else in this codebase does, so the guard
+        # stays fully protective everywhere else (in particular, every bridge
+        # call site).
+        bypass_guard = 1 if allow_reopen else 0
         with self.transaction() as conn:
             existing = conn.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
             if not existing:
                 raise KeyError(f"Request {request_id} not found")
-            # WHERE-clause guard (AGA-596 review finding 3): a NON-success status
-            # update must not overwrite a request that has ALREADY reached a
-            # success status — e.g. two workers race on the same retryable
-            # request; one succeeds and clears manual_*, then a slower/stale
-            # failure from the other lands afterward and must not resurrect the
-            # request as failed nor repopulate the handoff. `status` inside the
-            # WHERE clause refers to the row's CURRENT (pre-update) value, per
-            # standard UPDATE semantics — this is a single guarded statement, not
-            # a separate read-then-write, so there is no check-then-act gap. A
-            # transition that is ITSELF a success status is never blocked.
-            conn.execute(
+            # WHERE-clause guard: a NON-success status update must not overwrite a
+            # request that has ALREADY reached a success status, unless the caller
+            # explicitly opted in via allow_reopen. `status` inside the WHERE
+            # clause refers to the row's CURRENT (pre-update) value, per standard
+            # UPDATE semantics — this is a single guarded statement, not a separate
+            # read-then-write, so there is no check-then-act gap. A transition that
+            # is ITSELF a success status is never blocked.
+            cursor = conn.execute(
                 f"""
                 UPDATE paper_requests
                 SET status = ?,
@@ -356,7 +378,7 @@ class Database:
                     paper_id = COALESCE(?, paper_id),
                     updated_at = ?
                 WHERE id = ?
-                  AND NOT (status IN ({_SUCCESS_STATUSES_SQL}) AND ? = 0)
+                  AND NOT (status IN ({_SUCCESS_STATUSES_SQL}) AND ? = 0 AND ? = 0)
                 """,
                 (
                     status,
@@ -371,8 +393,10 @@ class Database:
                     now,
                     request_id,
                     is_success,
+                    bypass_guard,
                 ),
             )
+            return cursor.rowcount > 0
 
     def record_attempt(
         self,
