@@ -16,6 +16,14 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# paper_requests.status values meaning "a paper was actually obtained" — used by
+# update_request_status to decide whether a stale manual_* operator handoff must
+# be cleared (AGA-596 P5 follow-up). The two callers spell success differently:
+# downloader.py's queue-retry path uses "downloaded"/"completed_deduped"; the
+# bridge uses "completed".
+_SUCCESS_STATUSES = frozenset({"downloaded", "completed_deduped", "completed"})
+
+
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 
@@ -308,6 +316,13 @@ class Database:
         paper_id: int | None = None,
     ) -> None:
         now = utc_now()
+        # A request reaching a SUCCESS status must never keep showing a stale
+        # operator handoff from an earlier failed attempt (AGA-596 P5 follow-up):
+        # clear manual_* unconditionally on success, regardless of whether `manual`
+        # was passed. Every other status keeps the only-overwrite-when-supplied
+        # (COALESCE) behavior, so a later transition without a fresh
+        # ManualIntervention cannot erase a still-relevant handoff.
+        clear_manual = 1 if status in _SUCCESS_STATUSES else 0
         with self.transaction() as conn:
             existing = conn.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
             if not existing:
@@ -318,11 +333,11 @@ class Database:
                 SET status = ?,
                     attempt_count = COALESCE(?, attempt_count),
                     next_retry_at = ?,
-                    manual_reason = COALESCE(?, manual_reason),
-                    manual_screenshot_path = COALESCE(?, manual_screenshot_path),
-                    manual_page_title = COALESCE(?, manual_page_title),
-                    manual_current_url = COALESCE(?, manual_current_url),
-                    manual_suggested_next_action = COALESCE(?, manual_suggested_next_action),
+                    manual_reason = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_reason) END,
+                    manual_screenshot_path = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_screenshot_path) END,
+                    manual_page_title = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_page_title) END,
+                    manual_current_url = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_current_url) END,
+                    manual_suggested_next_action = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_suggested_next_action) END,
                     paper_id = COALESCE(?, paper_id),
                     updated_at = ?
                 WHERE id = ?
@@ -331,11 +346,11 @@ class Database:
                     status,
                     attempt_count,
                     next_retry_at,
-                    manual.reason if manual else None,
-                    manual.screenshot_path if manual else None,
-                    manual.page_title if manual else None,
-                    manual.current_url if manual else None,
-                    manual.suggested_next_action if manual else None,
+                    clear_manual, manual.reason if manual else None,
+                    clear_manual, manual.screenshot_path if manual else None,
+                    clear_manual, manual.page_title if manual else None,
+                    clear_manual, manual.current_url if manual else None,
+                    clear_manual, manual.suggested_next_action if manual else None,
                     paper_id,
                     now,
                     request_id,

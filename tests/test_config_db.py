@@ -101,3 +101,48 @@ def test_update_request_status_manual_stays_null_when_never_set(tmp_path: Path):
     row = db.get_request(request_id)
     assert row["manual_reason"] is None
     assert row["manual_screenshot_path"] is None
+
+
+def test_update_request_status_clears_manual_fields_on_success(tmp_path: Path):
+    """A later transition to a SUCCESS status must clear manual_* unconditionally —
+    a completed request must never keep displaying a stale CAPTCHA-wall handoff,
+    even though ordinary (non-success) transitions preserve it (contrast with
+    test_update_request_status_preserves_manual_fields_when_not_supplied)."""
+    db = _make_db(tmp_path)
+    request_id = db.create_request(
+        raw_input="10.1000/manual-clear-on-success", inferred_title="Manual Clear On Success Paper",
+        inferred_doi="10.1000/manual-clear-on-success", inferred_url=None, paper_id=None,
+    )
+    db.update_request_status(
+        request_id, "failed",
+        manual=ManualIntervention(
+            reason="bot wall", screenshot_path="/tmp/wall.png",
+            page_title="Verify you are human", current_url="https://pub.example/wall",
+            suggested_next_action="Open the URL yourself.",
+        ),
+    )
+    db.update_request_status(request_id, "completed")
+
+    row = db.get_request(request_id)
+    assert row["status"] == "completed"
+    assert row["manual_reason"] is None
+    assert row["manual_screenshot_path"] is None
+    assert row["manual_page_title"] is None
+    assert row["manual_current_url"] is None
+    assert row["manual_suggested_next_action"] is None
+
+
+def test_update_request_status_clears_manual_fields_for_every_success_alias(tmp_path: Path):
+    """All three success spellings used across the codebase — the bridge's
+    "completed"; downloader.py's "downloaded" and "completed_deduped" — must each
+    clear a prior manual_* handoff."""
+    db = _make_db(tmp_path)
+    for success_status in ("downloaded", "completed_deduped", "completed"):
+        request_id = db.create_request(
+            raw_input=f"10.1000/manual-clear-{success_status}", inferred_title="t",
+            inferred_doi=f"10.1000/manual-clear-{success_status}", inferred_url=None, paper_id=None,
+        )
+        db.update_request_status(request_id, "failed", manual=ManualIntervention(reason="bot wall"))
+        db.update_request_status(request_id, success_status)
+        row = db.get_request(request_id)
+        assert row["manual_reason"] is None, f"{success_status} should clear manual_reason"

@@ -1623,3 +1623,43 @@ def test_screenshot_endpoint_rejects_path_outside_allowed_roots(cfg, tmp_path):
     client = TestClient(bridge_app.create_app(cfg))
     resp = client.get("/requests/5/screenshot", headers=_auth())
     assert resp.status_code == 404
+
+
+def test_wall_manual_cleared_by_a_later_success_status(cfg, monkeypatch):
+    """AGA-596 P5 follow-up: a request that later reaches a SUCCESS status must
+    never keep showing a stale CAPTCHA-wall handoff. Exercises the invariant
+    through the bridge's own Database wiring (not just db.py directly): a wall
+    populates manual_*, then a later "completed" transition (e.g. an operator
+    resolving the request out-of-band) must clear it."""
+    # no _seed_sandbox_mode ⇒ codex unavailable ⇒ both walls -> bot_wall_unclassified
+    async def _wall_direct(**kwargs):
+        return direct_fetch.DirectFetchResult(kind="wall", final_url="https://pub.example/tier1-wall")
+
+    async def _wall_scripted(**kwargs):
+        return scripted_browser.ScriptedFetchResult(kind="wall", final_url="https://pub.example/tier2-wall")
+
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _wall_direct)
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _wall_scripted)
+
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.wallcleared", "title": "Wall Then Success Paper"})
+    request_id = int(resp.json()["request_id"])
+
+    con = _conn(cfg)
+    row = con.execute("SELECT manual_reason FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
+    assert row["manual_reason"] is not None  # sanity: the wall really did populate it
+    con.close()
+
+    bridge = bridge_app.build_bridge(cfg)
+    bridge.db.update_request_status(request_id, "completed")
+
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
+    assert row["status"] == "completed"
+    assert row["manual_reason"] is None
+    assert row["manual_screenshot_path"] is None
+    assert row["manual_page_title"] is None
+    assert row["manual_current_url"] is None
+    assert row["manual_suggested_next_action"] is None
+    con.close()
