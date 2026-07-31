@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS paper_requests (
     priority INTEGER NOT NULL DEFAULT 100,
     force_redownload INTEGER NOT NULL DEFAULT 0,
     next_retry_at TEXT,
+    -- attempt_count counts WHOLE-REQUEST retries (downloader.py's queue-retry
+    -- path bumps it per pass through process_request). It is a distinct counter
+    -- from paper_attempts.attempt_number, which counts per-request TIER attempts
+    -- (direct_fetch/scripted_browser/codex_bridge) inside the bridge's ladder —
+    -- the bridge passes paper_attempts' max attempt_number here on every finish
+    -- so operators don't see a request stuck at 0 while attempts accumulate
+    -- (AGA-596 P4).
     attempt_count INTEGER NOT NULL DEFAULT 0,
     manual_reason TEXT,
     manual_screenshot_path TEXT,
@@ -311,11 +318,11 @@ class Database:
                 SET status = ?,
                     attempt_count = COALESCE(?, attempt_count),
                     next_retry_at = ?,
-                    manual_reason = ?,
-                    manual_screenshot_path = ?,
-                    manual_page_title = ?,
-                    manual_current_url = ?,
-                    manual_suggested_next_action = ?,
+                    manual_reason = COALESCE(?, manual_reason),
+                    manual_screenshot_path = COALESCE(?, manual_screenshot_path),
+                    manual_page_title = COALESCE(?, manual_page_title),
+                    manual_current_url = COALESCE(?, manual_current_url),
+                    manual_suggested_next_action = COALESCE(?, manual_suggested_next_action),
                     paper_id = COALESCE(?, paper_id),
                     updated_at = ?
                 WHERE id = ?

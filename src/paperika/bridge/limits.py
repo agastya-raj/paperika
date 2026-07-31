@@ -169,6 +169,19 @@ def _next_attempt_number(conn: sqlite3.Connection, request_id: int) -> int:
     return int(row[0]) + 1 if row else 1
 
 
+def latest_attempt_number(conn: sqlite3.Connection, request_id: int) -> int:
+    """Highest ``attempt_number`` recorded across this request's ``paper_attempts``
+    rows (0 if none). Bridge finishes pass this as ``paper_requests.attempt_count``
+    (AGA-596 P4): that column is a DIFFERENT counter (whole-request retries, bumped
+    by downloader.py's queue-retry path) which every bridge finish previously left
+    at the default 0 forever, even as tier attempts accumulated."""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(attempt_number), 0) FROM paper_attempts WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
 def write_ahead_attempt(
     conn: sqlite3.Connection,
     *,
