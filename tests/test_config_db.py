@@ -22,6 +22,89 @@ def test_init_db_creates_expected_tables(tmp_path: Path):
     assert {"papers", "paper_links", "paper_requests", "paper_attempts"}.issubset(names)
 
 
+_PRE_REVISION_SCHEMA = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE papers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT, normalized_title TEXT, doi TEXT UNIQUE,
+    status TEXT NOT NULL DEFAULT 'new', local_pdf_path TEXT,
+    verified_pdf INTEGER NOT NULL DEFAULT 0, canonical_url TEXT,
+    open_access_url TEXT, year INTEGER, venue TEXT, authors_json TEXT,
+    abstract TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+
+CREATE TABLE paper_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_input TEXT NOT NULL,
+    paper_id INTEGER REFERENCES papers(id) ON DELETE SET NULL,
+    inferred_title TEXT, inferred_doi TEXT, inferred_url TEXT,
+    source_mode TEXT NOT NULL DEFAULT 'local_download',
+    status TEXT NOT NULL DEFAULT 'queued', priority INTEGER NOT NULL DEFAULT 100,
+    force_redownload INTEGER NOT NULL DEFAULT 0, next_retry_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    manual_reason TEXT, manual_screenshot_path TEXT, manual_page_title TEXT,
+    manual_current_url TEXT, manual_suggested_next_action TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+
+CREATE TABLE paper_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES paper_requests(id) ON DELETE CASCADE,
+    paper_id INTEGER REFERENCES papers(id) ON DELETE SET NULL,
+    attempt_number INTEGER NOT NULL, status TEXT NOT NULL, strategy TEXT,
+    message TEXT, screenshot_path TEXT, page_title TEXT, current_url TEXT,
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def test_init_migrates_pre_revision_schema_idempotently(tmp_path: Path):
+    """AGA-596 review round 5, finding 3: pin migration deletion-sensitivity —
+    removing db._ensure_request_revision_column() from Database.init() would
+    leave this test failing (an existing deployed database, like the gpu-box
+    one, has paper_requests WITHOUT a revision column) while every OTHER test
+    stays green (they all start from the current, already-migrated schema).
+    Builds a database from the pre-revision schema (everything current EXCEPT
+    the revision column), runs init() TWICE (idempotence — a second bridge
+    restart or CLI invocation must not error or reset existing data), then
+    asserts the column was backfilled to 0 for a pre-existing row and CAS
+    works against it immediately."""
+    config = PaperikaConfig(
+        db_path=tmp_path / "papers.db",
+        download_dir=tmp_path / "downloads",
+        screenshot_dir=tmp_path / "shots",
+    )
+    config.ensure_runtime_dirs()
+
+    conn = sqlite3.connect(config.db_path)
+    conn.executescript(_PRE_REVISION_SCHEMA)
+    conn.execute(
+        "INSERT INTO paper_requests (raw_input, status, created_at, updated_at) "
+        "VALUES ('10.1000/pre-revision', 'downloaded', 't', 't')"
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database.from_config(config)
+    db.init()
+    db.init()  # idempotence: a second init() (e.g. a later bridge restart) must not error
+
+    conn = sqlite3.connect(config.db_path)
+    conn.row_factory = sqlite3.Row
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_requests)")}
+    assert "revision" in columns
+    row = conn.execute("SELECT * FROM paper_requests WHERE raw_input = '10.1000/pre-revision'").fetchone()
+    assert row["revision"] == 0  # backfilled, not NULL
+    conn.close()
+
+    applied = db.update_request_status(row["id"], "failed", expected_revision=row["revision"])
+    assert applied is True
+    updated = db.get_request(row["id"])
+    assert updated["status"] == "failed"
+    assert updated["revision"] == 1
+
+
 def _make_db(tmp_path: Path) -> Database:
     config = PaperikaConfig(
         db_path=tmp_path / "papers.db",

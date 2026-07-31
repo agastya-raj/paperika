@@ -48,6 +48,7 @@ CREATE TABLE paper_requests (
     force_redownload INTEGER NOT NULL DEFAULT 0,
     next_retry_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 0,
     manual_reason TEXT,
     manual_screenshot_path TEXT,
     manual_page_title TEXT,
@@ -57,6 +58,13 @@ CREATE TABLE paper_requests (
     updated_at TEXT NOT NULL
 )
 ```
+`revision` (AGA-596 review round 4) is a pure optimistic-concurrency-control
+token — bumped by 1 on every `update_request_status` write that actually
+applies (never on a guarded no-op); NOT present in the 2026-06-13 snapshot
+above, retrofitted onto pre-existing databases by
+`db._ensure_request_revision_column` (idempotent `ALTER TABLE ... ADD COLUMN`,
+run from `Database.init()`). See §3's `update_request_status` entry for the
+CAS contract that reads/writes it.
 
 ### paper_attempts (AFTER the bridge migration)
 Original live schema lacked `started_at/finished_at/outcome/run_dir`. The design

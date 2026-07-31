@@ -246,6 +246,11 @@ class Downloader:
                     paper_id=paper_id,
                     expected_revision=previous_revision,
                 )
+                if not applied:
+                    return self._superseded_outcome(
+                        request_id=request_id, attempt_number=attempt_number,
+                        kind=final_status, message=message,
+                    )
                 return DownloadOutcome(
                     request_id=request_id,
                     paper_id=paper_id,
@@ -261,7 +266,7 @@ class Downloader:
                         message=message,
                         attempt_number=attempt_number,
                         manual=manual,
-                    ) if applied else [],
+                    ),
                 )
             if should_retry(attempt_number):
                 final_status = "retrying"
@@ -274,6 +279,11 @@ class Downloader:
                     paper_id=paper_id,
                     expected_revision=previous_revision,  # see the branch above
                 )
+                if not applied:
+                    return self._superseded_outcome(
+                        request_id=request_id, attempt_number=attempt_number,
+                        kind=final_status, message=message,
+                    )
                 return DownloadOutcome(
                     request_id=request_id,
                     paper_id=paper_id,
@@ -289,7 +299,7 @@ class Downloader:
                         message=message,
                         attempt_number=attempt_number,
                         manual=manual,
-                    ) if applied else [],
+                    ),
                 )
             final_status = "permanent_failure"
             applied = self.db.update_request_status(
@@ -301,6 +311,11 @@ class Downloader:
                 paper_id=paper_id,
                 expected_revision=previous_revision,  # see the branch above
             )
+            if not applied:
+                return self._superseded_outcome(
+                    request_id=request_id, attempt_number=attempt_number,
+                    kind=final_status, message=message,
+                )
             return DownloadOutcome(
                 request_id=request_id,
                 paper_id=paper_id,
@@ -316,7 +331,7 @@ class Downloader:
                     message=message,
                     attempt_number=attempt_number,
                     manual=manual,
-                ) if applied else [],
+                ),
             )
 
     def retry_pending(self, browser: Any | None = None) -> list[DownloadOutcome]:
@@ -967,6 +982,32 @@ class Downloader:
             if self._is_pdf_file(path):
                 return path
         return None
+
+    def _superseded_outcome(
+        self, *, request_id: int, attempt_number: int, kind: str, message: str,
+    ) -> DownloadOutcome:
+        """A CAS no-op (``expected_revision`` mismatch) means some OTHER write
+        already changed this request since ``process_request`` read it at the
+        top — e.g. a faster concurrent worker's success. Never report the STALE
+        outcome THIS call computed as if it had been persisted (review round 5,
+        finding 1: the faster worker's success must not be masked by the slower
+        worker's failure message in CLI/worker output). Re-read the row and
+        describe what is ACTUALLY there instead."""
+        row = self.db.get_request(request_id)
+        current_status = row["status"] if row else kind
+        current_paper_id = row["paper_id"] if row else None
+        return DownloadOutcome(
+            request_id=request_id,
+            paper_id=current_paper_id,
+            status=current_status,
+            message=(
+                f"Superseded: this attempt's outcome ({kind}: {message}) was not "
+                f"applied — a concurrent update already left the request as "
+                f"'{current_status}'."
+            ),
+            deduped=current_status == "completed_deduped",
+            attempt_number=attempt_number,
+        )
 
     def _requires_manual_intervention(self, message: str) -> bool:
         lowered = message.lower()
