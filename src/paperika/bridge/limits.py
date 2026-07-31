@@ -169,19 +169,6 @@ def _next_attempt_number(conn: sqlite3.Connection, request_id: int) -> int:
     return int(row[0]) + 1 if row else 1
 
 
-def latest_attempt_number(conn: sqlite3.Connection, request_id: int) -> int:
-    """Highest ``attempt_number`` recorded across this request's ``paper_attempts``
-    rows (0 if none). Bridge finishes pass this as ``paper_requests.attempt_count``
-    (AGA-596 P4): that column is a DIFFERENT counter (whole-request retries, bumped
-    by downloader.py's queue-retry path) which every bridge finish previously left
-    at the default 0 forever, even as tier attempts accumulated."""
-    row = conn.execute(
-        "SELECT COALESCE(MAX(attempt_number), 0) FROM paper_attempts WHERE request_id = ?",
-        (request_id,),
-    ).fetchone()
-    return int(row[0]) if row else 0
-
-
 def write_ahead_attempt(
     conn: sqlite3.Connection,
     *,
@@ -225,9 +212,14 @@ def resolve_attempt(
     paper_id: int | None = None,
     message: str | None = None,
     screenshot_path: str | None = None,
+    current_url: str | None = None,
     now: datetime | None = None,
 ) -> None:
-    """UPDATE the write-ahead row with its final outcome + finished_at."""
+    """UPDATE the write-ahead row with its final outcome + finished_at.
+    ``current_url`` (AGA-596 review finding 1) persists a tier's ``final_url`` on
+    its OWN attempt row — durable evidence (survives a bridge restart) that a
+    later finish can read back via ``paper_attempts.current_url``, instead of
+    depending on an in-memory value computed during the same /download call."""
     now = now or utc_now()
     status = "downloaded" if outcome in _SUCCESS_OUTCOMES else "failed"
     conn.execute(
@@ -235,10 +227,11 @@ def resolve_attempt(
         UPDATE paper_attempts
         SET outcome = ?, status = ?, finished_at = ?, message = COALESCE(?, message),
             paper_id = COALESCE(?, paper_id),
-            screenshot_path = COALESCE(?, screenshot_path)
+            screenshot_path = COALESCE(?, screenshot_path),
+            current_url = COALESCE(?, current_url)
         WHERE id = ?
         """,
-        (outcome, status, iso(now), message, paper_id, screenshot_path, attempt_id),
+        (outcome, status, iso(now), message, paper_id, screenshot_path, current_url, attempt_id),
     )
     conn.commit()
 

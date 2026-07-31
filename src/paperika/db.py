@@ -18,10 +18,15 @@ def utc_now() -> str:
 
 # paper_requests.status values meaning "a paper was actually obtained" — used by
 # update_request_status to decide whether a stale manual_* operator handoff must
-# be cleared (AGA-596 P5 follow-up). The two callers spell success differently:
-# downloader.py's queue-retry path uses "downloaded"/"completed_deduped"; the
-# bridge uses "completed".
+# be cleared (AGA-596 P5 follow-up), and to guard against a stale non-success
+# transition overwriting a request that already succeeded (AGA-596 review
+# finding 3). The two callers spell success differently: downloader.py's
+# queue-retry path uses "downloaded"/"completed_deduped"; the bridge uses
+# "completed".
 _SUCCESS_STATUSES = frozenset({"downloaded", "completed_deduped", "completed"})
+# Same set, pre-rendered as a SQL literal list for the WHERE-clause guard below —
+# built from _SUCCESS_STATUSES (not duplicated by hand) so the two can't drift.
+_SUCCESS_STATUSES_SQL = ", ".join(f"'{s}'" for s in sorted(_SUCCESS_STATUSES))
 
 
 SCHEMA_SQL = """
@@ -322,13 +327,23 @@ class Database:
         # was passed. Every other status keeps the only-overwrite-when-supplied
         # (COALESCE) behavior, so a later transition without a fresh
         # ManualIntervention cannot erase a still-relevant handoff.
-        clear_manual = 1 if status in _SUCCESS_STATUSES else 0
+        is_success = 1 if status in _SUCCESS_STATUSES else 0
         with self.transaction() as conn:
             existing = conn.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
             if not existing:
                 raise KeyError(f"Request {request_id} not found")
+            # WHERE-clause guard (AGA-596 review finding 3): a NON-success status
+            # update must not overwrite a request that has ALREADY reached a
+            # success status — e.g. two workers race on the same retryable
+            # request; one succeeds and clears manual_*, then a slower/stale
+            # failure from the other lands afterward and must not resurrect the
+            # request as failed nor repopulate the handoff. `status` inside the
+            # WHERE clause refers to the row's CURRENT (pre-update) value, per
+            # standard UPDATE semantics — this is a single guarded statement, not
+            # a separate read-then-write, so there is no check-then-act gap. A
+            # transition that is ITSELF a success status is never blocked.
             conn.execute(
-                """
+                f"""
                 UPDATE paper_requests
                 SET status = ?,
                     attempt_count = COALESCE(?, attempt_count),
@@ -341,19 +356,21 @@ class Database:
                     paper_id = COALESCE(?, paper_id),
                     updated_at = ?
                 WHERE id = ?
+                  AND NOT (status IN ({_SUCCESS_STATUSES_SQL}) AND ? = 0)
                 """,
                 (
                     status,
                     attempt_count,
                     next_retry_at,
-                    clear_manual, manual.reason if manual else None,
-                    clear_manual, manual.screenshot_path if manual else None,
-                    clear_manual, manual.page_title if manual else None,
-                    clear_manual, manual.current_url if manual else None,
-                    clear_manual, manual.suggested_next_action if manual else None,
+                    is_success, manual.reason if manual else None,
+                    is_success, manual.screenshot_path if manual else None,
+                    is_success, manual.page_title if manual else None,
+                    is_success, manual.current_url if manual else None,
+                    is_success, manual.suggested_next_action if manual else None,
                     paper_id,
                     now,
                     request_id,
+                    is_success,
                 ),
             )
 

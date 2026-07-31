@@ -3,7 +3,7 @@ import sqlite3
 
 from paperika.config import PaperikaConfig
 from paperika.db import Database
-from paperika.models import ManualIntervention
+from paperika.models import LocateCandidate, ManualIntervention
 
 
 def test_init_db_creates_expected_tables(tmp_path: Path):
@@ -146,3 +146,65 @@ def test_update_request_status_clears_manual_fields_for_every_success_alias(tmp_
         db.update_request_status(request_id, success_status)
         row = db.get_request(request_id)
         assert row["manual_reason"] is None, f"{success_status} should clear manual_reason"
+
+
+# --------------------------------- AGA-596 review finding 3: stale-failure race ---
+
+
+def test_update_request_status_stale_failure_after_success_does_not_overwrite(tmp_path: Path):
+    """A slower/stale failure transition committing AFTER a success has already
+    landed (e.g. two workers race on the same retryable request) must not
+    resurrect the request as failed nor repopulate manual_* — the WHERE-clause
+    guard blocks any non-success status update once the row is already in a
+    _SUCCESS_STATUSES state. Sequential commits are enough to pin this: the guard
+    is about commit ORDER, not true concurrent access."""
+    db = _make_db(tmp_path)
+    paper_id = db.upsert_located_paper(LocateCandidate(title="Race Stale Failure Paper"))
+    request_id = db.create_request(
+        raw_input="10.1000/race-stale-failure", inferred_title="Race Stale Failure Paper",
+        inferred_doi="10.1000/race-stale-failure", inferred_url=None, paper_id=None,
+    )
+    db.update_request_status(request_id, "completed", paper_id=paper_id)
+    # A stale failure (e.g. a slower worker's outcome) commits after the success.
+    db.update_request_status(
+        request_id, "failed",
+        manual=ManualIntervention(reason="stale bot wall", screenshot_path="/tmp/stale.png"),
+    )
+    row = db.get_request(request_id)
+    assert row["status"] == "completed"
+    assert row["paper_id"] == paper_id
+    assert row["manual_reason"] is None
+    assert row["manual_screenshot_path"] is None
+
+
+def test_update_request_status_success_after_success_still_applies(tmp_path: Path):
+    """The stale-failure guard blocks only a NON-success transition landing after
+    a success — a later transition that is ITSELF a success status (e.g. a
+    redundant/idempotent completion) must still apply."""
+    db = _make_db(tmp_path)
+    paper_a = db.upsert_located_paper(LocateCandidate(title="Race Success Success Paper A"))
+    paper_b = db.upsert_located_paper(LocateCandidate(title="Race Success Success Paper B"))
+    request_id = db.create_request(
+        raw_input="10.1000/race-success-success", inferred_title="t",
+        inferred_doi="10.1000/race-success-success", inferred_url=None, paper_id=None,
+    )
+    db.update_request_status(request_id, "completed", paper_id=paper_a)
+    db.update_request_status(request_id, "completed", paper_id=paper_b)
+    row = db.get_request(request_id)
+    assert row["paper_id"] == paper_b
+
+
+def test_update_request_status_non_success_still_applies_before_any_success(tmp_path: Path):
+    """The guard must not block the NORMAL case: a fresh request's ordinary
+    non-success transitions (in_progress -> failed, or a retry sequence) apply
+    exactly as before, since the row was never in a success state."""
+    db = _make_db(tmp_path)
+    request_id = db.create_request(
+        raw_input="10.1000/race-normal-failure", inferred_title="t",
+        inferred_doi="10.1000/race-normal-failure", inferred_url=None, paper_id=None,
+    )
+    db.update_request_status(request_id, "in_progress")
+    db.update_request_status(request_id, "failed", manual=ManualIntervention(reason="bot wall"))
+    row = db.get_request(request_id)
+    assert row["status"] == "failed"
+    assert row["manual_reason"] == "bot wall"
