@@ -85,6 +85,18 @@ CREATE TABLE IF NOT EXISTS paper_requests (
     -- of paper_attempts rows) surfaced only in the bridge's GET /requests/{id}
     -- response.
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    -- revision is a pure optimistic-concurrency-control token (AGA-596 review
+    -- round 4, finding 1) — NOT a semantic/operator-facing counter like
+    -- attempt_count. update_request_status bumps it by 1 on every write it
+    -- actually applies (never on a guarded no-op). A CAS caller's
+    -- expected_revision must equal the row's CURRENT revision, not just its
+    -- status string: status-only CAS has an ABA hole — e.g. two
+    -- force_redownload workers both read status='downloaded'; the faster one
+    -- re-downloads and writes 'downloaded' again (same STRING, but a genuinely
+    -- newer row); the slower one's stale expected_status='downloaded' would
+    -- still match and clobber that newer success. revision always changes on
+    -- a real write, so it catches this where status alone cannot.
+    revision INTEGER NOT NULL DEFAULT 0,
     manual_reason TEXT,
     manual_screenshot_path TEXT,
     manual_page_title TEXT,
@@ -114,6 +126,24 @@ CREATE INDEX IF NOT EXISTS idx_paper_attempts_request_id ON paper_attempts(reque
 """
 
 
+def _ensure_request_revision_column(conn: sqlite3.Connection) -> None:
+    """Idempotent ``ALTER TABLE ... ADD COLUMN`` for ``paper_requests.revision``
+    (AGA-596 review round 4, finding 1). ``CREATE TABLE IF NOT EXISTS`` in
+    SCHEMA_SQL only creates the column on a brand-new database — it silently
+    no-ops on a database whose ``paper_requests`` table already existed before
+    this column was added (in particular the deployed gpu-box DB), so a
+    pre-existing table needs this retrofit. Mirrors the same idiom the bridge
+    already uses for its own ``paper_attempts`` columns (see
+    ``bridge/limits.py:ensure_bridge_columns``), but lives here — not
+    bridge-only — because ``paper_requests`` and its CAS use of ``revision``
+    are shared by both downloader.py and the bridge, and this runs from
+    ``Database.init()``, the one common entry point both go through."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(paper_requests)")}
+    if "revision" not in existing:
+        conn.execute("ALTER TABLE paper_requests ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+
+
 @dataclass(slots=True)
 class Database:
     path: Path
@@ -132,6 +162,7 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA_SQL)
+            _ensure_request_revision_column(conn)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -322,40 +353,39 @@ class Database:
         next_retry_at: str | None = None,
         manual: ManualIntervention | None = None,
         paper_id: int | None = None,
-        expected_status: str | None = None,
+        expected_revision: int | None = None,
     ) -> bool:
         """Returns True if the row was actually updated, False if a guard below
-        turned this into a no-op (AGA-596 review round 2/3) — callers that emit a
-        status-change notification/event MUST check this before doing so, or
-        they can report a status the row never actually reached. Raises KeyError
-        only when ``request_id`` doesn't exist at all (a guarded no-op is NOT an
-        error — the row exists, the write was just skipped).
+        turned this into a no-op (AGA-596 review round 2/3/4) — callers that
+        emit a status-change notification/event MUST check this before doing
+        so, or they can report a status the row never actually reached. Raises
+        KeyError only when ``request_id`` doesn't exist at all (a guarded
+        no-op is NOT an error — the row exists, the write was just skipped).
 
         Two independent guard mechanisms, never both active at once:
-        - Default (``expected_status=None``): the success-status guard — a
+        - Default (``expected_revision=None``): the success-status guard — a
           transition to a NON-success status cannot overwrite a row whose
           CURRENT status is already in ``_SUCCESS_STATUSES`` (protects against
           an unintentional stale write resurrecting an already-succeeded
           request). This is the only guard for callers that never supply
-          ``expected_status`` — in particular every bridge call site.
-        - ``expected_status`` (compare-and-set, AGA-596 review round 3 finding
-          1): downloader.py's ``process_request`` reads the row once at the top
-          (``previous_status``) and does real work (network I/O) before writing
-          back. An earlier fix let those writes bypass the success guard via a
-          caller-asserted ``allow_reopen=True`` — unconditional at all three
-          call sites — so a legitimate force_redownload reopen-then-fail wasn't
-          blocked, but it ALSO let a genuinely stale concurrent write (a second
-          worker racing the same request) bypass it just as freely:
-          ``force_redownload`` is fixed at request-creation and never cleared
-          (verified in code — clearing it would break the documented repeated
-          `process-request <id>` CLI retry workflow), so it cannot distinguish
-          "this specific call is the deliberate reopen" from "some other call
-          reached this same code". Passing ``expected_status=previous_status``
-          instead requires the row's status to still equal what THIS caller
-          last read; ANY concurrent write since then (a success OR another
-          failure) makes it a no-op. That is a strictly stronger, more precise
-          guard than the success-set check, so it fully replaces the success
-          guard for a CAS call rather than composing with it.
+          ``expected_revision`` — in particular every bridge call site.
+        - ``expected_revision`` (compare-and-set on ``paper_requests.revision``,
+          AGA-596 review round 4 finding 1): downloader.py's
+          ``process_request`` reads the row once at the top and does real work
+          (network I/O) before writing back. Round 3 CAS'd on ``expected_status``
+          (the STATUS STRING read at that same moment) instead — replacing an
+          even earlier, unconditional ``allow_reopen=True`` that let ANY
+          concurrent write bypass the success guard, race or not — but
+          status-only CAS has an ABA hole: two force_redownload workers can
+          both read status='downloaded'; the faster one re-downloads and
+          writes 'downloaded' AGAIN (same STRING, genuinely newer row); the
+          slower one's stale expected_status='downloaded' would still match
+          and clobber that newer success. ``revision`` is bumped by 1 on every
+          write this method actually applies (never on a guarded no-op, under
+          either mechanism), so it always differs after a real write even when
+          the status string cycles back to what it was — CAS on it is
+          therefore strictly stronger than status-only CAS and fully replaces
+          the success guard for a CAS call rather than composing with it.
         """
         now = utc_now()
         # A request reaching a SUCCESS status must never keep showing a stale
@@ -373,9 +403,12 @@ class Database:
             is_success, manual.current_url if manual else None,
             is_success, manual.suggested_next_action if manual else None,
         )
+        # revision = revision + 1 fires only when the WHERE clause matches (i.e.
+        # only on an ACTUALLY applied write) — a guarded no-op never bumps it.
         set_clause = """
             SET status = ?,
                 attempt_count = COALESCE(?, attempt_count),
+                revision = revision + 1,
                 next_retry_at = ?,
                 manual_reason = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_reason) END,
                 manual_screenshot_path = CASE WHEN ? THEN NULL ELSE COALESCE(?, manual_screenshot_path) END,
@@ -389,11 +422,11 @@ class Database:
             existing = conn.execute("SELECT * FROM paper_requests WHERE id = ?", (request_id,)).fetchone()
             if not existing:
                 raise KeyError(f"Request {request_id} not found")
-            if expected_status is not None:
+            if expected_revision is not None:
                 cursor = conn.execute(
-                    f"UPDATE paper_requests {set_clause} WHERE id = ? AND status = ?",
+                    f"UPDATE paper_requests {set_clause} WHERE id = ? AND revision = ?",
                     (status, attempt_count, next_retry_at, *manual_params, paper_id, now,
-                     request_id, expected_status),
+                     request_id, expected_revision),
                 )
             else:
                 # `status` inside the WHERE clause refers to the row's CURRENT

@@ -140,6 +140,11 @@ class Downloader:
                 publisher_hint=detect_publisher(request_row["inferred_url"]),
             )
         previous_status = request_row["status"]
+        # Captured at the same moment as previous_status, before any real work
+        # (network I/O) runs — this row's optimistic-concurrency-control token
+        # for the three failure branches below (AGA-596 review round 4,
+        # finding 1: status alone has an ABA hole a revision CAS does not).
+        previous_revision = request_row["revision"]
         paper_id = request_row["paper_id"]
         if previous_status in {"completed_deduped", "downloaded"} and not request_row["force_redownload"]:
             paper_row = self.db.find_verified_pdf(doi=parsed.doi, title=parsed.title)
@@ -223,14 +228,15 @@ class Downloader:
             )
             if self._requires_manual_intervention(message):
                 final_status = "manual_intervention"
-                # expected_status=previous_status (AGA-596 review round 3,
-                # finding 1): compare-and-set instead of an unconditional
-                # allow_reopen — only apply this write if the row's status is
-                # STILL what THIS call read at the top of process_request. A
-                # concurrent worker that already changed it (a genuine success,
-                # or another failure) makes this a no-op, same as the plain
-                # success guard everywhere else, but without also blocking a
-                # legitimate force_redownload reopen-then-fail.
+                # expected_revision=previous_revision (AGA-596 review round 4,
+                # finding 1 — was expected_status, which has an ABA hole; see
+                # update_request_status's docstring): only apply this write if
+                # the row's revision is STILL what THIS call read at the top of
+                # process_request. A concurrent worker that already changed it
+                # (a genuine success, or another failure — even one that leaves
+                # the status STRING unchanged) makes this a no-op, same as the
+                # plain success guard everywhere else, but without also
+                # blocking a legitimate force_redownload reopen-then-fail.
                 applied = self.db.update_request_status(
                     request_id,
                     final_status,
@@ -238,7 +244,7 @@ class Downloader:
                     next_retry_at=None,
                     manual=manual,
                     paper_id=paper_id,
-                    expected_status=previous_status,
+                    expected_revision=previous_revision,
                 )
                 return DownloadOutcome(
                     request_id=request_id,
@@ -266,7 +272,7 @@ class Downloader:
                     next_retry_at=next_retry_at(attempt_number).isoformat(),
                     manual=manual,
                     paper_id=paper_id,
-                    expected_status=previous_status,  # see the branch above
+                    expected_revision=previous_revision,  # see the branch above
                 )
                 return DownloadOutcome(
                     request_id=request_id,
@@ -293,7 +299,7 @@ class Downloader:
                 next_retry_at=None,
                 manual=manual,
                 paper_id=paper_id,
-                expected_status=previous_status,  # see the branch above
+                expected_revision=previous_revision,  # see the branch above
             )
             return DownloadOutcome(
                 request_id=request_id,

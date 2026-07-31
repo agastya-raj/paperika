@@ -202,7 +202,7 @@ def test_update_request_status_success_after_success_still_applies(tmp_path: Pat
 def test_update_request_status_compare_and_set_allows_legitimate_reopen(tmp_path: Path):
     """MEDIUM review round-3 finding 1: the guard's purpose is only "a stale
     failure must not overwrite a success", not "success is forever". A caller
-    that supplies expected_status matching the row's ACTUAL current status
+    that supplies expected_revision matching the row's ACTUAL current revision
     (compare-and-set — not a bare caller-asserted allow_reopen=True, which
     review round 2's fix used and round 3 found unconditionally bypassed the
     guard for every caller, race or not) can still transition an
@@ -214,9 +214,10 @@ def test_update_request_status_compare_and_set_allows_legitimate_reopen(tmp_path
         inferred_doi="10.1000/legit-reopen", inferred_url=None, paper_id=None,
     )
     db.update_request_status(request_id, "completed")
+    revision_after_success = db.get_request(request_id)["revision"]
     blocked = db.update_request_status(request_id, "failed")
     assert blocked is False
-    applied = db.update_request_status(request_id, "failed", expected_status="completed")
+    applied = db.update_request_status(request_id, "failed", expected_revision=revision_after_success)
     assert applied is True
     row = db.get_request(request_id)
     assert row["status"] == "failed"
@@ -225,30 +226,76 @@ def test_update_request_status_compare_and_set_allows_legitimate_reopen(tmp_path
 def test_update_request_status_compare_and_set_blocks_stale_worker_after_success(tmp_path: Path):
     """HIGH review round-3 finding 1: two workers read the same request at
     status='queued'. The FASTER worker succeeds first (status -> 'downloaded').
-    The SLOWER worker's failure write, using expected_status='queued' (what IT
-    read before doing its work), must no-op — CAS correctly detects the row
-    moved on, unlike the previous unconditional allow_reopen=True (round 2's
-    fix) which would have resurrected it regardless of any race."""
+    The SLOWER worker's failure write, using the revision it read before doing
+    its work, must no-op — CAS correctly detects the row moved on, unlike the
+    previous unconditional allow_reopen=True (round 2's fix) which would have
+    resurrected it regardless of any race."""
     db = _make_db(tmp_path)
     request_id = db.create_request(
         raw_input="10.1000/race-two-workers", inferred_title="t",
         inferred_doi="10.1000/race-two-workers", inferred_url=None, paper_id=None,
     )
-    # Both workers' view at read time: status is the DEFAULT 'queued'.
+    # Both workers' view at read time: the freshly-created row's revision.
+    revision_both_workers_read = db.get_request(request_id)["revision"]
     paper_id = db.upsert_located_paper(LocateCandidate(title="Race Two Workers Paper"))
-    applied_a = db.update_request_status(request_id, "downloaded", paper_id=paper_id, expected_status="queued")
+    applied_a = db.update_request_status(
+        request_id, "downloaded", paper_id=paper_id, expected_revision=revision_both_workers_read,
+    )
     assert applied_a is True
 
     applied_b = db.update_request_status(
         request_id, "retrying",
         manual=ManualIntervention(reason="stale failure"),
-        expected_status="queued",
+        expected_revision=revision_both_workers_read,
     )
     assert applied_b is False
 
     row = db.get_request(request_id)
     assert row["status"] == "downloaded"
     assert row["paper_id"] == paper_id
+    assert row["manual_reason"] is None
+
+
+def test_update_request_status_compare_and_set_blocks_aba_stale_worker(tmp_path: Path):
+    """MEDIUM review round-4 finding 1: status-alone CAS has an ABA race. Two
+    force_redownload workers both read status='downloaded' (same revision N).
+    The FASTER worker re-downloads and writes 'downloaded' AGAIN — same STATUS
+    STRING, but a genuinely newer row (revision N+1). The SLOWER worker's
+    stale failure, still holding revision N, must no-op even though `status`
+    alone still reads "downloaded" and would satisfy a status-only CAS check —
+    this is exactly the case status-based CAS (round 3) could not catch."""
+    db = _make_db(tmp_path)
+    request_id = db.create_request(
+        raw_input="10.1000/aba-race", inferred_title="t",
+        inferred_doi="10.1000/aba-race", inferred_url=None, paper_id=None,
+    )
+    paper_1 = db.upsert_located_paper(LocateCandidate(title="ABA Race Paper One"))
+    db.update_request_status(request_id, "downloaded", paper_id=paper_1)
+    revision_both_workers_read = db.get_request(request_id)["revision"]
+
+    # The FASTER worker force-redownloads and succeeds again: status cycles
+    # back to the SAME "downloaded" value, but the revision bumps.
+    paper_2 = db.upsert_located_paper(LocateCandidate(title="ABA Race Paper Two"))
+    applied_winner = db.update_request_status(
+        request_id, "downloaded", paper_id=paper_2, expected_revision=revision_both_workers_read,
+    )
+    assert applied_winner is True
+    row = db.get_request(request_id)
+    assert row["paper_id"] == paper_2
+    assert row["revision"] != revision_both_workers_read
+
+    # The SLOWER worker's stale failure, still holding the OLD revision it read
+    # before either worker did anything, must no-op.
+    applied_stale = db.update_request_status(
+        request_id, "retrying",
+        manual=ManualIntervention(reason="stale failure"),
+        expected_revision=revision_both_workers_read,
+    )
+    assert applied_stale is False
+
+    row = db.get_request(request_id)
+    assert row["status"] == "downloaded"
+    assert row["paper_id"] == paper_2
     assert row["manual_reason"] is None
 
 
