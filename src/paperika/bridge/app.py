@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 from typing import Any
 from urllib.parse import urlparse
@@ -437,6 +438,9 @@ def build_bridge(config: PaperikaConfig | None = None) -> Bridge:
     config.ensure_runtime_dirs()
     (config.db_path.parent / "codex_runs").mkdir(parents=True, exist_ok=True)
     db = Database.from_config(config)
+    # Registered BEFORE init() so a DB file rebuilt later by connect() (AGA-1250)
+    # gets the bridge columns too, not just the shared schema.
+    db.schema_hooks.append(limits.ensure_bridge_columns)
     db.init()
     with db.transaction() as conn:
         limits.ensure_bridge_columns(conn)
@@ -615,6 +619,19 @@ def _codex_usable(state: BridgeState) -> bool:
     return timedelta(0) <= age <= timedelta(days=SELFTEST_MAX_AGE_DAYS)
 
 
+def _db_usable(db: Database) -> bool:
+    """True when the state DB answers a query against the schema it should hold.
+    /healthz reported ``ok`` for three days while every /download died on
+    ``no such table: papers`` (AGA-1250); liveness must include the DB."""
+    try:
+        with db.transaction() as conn:
+            conn.execute("SELECT 1 FROM papers LIMIT 1").fetchall()
+            conn.execute("SELECT 1 FROM paper_attempts LIMIT 1").fetchall()
+        return True
+    except sqlite3.Error:
+        return False
+
+
 def create_app(config: PaperikaConfig | None = None) -> FastAPI:
     bridge = build_bridge(config)
 
@@ -632,8 +649,10 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
     async def healthz(request: Request) -> Response:
         token_configured = bool(_configured_token())
         result = await chrome.probe(fresh=False)
-        status = "ok" if result.ok else "degraded"
-        http_status = 200 if result.ok else 503
+        db_ok = _db_usable(bridge.db)
+        healthy = result.ok and db_ok
+        status = "ok" if healthy else "degraded"
+        http_status = 200 if healthy else 503
 
         # Unauthenticated tier: liveness only.
         header = request.headers.get("authorization", "")
@@ -642,18 +661,28 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
         if not authed:
             return JSONResponse(
                 status_code=http_status,
-                content={"status": status, "token_configured": token_configured},
+                content={
+                    "status": status,
+                    "token_configured": token_configured,
+                    "db": "ok" if db_ok else "unavailable",
+                },
             )
 
         state = bridge.state_store.load()
-        with bridge.db.transaction() as conn:
-            downloads_today = limits.attempts_today(conn)
-            attempts_by_strategy = {
-                strat: limits.attempts_today(conn, strat)
-                for strat in ("direct_fetch", "scripted_browser", "codex_bridge")
-            }
+        downloads_today = None
+        attempts_by_strategy: dict[str, int | None] = {
+            strat: None for strat in ("direct_fetch", "scripted_browser", "codex_bridge")
+        }
+        if db_ok:
+            with bridge.db.transaction() as conn:
+                downloads_today = limits.attempts_today(conn)
+                attempts_by_strategy = {
+                    strat: limits.attempts_today(conn, strat)
+                    for strat in ("direct_fetch", "scripted_browser", "codex_bridge")
+                }
         body = {
             "status": status,
+            "db": {"ok": db_ok, "path": str(bridge.config.db_path)},
             "chrome": {
                 "cdp_connectable": result.ok,
                 "browser": result.version,

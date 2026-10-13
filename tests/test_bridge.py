@@ -701,7 +701,43 @@ def test_healthz_open_unauthenticated_trimmed(cfg):
     resp = client.get("/healthz")
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body.keys()) == {"status", "token_configured"}
+    assert set(body.keys()) == {"status", "token_configured", "db"}
+    assert body["db"] == "ok"
+
+
+def test_healthz_degraded_when_state_db_unusable(cfg):
+    """AGA-1250: the state DB vanished under a running bridge and /healthz kept
+    saying ok while every /download 500'd. A DB that cannot answer the schema
+    query must turn both tiers 503/degraded, with limits reported as unknown."""
+    client = _client(cfg)
+    cfg.db_path.write_bytes(b"this is not a sqlite database, it is 48 bytes!!")
+    open_resp = client.get("/healthz")
+    assert open_resp.status_code == 503
+    assert open_resp.json()["status"] == "degraded"
+    assert open_resp.json()["db"] == "unavailable"
+    full = client.get("/healthz", headers=_auth())
+    assert full.status_code == 503
+    body = full.json()
+    assert body["db"]["ok"] is False
+    assert body["limits"]["downloads_today"] is None
+
+
+def test_healthz_recovers_when_state_db_file_is_emptied(cfg):
+    """AGA-1250 self-heal: an emptied DB file (what a wiped-and-recreated state
+    dir looks like) is re-initialised on the next connect, so the bridge recovers
+    without a restart."""
+    client = _client(cfg)
+    cfg.db_path.write_bytes(b"")
+    resp = client.get("/healthz", headers=_auth())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["db"]["ok"] is True
+    names = {
+        row[0]
+        for row in sqlite3.connect(cfg.db_path).execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    assert {"papers", "paper_requests", "paper_attempts"}.issubset(names)
 
 
 def test_healthz_authenticated_full_detail(cfg):

@@ -22,6 +22,32 @@ def test_init_db_creates_expected_tables(tmp_path: Path):
     assert {"papers", "paper_links", "paper_requests", "paper_attempts"}.issubset(names)
 
 
+def test_connect_recreates_schema_when_db_file_missing_or_empty(tmp_path: Path):
+    """AGA-1250: a DB deleted underneath a running process must not leave every
+    later connect() on a table-less file."""
+    config = PaperikaConfig(db_path=tmp_path / "state" / "papers.db", download_dir=tmp_path / "dl")
+    db = Database.from_config(config)
+    db.init()
+    config.db_path.unlink()
+    with db.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM papers").fetchone()[0] == 0
+    config.db_path.write_bytes(b"")
+    with db.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM paper_attempts").fetchone()[0] == 0
+    import shutil
+    shutil.rmtree(config.db_path.parent)
+    with db.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM paper_requests").fetchone()[0] == 0
+
+
+def test_default_state_paths_are_not_under_hermes_home():
+    """AGA-1250: ~/.hermes belongs to the Hermes agent and gets wiped by its
+    updates; paperika state must not live there."""
+    config = PaperikaConfig()
+    for path in (config.db_path, config.screenshot_dir, config.notification_dir):
+        assert ".hermes" not in path.parts, path
+
+
 _PRE_REVISION_SCHEMA = """
 PRAGMA foreign_keys = ON;
 

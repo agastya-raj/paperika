@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -147,15 +148,29 @@ def _ensure_request_revision_column(conn: sqlite3.Connection) -> None:
 @dataclass(slots=True)
 class Database:
     path: Path
+    # Extra idempotent schema steps (e.g. the bridge's paper_attempts columns)
+    # re-applied whenever connect() rebuilds a missing/empty DB file.
+    schema_hooks: list[Callable[[sqlite3.Connection], None]] = field(default_factory=list)
 
     @classmethod
     def from_config(cls, config: PaperikaConfig) -> "Database":
         return cls(path=config.db_path)
 
     def connect(self) -> sqlite3.Connection:
+        # A long-running bridge only ran init() at startup; when the DB file was
+        # deleted underneath it (AGA-1250) every later connect() opened a fresh,
+        # table-less file and failed with "no such table". Re-apply the schema
+        # whenever the file is missing or empty (a stat per connect, idempotent).
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fresh = not self.path.exists() or self.path.stat().st_size == 0
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        if fresh:
+            conn.executescript(SCHEMA_SQL)
+            _ensure_request_revision_column(conn)
+            for hook in self.schema_hooks:
+                hook(conn)
         return conn
 
     def init(self) -> None:

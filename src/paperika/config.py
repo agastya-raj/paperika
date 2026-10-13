@@ -5,10 +5,14 @@ from pathlib import Path
 import os
 
 
-DEFAULT_DB_PATH = Path.home() / ".hermes" / "paper_pipeline" / "papers.db"
+# Runtime state lives under XDG state, NOT under ~/.hermes: that directory
+# belongs to the Hermes agent, and a Hermes update/cleanup on 2026-10-07 wiped
+# the bridge's papers.db with it (every download 500'd for days, AGA-1250).
+DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "paperika"
+DEFAULT_DB_PATH = DEFAULT_STATE_DIR / "papers.db"
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Downloads" / "papers"
-DEFAULT_SCREENSHOT_DIR = Path.home() / ".hermes" / "paper_pipeline" / "screenshots"
-DEFAULT_NOTIFICATION_DIR = Path.home() / ".hermes" / "paper_pipeline" / "events"
+DEFAULT_SCREENSHOT_DIR = DEFAULT_STATE_DIR / "screenshots"
+DEFAULT_NOTIFICATION_DIR = DEFAULT_STATE_DIR / "events"
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 
 
