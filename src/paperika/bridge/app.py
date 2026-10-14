@@ -58,6 +58,11 @@ SWEEP_WINDOW_SECONDS = executor.EXEC_WALL_SECONDS + 30
 # min(budget, 15.0) — a per-read gap cap, not a total, so a steady multi-minute
 # stream never trips it.
 TIER1_BUDGET = 60.0
+# AGA-1256: the longest tier-1 cooldown the ladder waits out instead of skipping
+# tier 1 (direct_fetch spacing is 30 s, so this is cooldown + margin). SLEEP is
+# a module attribute so tests can stub the wait.
+TIER1_COOLDOWN_WAIT_MAX = 45
+SLEEP = asyncio.sleep
 TIER2_BUDGET = 45.0
 
 # GET /requests/{id}/screenshot (AGA-596 P3) media type by file extension. Bridge
@@ -857,6 +862,22 @@ async def _download_locked(
         retry = [d.retry_after_seconds for d in rate.values() if d.retry_after_seconds is not None]
         extra = {"retry_after_seconds": min(retry)} if retry else {}
         return _json_error(429, "rate_limited", "all download tiers are rate-limited", **extra)
+
+    # AGA-1256: tier 1 merely cooling down is not a reason to skip it. Skipping
+    # escalated IEEE papers straight to the scripted/codex tiers, and with codex
+    # unusable the answer was selftest_required for a paper tier 1 fetches in
+    # seconds (2026-10-13: every second back-to-back request). Wait out a short
+    # cooldown instead (the lock is held either way; the client budget is 1200s).
+    tier1 = rate["direct_fetch"]
+    if (
+        not tier1.allowed
+        and tier1.error_code == "cooldown"
+        and tier1.retry_after_seconds is not None
+        and tier1.retry_after_seconds <= TIER1_COOLDOWN_WAIT_MAX
+    ):
+        await SLEEP(tier1.retry_after_seconds)
+        with bridge.db.transaction() as conn:
+            rate["direct_fetch"] = limits.check_rate(conn, "direct_fetch")
 
     # 5. chrome pre-flight. A sick Chrome no longer fails the whole request: tier 1
     # runs cookie-less regardless, tier 2 is skipped, and tier 3 keeps the legacy

@@ -1418,6 +1418,73 @@ def test_ladder_per_strategy_spacing_isolation(cfg, monkeypatch):
     assert resp.status_code == 200 and resp.headers.get("X-Paperika-Tier") == "direct_fetch"
 
 
+def test_ladder_waits_out_short_tier1_cooldown_instead_of_escalating(cfg, monkeypatch):
+    """AGA-1256: direct_fetch cooling down (an attempt 24 s ago, 30 s spacing) with
+    codex unusable used to skip tier 1 and answer selftest_required. The ladder now
+    sleeps the remaining cooldown and runs tier 1."""
+    bridge_app.build_bridge(cfg)  # no sandbox mode seeded: codex unusable
+    con = _conn(cfg)
+    con.execute("INSERT INTO paper_requests (raw_input, status, created_at, updated_at) VALUES ('x','in_progress',?,?)",
+                (limits.iso(_now()), limits.iso(_now())))
+    rid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    t24 = _now() - timedelta(seconds=24)
+    con.execute("INSERT INTO paper_attempts (request_id, attempt_number, status, strategy, created_at, started_at, outcome) "
+                "VALUES (?,1,'completed','direct_fetch',?,?,'completed')", (rid, limits.iso(t24), limits.iso(t24)))
+    con.commit()
+    con.close()
+
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+        # simulate the clock advancing past the cooldown
+        c = _conn(cfg)
+        old = limits.iso(_now() - timedelta(seconds=90))
+        c.execute("UPDATE paper_attempts SET started_at=?, created_at=? WHERE request_id=?", (old, old, rid))
+        c.commit()
+        c.close()
+
+    monkeypatch.setattr(bridge_app, "SLEEP", _fake_sleep)
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _tier_download_stub())
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1109/jlt.cooldown", "title": "Cooling Tier One Paper"})
+    assert resp.status_code == 200, resp.text
+    assert resp.headers.get("X-Paperika-Tier") == "direct_fetch"
+    assert len(slept) == 1 and 1 <= slept[0] <= 31
+    con = _conn(cfg)
+    rows = con.execute("SELECT strategy, outcome FROM paper_attempts ORDER BY id").fetchall()
+    assert [r["strategy"] for r in rows] == ["direct_fetch", "direct_fetch"]
+    assert rows[-1]["outcome"] == "completed"
+    con.close()
+
+
+def test_ladder_does_not_wait_when_tier1_cooldown_exceeds_cap(cfg, monkeypatch):
+    """A cooldown longer than TIER1_COOLDOWN_WAIT_MAX keeps the old skip behaviour."""
+    bridge_app.build_bridge(cfg)
+    monkeypatch.setattr(bridge_app, "TIER1_COOLDOWN_WAIT_MAX", 3)
+    con = _conn(cfg)
+    con.execute("INSERT INTO paper_requests (raw_input, status, created_at, updated_at) VALUES ('x','in_progress',?,?)",
+                (limits.iso(_now()), limits.iso(_now())))
+    rid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    t5 = _now() - timedelta(seconds=5)
+    con.execute("INSERT INTO paper_attempts (request_id, attempt_number, status, strategy, created_at, started_at, outcome) "
+                "VALUES (?,1,'completed','direct_fetch',?,?,'completed')", (rid, limits.iso(t5), limits.iso(t5)))
+    con.commit()
+    con.close()
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(bridge_app, "SLEEP", _fake_sleep)
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1109/jlt.longcool", "title": "Long Cooldown Paper"})
+    assert slept == []
+    assert resp.status_code == 503 and resp.json()["error_code"] == "selftest_required"
+
+
 def test_ladder_all_tiers_rate_blocked_429_min_retry(cfg):
     """Every tier in cooldown ⇒ 429 with the SMALLEST retry_after (direct_fetch's)."""
     _seed_sandbox_mode(cfg)
