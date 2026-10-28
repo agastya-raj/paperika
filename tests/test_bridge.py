@@ -1295,7 +1295,7 @@ def _tier_download_stub(*, mismatch: bool = False):
 
 
 def _fake_codex_recorder(counter, *, kind="gave_up"):
-    async def _fake(run_dir, prompt, sandbox_mode):
+    async def _fake(run_dir, prompt, sandbox_mode, **_kw):
         counter["n"] += 1
         return executor.ExecResult(kind=kind, notes=f"fake codex {kind}")
     return _fake
@@ -1755,7 +1755,7 @@ def test_codex_confirmed_bot_wall_populates_manual_with_no_prior_wall(cfg, monke
     classifier, current_url comes from exec_result.final_url."""
     _seed_sandbox_mode(cfg)
 
-    async def _fake_codex_bot_wall(run_dir, prompt, sandbox_mode):
+    async def _fake_codex_bot_wall(run_dir, prompt, sandbox_mode, **_kw):
         return executor.ExecResult(
             kind="bot_wall", final_url="https://pub.example/codex-wall", notes="codex bot wall"
         )
@@ -1788,7 +1788,7 @@ def test_codex_confirmed_bot_wall_with_null_final_url_falls_back_to_request_url(
     ladder started from) — never a bare NULL when a usable URL is available."""
     _seed_sandbox_mode(cfg)
 
-    async def _fake_codex_bot_wall_null_url(run_dir, prompt, sandbox_mode):
+    async def _fake_codex_bot_wall_null_url(run_dir, prompt, sandbox_mode, **_kw):
         return executor.ExecResult(kind="bot_wall", final_url=None, notes="codex bot wall, no url")
     monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_bot_wall_null_url)
 
@@ -1818,7 +1818,7 @@ def test_codex_confirmed_bot_wall_after_deterministic_walls_names_both_tiers(cfg
     async def _wall_scripted(**kwargs):
         return scripted_browser.ScriptedFetchResult(kind="wall", final_url="https://pub.example/tier2-wall")
 
-    async def _fake_codex_bot_wall(run_dir, prompt, sandbox_mode):
+    async def _fake_codex_bot_wall(run_dir, prompt, sandbox_mode, **_kw):
         return executor.ExecResult(
             kind="bot_wall", final_url="https://pub.example/codex-wall", notes="codex bot wall"
         )
@@ -1888,7 +1888,7 @@ def test_post_escalation_codex_failure_does_not_discard_wall_evidence(cfg, monke
     async def _wall_scripted(**kwargs):
         return scripted_browser.ScriptedFetchResult(kind="wall", final_url="https://pub.example/tier2-wall")
 
-    async def _fake_codex_died(run_dir, prompt, sandbox_mode):
+    async def _fake_codex_died(run_dir, prompt, sandbox_mode, **_kw):
         return executor.ExecResult(kind="executor_died", notes="codex crashed mid-turn")
 
     monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _wall_direct)
@@ -2606,8 +2606,12 @@ def test_claude_key_never_reaches_db_error_json_or_logs(cfg, monkeypatch, caplog
 def test_request_budget_pinned_under_kc_client_timeout():
     kc_timeout = 1200
     assert bridge_app.REQUEST_BUDGET_SECONDS < kc_timeout
-    # tiers 1+2 and codex's own wall always fit, so codex is never cut short
-    assert (bridge_app.TIER1_BUDGET + bridge_app.TIER2_BUDGET + executor.EXEC_WALL_SECONDS
+    # the Elsevier step + tiers 1+2 leave room for a minimum-wall tier 3 plus the
+    # cleanup reserve; codex's wall is capped by the deadline (AGA-1462), so the
+    # total can never exceed the budget however slow the early stages are
+    pre = (bridge_app.elsevier_api.BUDGET_SECONDS + bridge_app.TIER1_BUDGET
+           + bridge_app.TIER2_BUDGET)
+    assert (pre + bridge_app.FALLBACK_MIN_SECONDS + bridge_app.CLEANUP_RESERVE_SECONDS
             < bridge_app.REQUEST_BUDGET_SECONDS)
     # a fallback that starts at the minimum still has a positive wall after the reserve
     assert bridge_app.FALLBACK_MIN_SECONDS - bridge_app.CLEANUP_RESERVE_SECONDS > 0
@@ -2637,7 +2641,7 @@ def test_fallback_skipped_when_less_than_minimum_remains(cfg, monkeypatch):
     monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind="executor_died"))
     monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude))
     # deadline = 0 + 1140; by the post-salvage/recovery re-check only 100 s remain (< 180)
-    _clock(monkeypatch, 0, 1040)
+    _clock(monkeypatch, 0, 0, 1040)
     client = TestClient(bridge_app.create_app(cfg))
     resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.dl1", "title": "Deadline One"})
     assert claude["n"] == 0 and resp.json()["error_code"] == "executor_died"
@@ -2655,7 +2659,7 @@ def test_fallback_wall_is_capped_to_remaining_minus_tail(cfg, monkeypatch):
         return executor.ExecResult(kind="paywalled_no_access", notes="n")
     monkeypatch.setattr(bridge_app, "run_claude", _claude)
     # deadline 1140; at the re-check (right before the claude row) remaining = 300
-    _clock(monkeypatch, 0, 840)
+    _clock(monkeypatch, 0, 0, 840)
     client = TestClient(bridge_app.create_app(cfg))
     client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.dl2", "title": "Deadline Two"})
     assert walls == [180.0]  # min(900, 300 - CLEANUP_RESERVE_SECONDS)
@@ -2734,7 +2738,7 @@ def test_claude_wall_leaves_cleanup_reserve_and_recovery_skipped_past_deadline(c
     monkeypatch.setattr(bridge_app, "run_claude", _claude)
 
     # put the clock at 810 s elapsed (330 remaining) once codex is done
-    async def _codex(run_dir, prompt, sandbox_mode):
+    async def _codex(run_dir, prompt, sandbox_mode, **_kw):
         t["now"] = 810.0
         return executor.ExecResult(kind="executor_died", notes="codex died")
     monkeypatch.setattr(bridge_app, "run_codex", _codex)
@@ -2813,7 +2817,8 @@ def test_missing_claude_cli_is_retryable_not_a_crash(tmp_path, monkeypatch):
 
 # ------------------------------------- AGA-1462: Elsevier Article Retrieval API ---
 
-ELS_KEY = "els-SUPERSECRET-key-0123456789abcdef"
+_REAL_ELSEVIER_KEY_FN = executor.elsevier_api_key
+ELS_KEY = "elsSUPERSECRETkey0123456789abcdef"
 ELS_DOI = "10.1016/j.example.2026.01.001"
 ELS_TITLE = "Elsevier Entitled Paper On Optical Networks"
 
@@ -3013,3 +3018,133 @@ def test_load_secret_generic_env_and_cache(monkeypatch, tmp_path):
         assert executor.elsevier_api_key() == ELS_KEY
     finally:
         executor.reset_anthropic_key_cache()
+
+
+# ------------------------------- AGA-1462 review fixes (Codex round 1) ---------
+
+
+def _els_state(cfg, **fields):
+    path = cfg.db_path.parent / "bridge_state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(fields), encoding="utf-8")
+
+
+@pytest.mark.parametrize("raw", ["abc123 def", "caf\u00e9key123", "abc-123"])
+def test_malformed_elsevier_key_is_treated_as_absent_and_never_logged(
+        monkeypatch, tmp_path, caplog, raw):
+    monkeypatch.setenv("ELSEVIER_API_KEY", raw)
+    monkeypatch.setattr(executor, "SECRETS_ENV_CACHE", tmp_path / "nope")
+    executor.reset_anthropic_key_cache()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            logging.getLogger("httpx").setLevel(logging.DEBUG)
+            logging.getLogger("httpcore").setLevel(logging.DEBUG)
+            assert _REAL_ELSEVIER_KEY_FN() is None
+        assert raw not in caplog.text
+        assert "ELSEVIER_API_KEY" in caplog.text
+    finally:
+        executor.reset_anthropic_key_cache()
+
+
+def test_elsevier_key_from_cache_is_stripped(monkeypatch, tmp_path):
+    cache = tmp_path / "secrets_env"
+    cache.write_text(f"export ELSEVIER_API_KEY='{ELS_KEY}  '\n", encoding="utf-8")
+    monkeypatch.delenv("ELSEVIER_API_KEY", raising=False)
+    monkeypatch.setattr(executor, "SECRETS_ENV_CACHE", cache)
+    executor.reset_anthropic_key_cache()
+    try:
+        assert _REAL_ELSEVIER_KEY_FN() == ELS_KEY
+    finally:
+        executor.reset_anthropic_key_cache()
+
+
+def test_elsevier_header_construction_error_is_a_miss_and_ladder_continues(cfg, els, monkeypatch, caplog):
+    bad = "k\u00e9y-NONASCII"
+    monkeypatch.setattr(executor, "elsevier_api_key", lambda: bad)  # bypasses load validation
+    with caplog.at_level(logging.DEBUG):
+        _, resp = _els_post(cfg)
+    assert resp.status_code == 200 and resp.headers["X-Paperika-Tier"] == "direct_fetch"
+    assert _els_rows(cfg) == [("elsevier_api", "error")]  # finalised, not left running
+    assert bad not in caplog.text and bad.encode() not in cfg.db_path.read_bytes()
+    con = _conn(cfg)
+    assert con.execute("SELECT COUNT(*) FROM paper_requests WHERE status='in_progress'").fetchone()[0] == 0
+    con.close()
+
+
+def test_capped_regular_tiers_do_not_block_available_elsevier(cfg, els, monkeypatch):
+    for strat in ("direct_fetch", "scripted_browser", "codex_bridge", "claude_bridge"):
+        monkeypatch.setitem(limits.RATE_RULES, strat, (0, 0))
+    _, resp = _els_post(cfg)
+    assert resp.status_code == 200 and resp.headers["X-Paperika-Tier"] == "elsevier_api"
+
+
+def test_capped_regular_tiers_and_elsevier_miss_is_429_with_attempt_finalised(cfg, els, monkeypatch):
+    for strat in ("direct_fetch", "scripted_browser", "codex_bridge", "claude_bridge"):
+        monkeypatch.setitem(limits.RATE_RULES, strat, (0, 0))
+    els.handler = lambda req: httpx.Response(404)
+    _, resp = _els_post(cfg)
+    assert resp.status_code == 429 and resp.json()["error_code"] == "rate_limited"
+    assert _els_rows(cfg) == [("elsevier_api", "no_pdf")]
+
+
+def test_elsevier_303_to_cdn_401_does_not_latch(cfg, els):
+    def handler(req):
+        if req.url.host == "api.elsevier.com":
+            return httpx.Response(303, headers={"location": "https://cdn.example.org/p.pdf"})
+        return httpx.Response(401)
+    els.handler = handler
+    client, resp = _els_post(cfg)
+    assert resp.headers["X-Paperika-Tier"] == "direct_fetch"
+    assert client.get("/healthz", headers=_auth()).json()["elsevier"]["key_invalid"] is False
+
+
+def test_elsevier_200_non_pdf_clears_existing_latch(cfg, els):
+    _els_state(cfg, elsevier_key_invalid=True)
+    els.handler = lambda req: httpx.Response(200, headers={"content-type": "text/html"},
+                                             content=b"<html>" + b"x" * 20_000)
+    client, resp = _els_post(cfg)
+    assert resp.headers["X-Paperika-Tier"] == "direct_fetch"
+    assert client.get("/healthz", headers=_auth()).json()["elsevier"]["key_invalid"] is False
+
+
+def test_codex_wall_is_capped_by_the_request_deadline(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    walls = []
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        walls.append(kw["wall_seconds"])
+        return executor.ExecResult(kind="paywalled_no_access", notes="n")
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    _clock(monkeypatch, 0, 840)  # deadline 1140 -> 300 left -> wall = 300 - 120
+    client = TestClient(bridge_app.create_app(cfg))
+    client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.cw1", "title": "Codex Wall One"})
+    assert walls == [180.0]
+
+
+def test_codex_full_wall_when_budget_is_ample(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    walls = []
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        walls.append(kw["wall_seconds"])
+        return executor.ExecResult(kind="paywalled_no_access", notes="n")
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    _clock(monkeypatch, 0, 0)
+    client = TestClient(bridge_app.create_app(cfg))
+    client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.cw2", "title": "Codex Wall Two"})
+    assert walls == [float(executor.EXEC_WALL_SECONDS)]
+
+
+def test_codex_skipped_retryably_when_deadline_leaves_too_little(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    codex = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex))
+    _clock(monkeypatch, 0, 1000)  # 140 left -> wall 20 < 180
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.cw3", "title": "Codex Wall Three"})
+    assert codex["n"] == 0
+    assert resp.status_code == 429 and resp.json()["error_code"] == "cooldown"
+    con = _conn(cfg)
+    assert con.execute("SELECT COUNT(*) FROM paper_requests WHERE status='in_progress'").fetchone()[0] == 0
+    con.close()

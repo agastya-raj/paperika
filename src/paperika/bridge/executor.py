@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -448,7 +449,8 @@ def classify(
 
 
 def build_argv(
-    run_dir: Path, prompt: str, sandbox_mode: str, *, with_schema: bool = True
+    run_dir: Path, prompt: str, sandbox_mode: str, *, with_schema: bool = True,
+    wall_seconds: float = EXEC_WALL_SECONDS,
 ) -> list[str]:
     """Construct the timeout-wrapped codex exec argv (§2.4).
 
@@ -462,7 +464,7 @@ def build_argv(
     )
     return [
         "timeout",
-        str(EXEC_WALL_SECONDS),
+        str(int(wall_seconds)),
         CODEX_BIN,
         "exec",
         "--skip-git-repo-check",
@@ -540,8 +542,9 @@ async def run_codex(
     *,
     write_schema: bool = True,
     env: dict[str, str] | None = None,
+    wall_seconds: float = EXEC_WALL_SECONDS,
 ) -> ExecResult:
-    """Spawn ``timeout <EXEC_WALL_SECONDS> codex exec ...`` with
+    """Spawn ``timeout <wall_seconds=EXEC_WALL_SECONDS> codex exec ...`` with
     start_new_session=True; on overrun killpg the whole process group (codex +
     spawned venv python).
 
@@ -550,7 +553,9 @@ async def run_codex(
     run_dir.mkdir(parents=True, exist_ok=True)
     if write_schema:
         write_outcome_schema(run_dir)
-    argv = build_argv(run_dir, prompt, sandbox_mode, with_schema=write_schema)
+    argv = build_argv(
+        run_dir, prompt, sandbox_mode, with_schema=write_schema, wall_seconds=wall_seconds
+    )
 
     run_env = dict(os.environ)
     run_env.pop(ANTHROPIC_KEY_ENV, None)  # codex never needs the claude fallback's key
@@ -560,7 +565,7 @@ async def run_codex(
     # CODEX_HOME intentionally NOT set here; codex resolves /home/agastya/.codex.
 
     stdout, stderr, exit_code, timed_out, wall = await _spawn(
-        argv, run_dir, run_env, wait_seconds=EXEC_WALL_SECONDS + KILL_GRACE_SECONDS
+        argv, run_dir, run_env, wait_seconds=wall_seconds + KILL_GRACE_SECONDS
     )
     events = _parse_events(stdout)
     try:
@@ -668,7 +673,7 @@ def _read_key_from_secrets_cache(path: Path, name: str = ANTHROPIC_KEY_ENV) -> s
             parts = shlex.split(raw, posix=True)
         except ValueError:
             return None
-        return parts[0] if parts else None
+        return parts[0].strip() if parts else None
     return None
 
 
@@ -690,13 +695,34 @@ def anthropic_api_key() -> str | None:
     return load_secret(ANTHROPIC_KEY_ENV)
 
 
+_ELSEVIER_KEY_SHAPE = re.compile(r"[A-Za-z0-9]+")
+_els_warned = False
+
+
 def elsevier_api_key() -> str | None:
     """The Elsevier Article Retrieval API key (AGA-1462); sent only as the
-    ``X-ELS-APIKey`` header to api.elsevier.com. ``None`` ⇒ the strategy is skipped."""
-    return load_secret(ELSEVIER_KEY_ENV)
+    ``X-ELS-APIKey`` header to api.elsevier.com. ``None`` ⇒ the strategy is skipped.
+    A key that is not a plain alphanumeric token is treated as ABSENT (a malformed
+    header value would otherwise reach httpx/httpcore, which log it verbatim); the
+    warning names the variable, never the value."""
+    global _els_warned
+    key = load_secret(ELSEVIER_KEY_ENV)
+    if key is None:
+        return None
+    if not (key.isascii() and _ELSEVIER_KEY_SHAPE.fullmatch(key)):
+        if not _els_warned:
+            _els_warned = True
+            logging.getLogger(__name__).warning(
+                "%s is set but is not a plain alphanumeric token; Elsevier API step disabled",
+                ELSEVIER_KEY_ENV,
+            )
+        return None
+    return key
 
 
 def reset_anthropic_key_cache() -> None:
+    global _els_warned
+    _els_warned = False
     _key_cache.clear()
 
 

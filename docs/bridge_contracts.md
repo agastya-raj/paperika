@@ -256,7 +256,7 @@ tier 3 is bounded by `executor.EXEC_WALL_SECONDS`):
 
 | Tier | Strategy label | Mechanism | Budget |
 |------|----------------|-----------|--------|
-| 0 | `elsevier_api` | `elsevier_api.attempt_elsevier_fetch` — only for `10.1016/` DOIs, only with `ELSEVIER_API_KEY` (env, else `~/.cache/secrets_env`): `GET api.elsevier.com/content/article/doi/{doi}` (`X-ELS-APIKey`, `Accept: application/pdf`, no auto-redirect; a 302/303 Location is fetched WITHOUT the key through the SSRF guard) | 60 s |
+| 0 | `elsevier_api` | `elsevier_api.attempt_elsevier_fetch` — only for `10.1016/` DOIs, only with `ELSEVIER_API_KEY` (env, else `~/.cache/secrets_env`): `GET api.elsevier.com/content/article/doi/{doi}` (`X-ELS-APIKey`, `Accept: application/pdf`, no auto-redirect; a 302/303 Location is fetched WITHOUT the key through the SSRF guard) | 30 s |
 | 1 | `direct_fetch` | `direct_fetch.attempt_direct_fetch` — authenticated HTTP GET of the DOI redirect chain + a `citation_pdf_url`/per-publisher ruleset, Chrome cookies exported over CDP | 60 s |
 | 2 | `scripted_browser` | `scripted_browser.attempt_scripted_fetch` — deterministic Playwright over the managed CDP Chrome (no LLM) | 45 s |
 | 3 | `codex_bridge` | `executor.run_codex` — the LLM-steered browser session (`codex exec -m gpt-6.1-sol`, high effort, fast tier) | 900 s |
@@ -266,7 +266,12 @@ tier 3 is bounded by `executor.EXEC_WALL_SECONDS`):
 write-ahead attempt row. It only succeeds or misses: 403/404/202/429/non-PDF/network error/
 identity-gate failure (quarantined) all fall through to tier 1 unchanged, never a verdict;
 a 401 also falls through and latches `elsevier_key_invalid` in bridge state (cleared by the
-next 200). A missing key or a rate-blocked strategy skips it silently. Success carries
+next 2xx/3xx from api.elsevier.com itself, before the PDF gate; a 401 from a redirect
+target never latches). The key must be a plain alphanumeric token (whitespace stripped at
+load); anything else is treated as absent with a warning naming the variable. Any
+exception inside the fetch is a miss, so the ladder always continues and the attempt row
+is finalised. The step counts as an available tier in the all-tiers-rate-limited
+pre-flight when it applies. A missing key or a rate-blocked strategy skips it silently. Success carries
 `X-Paperika-Tier: elsevier_api`. **Provenance:** the `paper_attempts` row with strategy
 `elsevier_api` + outcome `completed` is the ledger of API-fetched papers (for purge on
 termination). `/healthz` gains `elsevier: {key_present, key_invalid, attempts_today}`.
@@ -357,8 +362,10 @@ New `error_code`s: `claude_auth` (503, operator), `claude_budget` (502, retryabl
 download not found" (was `codex_gave_up`).
 
 **Request budget.** KC's client timeout is 1200 s, so `/download` carries one
-deadline (`app.REQUEST_BUDGET_SECONDS` = 1140) set when the ladder starts. Tiers
-1+2+codex's wall (60+45+900 = 1005 s) always fit. The claude fallback only starts
+deadline (`app.REQUEST_BUDGET_SECONDS` = 1140) set when the ladder starts. Elsevier (30 s) + tiers
+1+2 (60+45 s) run first; codex's wall is capped like claude's: `min(900, remaining -
+CLEANUP_RESERVE_SECONDS)`, and when that is below `FALLBACK_MIN_SECONDS` tier 3 is not run
+(retryable `429 cooldown`, `retry_after_seconds` 30). The claude fallback only starts
 when at least `FALLBACK_MIN_SECONDS` (180) remain, re-checked right before the
 claude attempt row is created (i.e. AFTER codex's salvage and Chrome recovery, which
 can consume budget); otherwise codex's retryable failure stands and no claude row is

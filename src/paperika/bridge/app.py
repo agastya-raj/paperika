@@ -61,6 +61,7 @@ SWEEP_WINDOW_SECONDS = executor.EXEC_WALL_SECONDS + 30
 # salvage + Chrome recovery), with its wall capped at remaining - CLEANUP_RESERVE_SECONDS.
 REQUEST_BUDGET_SECONDS = 1140
 FALLBACK_MIN_SECONDS = 180
+TIER3_SKIP_RETRY_SECONDS = 30
 # Time held back at the end of the budget for everything that runs AFTER a claude
 # attempt's wall: salvage drain (10) + PDF verification (~20) + Chrome recovery
 # (~70) + margin. The claude wall is capped to remaining - this.
@@ -965,9 +966,14 @@ async def _download_locked(
     rate_strats = ("direct_fetch", "scripted_browser", "codex_bridge") + (
         ("claude_bridge",) if claude_ready else ()
     )
+    # AGA-1462: the Elsevier API step counts as an available tier when it applies
+    # (10.1016/ DOI, valid key, its own rate rule allows it).
+    els_key = executor.elsevier_api_key() if elsevier_api.applies_to(doi) else None
     with bridge.db.transaction() as conn:
         rate = {strat: limits.check_rate(conn, strat) for strat in rate_strats}
-    if all(not d.allowed for d in rate.values()):
+        els_allowed = bool(els_key) and limits.check_rate(conn, "elsevier_api").allowed
+    regular_blocked = all(not d.allowed for d in rate.values())
+    if regular_blocked and not els_allowed:
         retry = [d.retry_after_seconds for d in rate.values() if d.retry_after_seconds is not None]
         extra = {"retry_after_seconds": min(retry)} if retry else {}
         return _json_error(429, "rate_limited", "all download tiers are rate-limited", **extra)
@@ -1076,25 +1082,25 @@ async def _download_locked(
     # --- AGA-1462: Elsevier Article Retrieval API, before tier 1, 10.1016/ DOIs only.
     # Deterministic; success returns, every miss falls through (never a verdict).
     # An absent key or a rate-blocked strategy skips it silently.
-    if elsevier_api.applies_to(doi):
-        els_key = executor.elsevier_api_key()
-        if els_key:
-            with bridge.db.transaction() as conn:
-                els_rate = limits.check_rate(conn, "elsevier_api")
-            if els_rate.allowed:
-                request_id, run_dir = ensure_request()
-                outcome = await _run_deterministic_tier(
-                    bridge, strategy="elsevier_api",
-                    fetch_fn=functools.partial(
-                        elsevier_api.attempt_elsevier_fetch, api_key=els_key,
-                        set_key_invalid=lambda bad: _set_elsevier_key_invalid(bridge, bad),
-                    ),
-                    budget=elsevier_api.BUDGET_SECONDS, request_id=request_id,
-                    run_dir=run_dir, doi=doi, title=title, start_url=start_url,
-                )
-                if isinstance(outcome, Response):
-                    return outcome
-                tier_kinds["elsevier_api"] = outcome
+    if els_allowed and els_key:
+        request_id, run_dir = ensure_request()
+        outcome = await _run_deterministic_tier(
+            bridge, strategy="elsevier_api",
+            fetch_fn=functools.partial(
+                elsevier_api.attempt_elsevier_fetch, api_key=els_key,
+                set_key_invalid=lambda bad: _set_elsevier_key_invalid(bridge, bad),
+            ),
+            budget=elsevier_api.BUDGET_SECONDS, request_id=request_id,
+            run_dir=run_dir, doi=doi, title=title, start_url=start_url,
+        )
+        if isinstance(outcome, Response):
+            return outcome
+        tier_kinds["elsevier_api"] = outcome
+    if regular_blocked:
+        # Only the Elsevier step was available and it missed.
+        return finalize_if_created(
+            _json_error(429, "rate_limited", "all download tiers are rate-limited")
+        )
 
     # --- tier 1: direct HTTP fetch (no Chrome-health requirement) ---
     if rate["direct_fetch"].allowed:
@@ -1127,12 +1133,22 @@ async def _download_locked(
     )
     codex_ready = rate["codex_bridge"].allowed and bool(state.sandbox_mode) and chrome_ok
     claude_go = claude_ready and rate["claude_bridge"].allowed and chrome_ok
+    codex_wall = float(executor.EXEC_WALL_SECONDS)
     if codex_ready or claude_go:
+        # AGA-1462: the deadline caps codex's wall exactly like claude's. Too little
+        # left for a useful run (< FALLBACK_MIN_SECONDS of wall): tier 3 is not run
+        # and the request ends retryably, as for a rate-skipped tier.
+        codex_wall = min(codex_wall, deadline - MONOTONIC() - CLEANUP_RESERVE_SECONDS)
+        if codex_wall < FALLBACK_MIN_SECONDS:
+            return finalize_if_created(
+                _json_error(429, "cooldown", "request budget exhausted before tier 3",
+                            retry_after_seconds=TIER3_SKIP_RETRY_SECONDS)
+            )
         request_id, run_dir = ensure_request()
         return await _run_tier3(
             bridge, request_id=request_id, run_dir=run_dir, doi=doi, title=title,
             start_url=start_url, sandbox_mode=state.sandbox_mode if codex_ready else None,
-            claude_go=claude_go, deadline=deadline,
+            claude_go=claude_go, deadline=deadline, codex_wall=codex_wall,
         )
 
     # Codex is unavailable. Both deterministic tiers hitting a wall is the one
@@ -1229,6 +1245,7 @@ _FALLBACK_KINDS = {"executor_died", "timeout", "auth_error", "codex_quota"}
 async def _run_tier3(
     bridge: Bridge, *, request_id: int, run_dir: Path, doi: str, title: str,
     start_url: str, sandbox_mode: str | None, claude_go: bool, deadline: float,
+    codex_wall: float = float(executor.EXEC_WALL_SECONDS),
 ) -> Response:
     """Tier 3 driver chain (AGA-1460): codex first when usable, claude as the
     automatic fallback. ``sandbox_mode=None`` means codex is unusable (no selftest /
@@ -1238,7 +1255,7 @@ async def _run_tier3(
         response = await _run_executor_attempt(
             bridge, driver="codex", request_id=request_id, run_dir=run_dir, doi=doi,
             title=title, start_url=start_url, sandbox_mode=sandbox_mode,
-            defer_failure=claude_go, deadline=deadline, pending=pending,
+            defer_failure=claude_go, deadline=deadline, pending=pending, codex_wall=codex_wall,
         )
         if response is not None:
             return response
@@ -1266,6 +1283,7 @@ async def _run_executor_attempt(
     bridge: Bridge, *, driver: str, request_id: int, run_dir: Path, doi: str, title: str,
     start_url: str, sandbox_mode: str | None, defer_failure: bool, deadline: float, api_key: str | None = None,
     claude_wall: float = float(executor.EXEC_WALL_SECONDS),
+    codex_wall: float = float(executor.EXEC_WALL_SECONDS),
     pending: dict[str, Any] | None = None,
 ) -> Response | None:
     """One tier-3 executor attempt (``driver`` = codex | claude). Writes its own
@@ -1287,7 +1305,9 @@ async def _run_executor_attempt(
         # row, notification or HTTP error detail.
         exec_result.notes = executor.redact_secret(exec_result.notes, api_key)
     else:
-        exec_result = await run_codex(run_dir, prompt, sandbox_mode or "")
+        exec_result = await run_codex(
+            run_dir, prompt, sandbox_mode or "", wall_seconds=codex_wall
+        )
     ended = _utc_now()
     screenshot = str(run_dir / "final.png") if (run_dir / "final.png").exists() else None
     if exec_result.cost_usd is not None:

@@ -28,7 +28,7 @@ log = logging.getLogger("paperika.bridge.elsevier_api")
 
 ELSEVIER_DOI_PREFIX = "10.1016/"
 API_URL = "https://api.elsevier.com/content/article/doi/"
-BUDGET_SECONDS = 60.0
+BUDGET_SECONDS = 30.0
 _RATE_HEADER_PREFIXES = ("x-els-status", "x-ratelimit-")
 
 
@@ -60,7 +60,14 @@ async def _fetch(
         async with client.stream("GET", url, headers={"X-ELS-APIKey": api_key}) as resp:
             status = resp.status_code
             location = resp.headers.get("location") if resp.is_redirect else None
-            rate_info = _rate_headers(resp.headers)
+            rate_info = _rate_headers(resp.headers) if status == 429 else {}
+            # Key health tracks ONLY the keyed request to api.elsevier.com: a 401
+            # latches, any 2xx/3xx (auth accepted) clears — before the PDF gate.
+            if status == 401:
+                log.warning("elsevier_api: API key rejected (401); refresh ELSEVIER_API_KEY")
+                set_key_invalid(True)
+            elif 200 <= status < 400:
+                set_key_invalid(False)
             body = b"" if (location or status != 200) else await direct_fetch._read_capped(resp)
             final_url = str(resp.url)
         if location:
@@ -68,9 +75,7 @@ async def _fetch(
             target = str(httpx.URL(url).join(location))
             status, body, final_url = await direct_fetch._get(client, target)
     if status == 401:
-        log.warning("elsevier_api: API key rejected (401); refresh ELSEVIER_API_KEY")
-        set_key_invalid(True)
-        return _miss("key rejected (401)")
+        return _miss("HTTP 401 from the redirect target" if location else "key rejected (401)")
     if status == 429:
         log.warning("elsevier_api: quota/rate limited (429) %s", rate_info)
         return _miss("rate limited (429)")
@@ -78,7 +83,6 @@ async def _fetch(
         return _miss(f"HTTP {status}")
     if not direct_fetch._passes_pdf_gate(body):
         return _miss("200 but not a PDF")
-    set_key_invalid(False)
     return direct_fetch._land(download_dir, doi, body, final_url, [], note="elsevier api")
 
 
@@ -103,7 +107,6 @@ async def attempt_elsevier_fetch(
             )
     except TimeoutError:
         return _miss("budget exceeded", "error")
-    except httpx.HTTPError as exc:
-        return _miss(type(exc).__name__, "error")
-    except OSError as exc:
+    except Exception as exc:  # noqa: BLE001 - any failure is a miss; the ladder continues
+        # Type name only: exception text can carry header values (the key).
         return _miss(type(exc).__name__, "error")
