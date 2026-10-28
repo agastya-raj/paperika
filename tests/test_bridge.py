@@ -2753,3 +2753,23 @@ def test_deferred_recovery_runs_before_browser_work_on_next_request(cfg, monkeyp
     client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.r3a", "title": "Round Three A"})
     assert recovered["n"] >= 1
     assert app.state.bridge.recovery_pending is False
+
+
+def test_failed_deferred_recovery_keeps_the_latch_and_gates_browser_tiers(cfg, monkeypatch):
+    """Codex round 4: a deferred recovery that fails keeps recovery_pending and no
+    browser tier runs even though CDP probes healthy."""
+    async def _recover():
+        return chrome.RecoveryResult(False, "unrecovered")
+    monkeypatch.setattr(chrome, "recover", _recover)
+    scripted = {"n": 0}
+
+    async def _scripted(*a, **kw):
+        scripted["n"] += 1
+        raise AssertionError("browser tier must not run while recovery is pending")
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _scripted)
+    app = bridge_app.create_app(cfg)
+    app.state.bridge.recovery_pending = True
+    client = TestClient(app)
+    client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.r4a", "title": "Round Four A"})
+    assert app.state.bridge.recovery_pending is True
+    assert scripted["n"] == 0

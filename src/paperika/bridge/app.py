@@ -984,14 +984,18 @@ async def _download_locked(
     if bridge.recovery_pending:
         rec = await chrome.recover()
         bridge.state_store.update(last_recovery_action=rec.action)
-        bridge.recovery_pending = False
+        # Cleared only by a successful recovery; until then the browser tiers are
+        # gated off as if Chrome were down (an orphan page may still be alive).
+        bridge.recovery_pending = not rec.recovered
     await chrome.idle_recycle_if_stale()
     probe = await chrome.probe(fresh=True)
-    chrome_ok = probe.ok
+    chrome_ok = probe.ok and not bridge.recovery_pending
     if not chrome_ok:
-        await chrome.recover()
+        rec = await chrome.recover()
+        if rec.recovered:
+            bridge.recovery_pending = False
         probe = await chrome.probe(fresh=True)
-        chrome_ok = probe.ok
+        chrome_ok = probe.ok and not bridge.recovery_pending
 
     # 6. write-ahead bookkeeping is lazy — the FIRST tier that actually runs
     # materializes the request + run_dir, so a fully-gated request (no eligible
