@@ -83,6 +83,13 @@ def _stub_tiers(monkeypatch):
     monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _miss_scripted)
 
 
+@pytest.fixture(autouse=True)
+def _no_claude_key(monkeypatch):
+    """Default: the claude fallback is UNAVAILABLE (no key), regardless of the
+    developer's real env / ~/.cache/secrets_env. Driver-chain tests opt in."""
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: None)
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -645,7 +652,7 @@ def test_executor_argv_pins_model_effort_and_service_tier(cfg, tmp_path, monkeyp
     import asyncio
     asyncio.run(executor.run_codex(run_dir, "prompt", "workspace-write"))
     argv = json.loads((run_dir / "argv.json").read_text())
-    assert argv[argv.index("-m") + 1] == "gpt-5.6-sol"
+    assert argv[argv.index("-m") + 1] == "gpt-6.1-sol"
     assert 'model_reasoning_effort="high"' in argv
     assert 'service_tier="fast"' in argv
 
@@ -1170,21 +1177,21 @@ def test_download_rejects_out_of_tree_file_path_and_never_moves_it(cfg, tmp_path
     monkeypatch.setenv("STUB_PDF_PATH", str(outside))
     client = TestClient(bridge_app.create_app(cfg))
     resp = client.post("/download", headers=_auth(), json={"doi": doi, "title": title})
-    # not served, and classified retryable (codex_gave_up), NOT terminal wrong_paper
+    # not served, and classified retryable (executor_died, AGA-490), NOT terminal wrong_paper
     assert resp.status_code == 502, resp.text
-    assert resp.json()["error_code"] == "codex_gave_up"
+    assert resp.json()["error_code"] == "executor_died"
     # the out-of-tree file is untouched: still present, never moved into any quarantine/
     assert outside.exists()
     assert not list(tmp_path.rglob("quarantine"))
     con = _conn(cfg)
     att = con.execute("SELECT outcome FROM paper_attempts ORDER BY id DESC LIMIT 1").fetchone()
-    assert att["outcome"] == "executor_gave_up"
+    assert att["outcome"] == "executor_died"
     con.close()
 
 
-def test_download_reported_no_file_is_codex_gave_up_not_wrong_paper(cfg, tmp_path, monkeypatch):
+def test_download_reported_no_file_is_executor_died_not_wrong_paper(cfg, tmp_path, monkeypatch):
     """Finding 4a: codex reports outcome=downloaded with NO locatable file ⇒ a
-    retryable executor failure (codex_gave_up), not terminal wrong_paper — no
+    retryable executor_died (AGA-490), not terminal wrong_paper — no
     identity verification ever ran."""
     _seed_sandbox_mode(cfg)
     _install_stub_codex(tmp_path, monkeypatch, script_body=_STUB_DOWNLOADED)
@@ -1193,7 +1200,12 @@ def test_download_reported_no_file_is_codex_gave_up_not_wrong_paper(cfg, tmp_pat
     client = TestClient(bridge_app.create_app(cfg))
     resp = client.post("/download", headers=_auth(),
                        json={"doi": "10.1364/jocn.ghost", "title": "Ghost Paper"})
-    assert resp.status_code == 502 and resp.json()["error_code"] == "codex_gave_up"
+    # AGA-490: a claimed download with no file is a death (retryable), not a verdict.
+    assert resp.status_code == 502 and resp.json()["error_code"] == "executor_died"
+    con = _conn(cfg)
+    att = con.execute("SELECT outcome, message FROM paper_attempts ORDER BY id DESC LIMIT 1").fetchone()
+    assert att["outcome"] == "executor_died" and "claimed download not found" in att["message"]
+    con.close()
 
 
 def test_salvage_verify_fail_quarantines(cfg, tmp_path, monkeypatch):
@@ -1668,7 +1680,7 @@ def test_healthz_reports_per_strategy_attempts(cfg):
     client = _client(cfg)
     body = client.get("/healthz", headers=_auth()).json()
     assert body["limits"]["attempts_today"] == {
-        "direct_fetch": 2, "scripted_browser": 1, "codex_bridge": 3,
+        "direct_fetch": 2, "scripted_browser": 1, "codex_bridge": 3, "claude_bridge": 0,
     }
     assert body["limits"]["downloads_today"] == 6
 
@@ -2111,3 +2123,404 @@ def test_unexpected_ladder_exception_returns_coded_bridge_error(cfg, monkeypatch
     assert resp2.status_code == 500
     assert resp2.json()["error_code"] == "bridge_error"
     assert calls["n"] == 2
+
+
+# ===================================================== AGA-1460: driver chain ===
+
+CODEX_ARGV_PIN = [
+    "timeout", "900", "codex", "exec", "--skip-git-repo-check",
+    "-c", "mcp_servers={}",
+    "-m", "gpt-6.1-sol",
+    "-c", 'model_reasoning_effort="high"',
+    "-c", 'service_tier="fast"',
+    "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+    "-C", "/r", "--json", "-o", "/r/last_message.txt",
+    "--output-schema", "/r/outcome.schema.json", "PROMPT",
+]
+
+
+def test_codex_full_argv_pinned():
+    assert executor.build_argv(Path("/r"), "PROMPT", "workspace-write") == CODEX_ARGV_PIN
+
+
+def test_claude_full_argv_pinned_and_key_not_in_argv():
+    argv = executor.build_argv_claude(Path("/r"), "PROMPT")
+    assert argv == [
+        "claude", "-p", "--bare", "--tools", "Bash", "--no-session-persistence",
+        "--model", "claude-sonnet-5-5", "--max-budget-usd", "0.60",
+        "--output-format", "json", "--json-schema", json.dumps(executor.OUTCOME_SCHEMA),
+        "--permission-mode", "bypassPermissions", "PROMPT",
+    ]
+    assert "ANTHROPIC" not in " ".join(argv)
+
+
+def _env(**over) -> str:
+    env = {"type": "result", "subtype": "success", "is_error": False,
+           "total_cost_usd": 0.12, "usage": {}, "result": "",
+           "structured_output": {"outcome": "downloaded", "file_path": "/d/x.pdf",
+                                 "final_url": "https://p/x", "notes": "ok"}}
+    env.update(over)
+    return json.dumps(env)
+
+
+def _cc(stdout: str, *, exit_code=0, stderr="", timed_out=False):
+    return executor.classify_claude(
+        exit_code=exit_code, stdout=stdout, stderr=stderr, timed_out=timed_out, wall_seconds=1.0
+    )
+
+
+def test_classify_claude_valid_outcome_maps_like_codex_and_records_cost():
+    r = _cc(_env())
+    assert r.kind == "downloaded" and r.file_path == "/d/x.pdf" and r.cost_usd == 0.12
+    for outcome in ("throttled", "paywalled_no_access", "bot_wall", "gave_up"):
+        so = {"outcome": outcome, "file_path": None, "final_url": None, "notes": "n"}
+        assert _cc(_env(structured_output=so)).kind == outcome
+
+
+def test_classify_claude_result_text_fallback_when_no_structured_output():
+    so = json.dumps({"outcome": "bot_wall", "file_path": None, "final_url": None, "notes": "n"})
+    assert _cc(_env(structured_output=None, result=so)).kind == "bot_wall"
+
+
+@pytest.mark.parametrize("stdout", ["", "not json", "[1]"])
+def test_classify_claude_missing_or_invalid_envelope_is_executor_died(stdout):
+    assert _cc(stdout, exit_code=1).kind == "executor_died"
+
+
+def test_classify_claude_is_error_is_executor_died():
+    assert _cc(_env(is_error=True, result="boom", structured_output=None)).kind == "executor_died"
+
+
+def test_classify_claude_refusal_is_executor_died_not_verdict():
+    r = _cc(_env(stop_reason="refusal", structured_output=None))
+    assert r.kind == "executor_died" and "refus" in r.notes
+
+
+def test_classify_claude_budget_exhausted_is_claude_budget():
+    r = _cc(_env(subtype="error_max_budget_usd", is_error=True, structured_output=None))
+    assert r.kind == "claude_budget"
+
+
+def test_classify_claude_401_is_claude_auth():
+    # real envelope shape captured from claude 2.1.312 with a bad key
+    r = _cc(_env(is_error=True, api_error_status=401, result="Invalid API key · Fix external API key",
+                 structured_output=None, total_cost_usd=0), exit_code=1)
+    assert r.kind == "claude_auth"
+    assert _cc("", exit_code=1, stderr="Invalid API key").kind == "claude_auth"
+
+
+def test_classify_claude_timeout():
+    assert _cc("", timed_out=True).kind == "timeout"
+
+
+def test_taxonomy_new_codes():
+    assert bridge_app._TAXONOMY["claude_auth"][2:] == (503, "claude_auth")
+    assert bridge_app._TAXONOMY["claude_budget"][2:] == (502, "claude_budget")
+    assert bridge_app._TAXONOMY["codex_quota"][2:] == (502, "codex_quota")
+
+
+def test_codex_quota_failure_classified_retryable():
+    events = [{"type": "turn.started"},
+              {"type": "error", "message": "You've hit your usage limit. Try again later."},
+              {"type": "turn.failed", "error": {"message": "usage limit reached"}}]
+    r = executor.classify(exit_code=1, events=events, last_message="", stderr="",
+                          timed_out=False, wall_seconds=1)
+    assert r.kind == "codex_quota"
+
+
+# --- infra-failure markers: gave_up that was really a broken network/browser ---
+
+
+@pytest.mark.parametrize("marker", executor.INFRA_FAILURE_MARKERS)
+def test_codex_gave_up_with_infra_marker_is_executor_died(marker):
+    events = [{"type": "turn.completed"},
+              {"type": "item.completed", "item": {"aggregated_output": f"Error: {marker.upper()} at page.goto"}}]
+    msg = json.dumps({"outcome": "gave_up", "file_path": None, "final_url": None, "notes": "x"})
+    r = executor.classify(exit_code=0, events=events, last_message=msg, stderr="",
+                          timed_out=False, wall_seconds=1)
+    assert r.kind == "executor_died" and marker in r.notes
+
+
+@pytest.mark.parametrize("marker", executor.INFRA_FAILURE_MARKERS)
+def test_gave_up_with_infra_marker_in_notes_is_executor_died_for_claude_too(marker):
+    so = {"outcome": "gave_up", "file_path": None, "final_url": None, "notes": f"saw {marker}"}
+    assert _cc(_env(structured_output=so)).kind == "executor_died"
+
+
+def test_marker_list_covers_the_required_failures():
+    required = {"err_name_not_resolved", "net::err_", "target closed", "browser has been closed",
+                "connection refused"}
+    assert required <= set(executor.INFRA_FAILURE_MARKERS)
+
+
+def test_gave_up_without_infra_marker_stays_terminal():
+    so = {"outcome": "gave_up", "file_path": None, "final_url": None, "notes": "no PDF link anywhere"}
+    assert _cc(_env(structured_output=so)).kind == "gave_up"
+
+
+# --- API key loading: env, secrets_env cache, never logged ---
+
+SECRET = "sk-ant-SUPERSECRET-0123456789"
+
+
+def test_key_loaded_from_env(monkeypatch, caplog):
+    executor.reset_anthropic_key_cache()
+    monkeypatch.undo()  # drop the autouse stub for this module attribute
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+    try:
+        with caplog.at_level("DEBUG"):
+            assert executor.anthropic_api_key() == SECRET
+        assert SECRET not in caplog.text
+    finally:
+        executor.reset_anthropic_key_cache()
+
+
+def test_key_loaded_from_secrets_env_file_and_not_logged(monkeypatch, tmp_path, caplog):
+    cache = tmp_path / "secrets_env"
+    cache.write_text(
+        "export OPENAI_API_KEY='other'\n"
+        f"export ANTHROPIC_API_KEY='{SECRET}'\n"
+        "export GITHUB_TOKEN='x'\n", encoding="utf-8")
+    cache.chmod(0o600)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(executor, "SECRETS_ENV_CACHE", cache)
+    monkeypatch.undo()
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    executor.reset_anthropic_key_cache()
+    assert executor._read_key_from_secrets_cache(cache) == SECRET
+    try:
+        monkeypatch.setattr(executor, "SECRETS_ENV_CACHE", cache)
+        with caplog.at_level("DEBUG"):
+            assert executor.anthropic_api_key() == SECRET
+        assert SECRET not in caplog.text
+    finally:
+        executor.reset_anthropic_key_cache()
+
+
+def test_key_absent_means_unavailable(monkeypatch, tmp_path):
+    monkeypatch.undo()
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(executor, "SECRETS_ENV_CACHE", tmp_path / "nope")
+    executor.reset_anthropic_key_cache()
+    try:
+        assert executor.anthropic_api_key() is None
+    finally:
+        executor.reset_anthropic_key_cache()
+
+
+def test_secrets_cache_parser_handles_quotes_and_missing(tmp_path):
+    f = tmp_path / "s"
+    f.write_text('ANTHROPIC_API_KEY="abc def"\n', encoding="utf-8")
+    assert executor._read_key_from_secrets_cache(f) == "abc def"
+    f.write_text("export OTHER='x'\n", encoding="utf-8")
+    assert executor._read_key_from_secrets_cache(f) is None
+
+
+def test_run_claude_passes_key_only_via_env(tmp_path, monkeypatch):
+    seen = {}
+
+    async def _fake_spawn(argv, run_dir, run_env, *, wait_seconds):
+        seen["argv"], seen["env"] = argv, run_env
+        return _env(), "", 0, False, 0.5
+    monkeypatch.setattr(executor, "_spawn", _fake_spawn)
+    import asyncio
+    r = asyncio.run(executor.run_claude(tmp_path / "run", "P", SECRET))
+    assert r.kind == "downloaded"
+    assert seen["env"]["ANTHROPIC_API_KEY"] == SECRET
+    assert SECRET not in " ".join(seen["argv"])
+
+
+# --- fallback ordering through /download ---
+
+
+def _claude_recorder(counter, *, kind="paywalled_no_access", cost=0.2):
+    async def _fake(run_dir, prompt, api_key):
+        counter["n"] += 1
+        return executor.ExecResult(kind=kind, notes=f"fake claude {kind}", cost_usd=cost)
+    return _fake
+
+
+def _with_key(monkeypatch):
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
+
+
+def _strategies(cfg):
+    con = _conn(cfg)
+    rows = [(r["strategy"], r["outcome"]) for r in con.execute(
+        "SELECT strategy, outcome FROM paper_attempts ORDER BY id").fetchall()]
+    con.close()
+    return rows
+
+
+def test_codex_auth_broken_claude_runs(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    codex, claude = {"n": 0}, {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind="auth_error"))
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.fb1", "title": "Fallback One"})
+    assert (codex["n"], claude["n"]) == (1, 1)
+    assert resp.status_code == 403 and resp.json()["error_code"] == "paywalled_no_access"
+    assert _strategies(cfg)[-2:] == [("codex_bridge", "auth_error"), ("claude_bridge", "no_access")]
+    state = json.loads((cfg.db_path.parent / "bridge_state.json").read_text())
+    assert state["sandbox_mode"] is None  # codex latch still cleared
+
+
+def test_codex_no_sandbox_mode_claude_runs_directly(cfg, monkeypatch):
+    _with_key(monkeypatch)  # no _seed_sandbox_mode: codex unusable
+    codex, claude = {"n": 0}, {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex))
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.fb2", "title": "Fallback Two"})
+    assert (codex["n"], claude["n"]) == (0, 1)
+    assert resp.status_code == 403
+
+
+@pytest.mark.parametrize("codex_kind", ["executor_died", "timeout", "codex_quota"])
+def test_codex_death_falls_back_to_claude(cfg, monkeypatch, codex_kind):
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    codex, claude = {"n": 0}, {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind=codex_kind))
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude, kind="bot_wall"))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.fb3", "title": "Fallback Three"})
+    assert (codex["n"], claude["n"]) == (1, 1)
+    assert resp.json()["error_code"] == "bot_wall"
+    assert _strategies(cfg)[-2][0] == "codex_bridge" and _strategies(cfg)[-1][0] == "claude_bridge"
+
+
+@pytest.mark.parametrize("codex_kind,code", [
+    ("paywalled_no_access", "paywalled_no_access"), ("bot_wall", "bot_wall"),
+    ("gave_up", "codex_gave_up"), ("throttled", "throttled"),
+])
+def test_codex_verdict_never_falls_back(cfg, monkeypatch, codex_kind, code):
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    codex, claude = {"n": 0}, {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind=codex_kind))
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.fb4", "title": "Fallback Four"})
+    assert claude["n"] == 0 and resp.json()["error_code"] == code
+
+
+def test_codex_downloaded_never_falls_back(cfg, tmp_path, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    claude = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude))
+    _install_stub_codex(tmp_path, monkeypatch, script_body=_STUB_DOWNLOADED)
+    pdf = cfg.download_dir / "10.1364_jocn.fb5.pdf"
+    _make_pdf(pdf, doi="10.1364/jocn.fb5", title="Fallback Five Paper")
+    monkeypatch.setenv("STUB_PDF_PATH", str(pdf))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.fb5", "title": "Fallback Five Paper"})
+    assert resp.status_code == 200 and resp.headers["X-Paperika-Tier"] == "codex_bridge"
+    assert claude["n"] == 0
+
+
+def test_claude_unavailable_codex_result_stands(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)  # key stays None via the autouse fixture
+    codex, claude = {"n": 0}, {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind="executor_died"))
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.fb6", "title": "Fallback Six"})
+    assert claude["n"] == 0 and resp.json()["error_code"] == "executor_died"
+    assert [s for s, _ in _strategies(cfg)][-1] == "codex_bridge"
+
+
+def test_claude_delivers_pdf_reports_claude_bridge_tier_and_cost(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder({"n": 0}, kind="executor_died"))
+    doi, title = "10.1364/jocn.fb7", "Fallback Seven Paper"
+
+    async def _claude_downloads(run_dir, prompt, api_key):
+        path = cfg.download_dir / "10.1364_jocn.fb7.pdf"
+        _make_pdf(path, doi=doi, title=title)
+        return executor.ExecResult(kind="downloaded", file_path=str(path), cost_usd=0.31)
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_downloads)
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": doi, "title": title})
+    assert resp.status_code == 200 and resp.headers["X-Paperika-Tier"] == "claude_bridge"
+    con = _conn(cfg)
+    row = con.execute("SELECT cost_usd FROM paper_attempts WHERE strategy='claude_bridge'").fetchone()
+    con.close()
+    assert row["cost_usd"] == pytest.approx(0.31)
+    hz = client.get("/healthz", headers=_auth()).json()
+    assert hz["claude"]["claude_cost_usd"] == pytest.approx(0.31)
+    assert hz["limits"]["attempts_today"]["claude_bridge"] == 1
+
+
+def test_claude_auth_failure_latches_claude_off(cfg, monkeypatch):
+    _with_key(monkeypatch)
+    claude = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude, kind="claude_auth"))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.fb8", "title": "Fallback Eight"})
+    assert resp.status_code == 503 and resp.json()["error_code"] == "claude_auth"
+    state = json.loads((cfg.db_path.parent / "bridge_state.json").read_text())
+    assert state["claude_last_selftest_ok"] is False
+    assert bridge_app._claude_ready(bridge_app.BridgeState(**state)) is False
+
+
+def test_claude_rate_rule_mirrors_codex():
+    assert limits.RATE_RULES["claude_bridge"] == (180, 20)
+
+
+# --- /selftest/claude + healthz ---
+
+
+def test_selftest_claude_ok_persists_state_and_healthz_usable(cfg, monkeypatch):
+    _with_key(monkeypatch)
+
+    async def _fake_selftest(run_dir, api_key, **kw):
+        return executor.SelftestResult(True, wall_seconds=2.0)
+    monkeypatch.setattr(executor, "run_claude_selftest", _fake_selftest)
+    client = TestClient(bridge_app.create_app(cfg))
+    assert client.get("/healthz", headers=_auth()).json()["claude"]["claude_usable"] is False
+    resp = client.post("/selftest/claude", headers=_auth())
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    state = json.loads((cfg.db_path.parent / "bridge_state.json").read_text())
+    assert state["claude_last_selftest_ok"] is True and state["claude_last_selftest_at"]
+    hz = client.get("/healthz", headers=_auth()).json()
+    assert hz["claude"]["claude_usable"] is True and hz["claude"]["claude_cost_usd"] == 0
+    assert "codex_usable" in hz["codex"]
+
+
+def test_selftest_claude_auth_and_missing_key(cfg, monkeypatch):
+    client = TestClient(bridge_app.create_app(cfg))
+    r = client.post("/selftest/claude", headers=_auth())  # no key
+    assert r.status_code == 503 and r.json()["error_code"] == "claude_auth"
+    _with_key(monkeypatch)
+
+    async def _bad(run_dir, api_key, **kw):
+        return executor.SelftestResult(False, error_code="claude_auth", detail="rejected")
+    monkeypatch.setattr(executor, "run_claude_selftest", _bad)
+    r = client.post("/selftest/claude", headers=_auth())
+    assert r.status_code == 503 and r.json()["error_code"] == "claude_auth"
+    assert client.get("/healthz", headers=_auth()).json()["claude"]["claude_usable"] is False
+
+
+def test_selftest_claude_requires_token(cfg):
+    assert TestClient(bridge_app.create_app(cfg)).post("/selftest/claude").status_code == 401
+
+
+def test_run_claude_selftest_pass_criteria(tmp_path, monkeypatch):
+    import asyncio
+
+    async def _ok(run_dir, prompt, key, **kw):
+        return executor.ExecResult(kind="gave_up", notes=executor.CLAUDE_SELFTEST_MARKER)
+    monkeypatch.setattr(executor, "run_claude", _ok)
+    assert asyncio.run(executor.run_claude_selftest(tmp_path, "k")).ok is True
+
+    async def _bad(run_dir, prompt, key, **kw):
+        return executor.ExecResult(kind="executor_died", notes="x")
+    monkeypatch.setattr(executor, "run_claude", _bad)
+    r = asyncio.run(executor.run_claude_selftest(tmp_path, "k"))
+    assert r.ok is False and r.error_code == "executor_failed"

@@ -36,7 +36,7 @@ from ..models import LocateCandidate, ManualIntervention, ParsedInput
 from ..notifications import NotificationEvent, emit_notification_event
 from . import chrome, executor, limits
 from .direct_fetch import attempt_direct_fetch
-from .executor import run_codex
+from .executor import run_claude, run_codex
 from .scripted_browser import attempt_scripted_fetch
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,8 @@ class BridgeState(BaseModel):
     last_selftest_at: str | None = None
     last_variant1_failure_reason: str | None = None
     last_recovery_action: str | None = None
+    claude_last_selftest_ok: bool | None = None
+    claude_last_selftest_at: str | None = None
 
 
 # --- bridge state (persisted) ---------------------------------------------
@@ -155,6 +157,14 @@ _TAXONOMY: dict[str, tuple[str, str, int, str]] = {
     "executor_died": ("executor_died", "executor_failed", 502, "executor_died"),
     "auth_error": ("auth_error", "executor_failed", 503, "codex_auth"),
     "timeout": ("timeout", "executor_failed", 504, "executor_timeout"),
+    # AGA-1460: codex's ChatGPT plan is out of usage. Retryable (the claude fallback
+    # normally absorbs it before the caller sees it).
+    "codex_quota": ("codex_quota", "executor_failed", 502, "codex_quota"),
+    # AGA-1460: the claude fallback's API key was rejected. Operator (KC:
+    # NEEDS_OPERATOR_CODES), like codex_auth.
+    "claude_auth": ("claude_auth", "executor_failed", 503, "claude_auth"),
+    # AGA-1460: the claude run hit its per-run --max-budget-usd. Retryable.
+    "claude_budget": ("claude_budget", "executor_failed", 502, "claude_budget"),
     # AGA-1457: an UNEXPECTED exception escaped the ladder (a bug, not a verdict).
     # 500, non-retryable, operator attention (KC: NEEDS_OPERATOR_CODES). Not an
     # expected-failure channel: expected failures map to the kinds above.
@@ -602,6 +612,8 @@ def _parse_iso(value: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+_STRATEGIES = ("direct_fetch", "scripted_browser", "codex_bridge", "claude_bridge")
+
 # A selftest older than this is treated as stale for the /healthz codex_usable
 # signal — codex auth/CLI can rot silently between requests (a revoked ChatGPT
 # token still leaves auth.json on disk), so a months-old "ok" is not evidence
@@ -624,6 +636,24 @@ def _codex_usable(state: BridgeState) -> bool:
     # state file) would otherwise pass the <= MAX_AGE check and latch codex_usable
     # true until that future instant + MAX_AGE (AGA-493).
     return timedelta(0) <= age <= timedelta(days=SELFTEST_MAX_AGE_DAYS)
+
+
+def _claude_usable(state: BridgeState) -> bool:
+    """Healthz-honest: an API key is available AND a fresh claude selftest passed."""
+    if not (state.claude_last_selftest_ok and executor.anthropic_api_key()):
+        return False
+    last_at = _parse_iso(state.claude_last_selftest_at)
+    if last_at is None:
+        return False
+    return timedelta(0) <= _utc_now() - last_at <= timedelta(days=SELFTEST_MAX_AGE_DAYS)
+
+
+def _claude_ready(state: BridgeState) -> bool:
+    """Fallback gate: a key is available and the last selftest/run did not prove it
+    dead. Deliberately does NOT require a selftest — the fallback must work without
+    an operator step — but a claude_auth failure latches it off (selftest_ok=False)
+    until POST /selftest/claude passes."""
+    return bool(executor.anthropic_api_key()) and state.claude_last_selftest_ok is not False
 
 
 def _db_usable(db: Database) -> bool:
@@ -677,16 +707,18 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
 
         state = bridge.state_store.load()
         downloads_today = None
+        claude_cost = None
         attempts_by_strategy: dict[str, int | None] = {
-            strat: None for strat in ("direct_fetch", "scripted_browser", "codex_bridge")
+            strat: None for strat in _STRATEGIES
         }
         if db_ok:
             with bridge.db.transaction() as conn:
                 downloads_today = limits.attempts_today(conn)
                 attempts_by_strategy = {
                     strat: limits.attempts_today(conn, strat)
-                    for strat in ("direct_fetch", "scripted_browser", "codex_bridge")
+                    for strat in _STRATEGIES
                 }
+                claude_cost = limits.month_cost_usd(conn, "claude_bridge")
         body = {
             "status": status,
             "db": {"ok": db_ok, "path": str(bridge.config.db_path)},
@@ -704,6 +736,13 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 "last_selftest_ok": state.last_selftest_ok,
                 "last_selftest_at": state.last_selftest_at,
                 "sandbox_mode": state.sandbox_mode,
+            },
+            "claude": {
+                "key_present": bool(executor.anthropic_api_key()),
+                "claude_usable": _claude_usable(state),
+                "last_selftest_ok": state.claude_last_selftest_ok,
+                "last_selftest_at": state.claude_last_selftest_at,
+                "claude_cost_usd": claude_cost,
             },
             "limits": {
                 "active_request": "locked" if bridge.lock.locked() else None,
@@ -745,6 +784,36 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
             bridge.state_store.update(last_selftest_ok=False, last_selftest_at=now_iso)
             if result.error_code == "codex_auth":
                 return _json_error(503, "codex_auth", result.detail, ok=False)
+            return _json_error(502, "executor_failed", result.detail, ok=False)
+
+    # --- /selftest/claude (AGA-1460) ---
+
+    @app.post("/selftest/claude")
+    async def selftest_claude(request: Request) -> Response:
+        denied = require_token(request)
+        if denied is not None:
+            return denied
+        api_key = executor.anthropic_api_key()
+        if not api_key:
+            return _json_error(
+                503, "claude_auth", "ANTHROPIC_API_KEY is not available to the bridge", ok=False
+            )
+        if bridge.lock.locked():
+            return _json_error(429, "busy", "a download or selftest is in progress")
+        async with bridge.lock:
+            run_dir = bridge.config.db_path.parent / "codex_runs" / "selftest_claude"
+            result = await executor.run_claude_selftest(run_dir, api_key)
+            now_iso = _utc_now().isoformat()
+            bridge.state_store.update(
+                claude_last_selftest_ok=result.ok, claude_last_selftest_at=now_iso
+            )
+            if result.ok:
+                return JSONResponse(
+                    status_code=200,
+                    content={"ok": True, "wall_seconds": round(result.wall_seconds, 2)},
+                )
+            if result.error_code == "claude_auth":
+                return _json_error(503, "claude_auth", result.detail, ok=False)
             return _json_error(502, "executor_failed", result.detail, ok=False)
 
     # --- /requests/{id} ---
@@ -862,11 +931,12 @@ async def _download_locked(
     # 4. rate pre-flight across all three strategies. A tier whose strategy is
     # rate-blocked is silently skipped (no attempt row). Only when EVERY tier is
     # blocked do we 429 — with the smallest retry_after among them.
+    claude_ready = _claude_ready(state)
+    rate_strats = ("direct_fetch", "scripted_browser", "codex_bridge") + (
+        ("claude_bridge",) if claude_ready else ()
+    )
     with bridge.db.transaction() as conn:
-        rate = {
-            strat: limits.check_rate(conn, strat)
-            for strat in ("direct_fetch", "scripted_browser", "codex_bridge")
-        }
+        rate = {strat: limits.check_rate(conn, strat) for strat in rate_strats}
     if all(not d.allowed for d in rate.values()):
         retry = [d.retry_after_seconds for d in rate.values() if d.retry_after_seconds is not None]
         extra = {"retry_after_seconds": min(retry)} if retry else {}
@@ -995,11 +1065,13 @@ async def _download_locked(
         and tier_kinds.get("scripted_browser") == "wall"
     )
     codex_ready = rate["codex_bridge"].allowed and bool(state.sandbox_mode) and chrome_ok
-    if codex_ready:
+    claude_go = claude_ready and rate["claude_bridge"].allowed and chrome_ok
+    if codex_ready or claude_go:
         request_id, run_dir = ensure_request()
-        return await _run_codex_tier(
+        return await _run_tier3(
             bridge, request_id=request_id, run_dir=run_dir, doi=doi, title=title,
-            start_url=start_url, sandbox_mode=state.sandbox_mode,
+            start_url=start_url, sandbox_mode=state.sandbox_mode if codex_ready else None,
+            claude_go=claude_go,
         )
 
     # Codex is unavailable. Both deterministic tiers hitting a wall is the one
@@ -1081,44 +1153,87 @@ async def _run_deterministic_tier(
     return result.kind
 
 
-async def _run_codex_tier(
+# Executor failures that never reached a verdict on the paper: the only ones the
+# claude fallback may take over from codex. A codex VERDICT (downloaded, bot_wall,
+# paywalled_no_access, gave_up, wrong_paper, throttled) is never second-guessed.
+_FALLBACK_KINDS = {"executor_died", "timeout", "auth_error", "codex_quota"}
+
+
+async def _run_tier3(
     bridge: Bridge, *, request_id: int, run_dir: Path, doi: str, title: str,
-    start_url: str, sandbox_mode: str,
+    start_url: str, sandbox_mode: str | None, claude_go: bool,
 ) -> Response:
-    """Tier 3: the codex executor. Writes its own write-ahead row, runs codex, and
-    resolves the terminal taxonomy (§2.7) — the only tier that produces terminal
-    wrong_paper / throttled / paywalled / bot_wall / gave_up classifications."""
+    """Tier 3 driver chain (AGA-1460): codex first when usable, claude as the
+    automatic fallback. ``sandbox_mode=None`` means codex is unusable (no selftest /
+    rate-blocked / chrome) and claude runs directly."""
+    if sandbox_mode is not None:
+        response = await _run_executor_attempt(
+            bridge, driver="codex", request_id=request_id, run_dir=run_dir, doi=doi,
+            title=title, start_url=start_url, sandbox_mode=sandbox_mode, defer_failure=claude_go,
+        )
+        if response is not None:
+            return response
+    # codex died / is unusable and claude is ready: its own attempt row.
+    api_key = executor.anthropic_api_key()
+    assert api_key  # claude_go implies a key
+    response = await _run_executor_attempt(
+        bridge, driver="claude", request_id=request_id, run_dir=run_dir, doi=doi,
+        title=title, start_url=start_url, sandbox_mode=None, defer_failure=False,
+        api_key=api_key,
+    )
+    assert response is not None
+    return response
+
+
+async def _run_executor_attempt(
+    bridge: Bridge, *, driver: str, request_id: int, run_dir: Path, doi: str, title: str,
+    start_url: str, sandbox_mode: str | None, defer_failure: bool, api_key: str | None = None,
+) -> Response | None:
+    """One tier-3 executor attempt (``driver`` = codex | claude). Writes its own
+    write-ahead row, runs the executor, resolves the terminal taxonomy (§2.7) — the
+    only tier that produces terminal wrong_paper / throttled / paywalled / bot_wall /
+    gave_up classifications. With ``defer_failure`` a fallback-eligible failure
+    (executor_died/timeout/auth/quota; salvage already tried) resolves ONLY the
+    attempt row and returns None so the caller can try the next driver."""
+    strategy = f"{driver}_bridge"
     attempt_id = bridge.write_ahead(
-        request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy="codex_bridge"
+        request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
     )
     executor.write_task_json(run_dir, doi=doi, title=title, start_url=start_url)
     prompt = executor.PROMPT_TEMPLATE.format(run_dir=str(run_dir))
     started = _utc_now()
-    exec_result = await run_codex(run_dir, prompt, sandbox_mode)
+    if driver == "claude":
+        exec_result = await run_claude(run_dir, prompt, api_key or "")
+    else:
+        exec_result = await run_codex(run_dir, prompt, sandbox_mode or "")
     ended = _utc_now()
     screenshot = str(run_dir / "final.png") if (run_dir / "final.png").exists() else None
+    if exec_result.cost_usd is not None:
+        with bridge.db.transaction() as conn:
+            limits.record_attempt_cost(conn, attempt_id, exec_result.cost_usd)
 
     bad_outcome = exec_result.kind in {"timeout", "gave_up", "executor_died"}
     response = await _resolve_outcome(
         bridge, exec_result=exec_result, request_id=request_id, attempt_id=attempt_id,
         doi=doi, title=title, run_dir=run_dir, window_start=started, window_end=ended,
-        screenshot=screenshot,
+        screenshot=screenshot, tier_label=strategy,
+        defer_failure=defer_failure,
     )
 
-    # A runtime auth_error means the host's codex login is dead (revoked refresh
-    # token / 401). Retrying it just burns the wall on every request while the
-    # token stays revoked. Clear the readiness latch so codex_ready flips false
-    # and the ladder surfaces selftest_required (needs-operator) until an operator
-    # re-logs-in and re-runs POST /selftest/codex — instead of silently
-    # re-attempting a broken codex forever (AGA-493). KC already treats codex_auth
-    # as needs-operator, so the two ends agree. Done BEFORE chrome recovery: that
-    # awaits up to ~30s, and a CancelledError (shutdown / disconnect) mid-recovery
-    # must not skip the clear and leave a known-broken codex latched ready.
+    # A runtime auth failure means that driver's login/key is dead. Retrying burns
+    # the wall on every request while it stays dead. Clear its readiness latch so
+    # the ladder stops attempting it (codex: surfaces selftest_required; claude:
+    # _claude_ready goes false) until an operator fixes it and re-runs the matching
+    # /selftest (AGA-493, AGA-1460). Done BEFORE chrome recovery: that awaits up to
+    # ~30s, and a CancelledError mid-recovery must not leave a known-broken driver
+    # latched ready.
     if exec_result.kind == "auth_error":
         bridge.state_store.update(sandbox_mode=None, last_selftest_ok=False)
+    elif exec_result.kind == "claude_auth":
+        bridge.state_store.update(claude_last_selftest_ok=False)
 
     # chrome recovery on bad outcomes (still holding the lock)
-    if bad_outcome or exec_result.kind == "auth_error":
+    if bad_outcome or exec_result.kind in {"auth_error", "claude_auth"}:
         rec = await chrome.recover()
         bridge.state_store.update(last_recovery_action=rec.action)
 
@@ -1201,9 +1316,23 @@ def _finish_wall_evidence(bridge: Bridge, *, request_id: int) -> Response:
 async def _resolve_outcome(
     bridge: Bridge, *, exec_result: executor.ExecResult, request_id: int, attempt_id: int,
     doi: str, title: str, run_dir: Path, window_start: datetime, window_end: datetime,
-    screenshot: str | None,
-) -> Response:
+    screenshot: str | None, tier_label: str = "codex_bridge", defer_failure: bool = False,
+) -> Response | None:
+    """Resolve an executor result. ``defer_failure`` (tier-3 fallback, AGA-1460):
+    a failure that survives salvage resolves only the attempt row and returns None,
+    leaving the request open for the next driver."""
     kind = exec_result.kind
+
+    def _fail(*, kind: str, message: str) -> Response | None:
+        if defer_failure and kind in _FALLBACK_KINDS:
+            bridge.resolve_attempt(
+                attempt_id, outcome=_TAXONOMY[kind][0], message=message,
+                screenshot_path=screenshot, current_url=exec_result.final_url,
+            )
+            return None
+        return _finish_failure(bridge, kind=kind, request_id=request_id,
+                               attempt_id=attempt_id, screenshot=screenshot,
+                               message=message, final_url=exec_result.final_url)
 
     # downloaded path
     if kind == "downloaded":
@@ -1222,7 +1351,7 @@ async def _resolve_outcome(
         verify = await _verify_and_finish(
             bridge, located=located, doi=doi, title=title, request_id=request_id,
             attempt_id=attempt_id, final_url=exec_result.final_url, screenshot=screenshot,
-            salvaged=False, run_dir=run_dir, tier_label="codex_bridge",
+            salvaged=False, run_dir=run_dir, tier_label=tier_label,
         )
         if isinstance(verify, Response):
             return verify
@@ -1234,13 +1363,11 @@ async def _resolve_outcome(
                                    attempt_id=attempt_id, screenshot=screenshot,
                                    message="downloaded PDF failed identity verification",
                                    final_url=exec_result.final_url)
-        # No locatable candidate at all (codex MISREPORTED 'downloaded' — nothing
-        # was ever verified). Treat as a retryable executor failure, not a
-        # terminal wrong_paper claim (review fix, finding 4a).
-        return _finish_failure(bridge, kind="gave_up", request_id=request_id,
-                               attempt_id=attempt_id, screenshot=screenshot,
-                               message="executor reported 'downloaded' but no PDF was located",
-                               final_url=exec_result.final_url)
+        # No locatable candidate at all (the executor MISREPORTED 'downloaded' —
+        # nothing was ever verified). A claim with no file is a death, not a
+        # verdict: retryable executor_died, never terminal gave_up / wrong_paper
+        # (review fix 4a; AGA-490 reclassified it from gave_up).
+        return _fail(kind="executor_died", message="claimed download not found")
 
     # salvage pass on timeout/gave_up/executor_died — a run that died (or timed out)
     # may still have written the PDF before dying, so it gets the same locate+verify
@@ -1253,7 +1380,7 @@ async def _resolve_outcome(
                 salvage = await _verify_and_finish(
                     bridge, located=located, doi=doi, title=title, request_id=request_id,
                     attempt_id=attempt_id, final_url=exec_result.final_url, screenshot=screenshot,
-                    salvaged=True, run_dir=run_dir, tier_label="codex_bridge",
+                    salvaged=True, run_dir=run_dir, tier_label=tier_label,
                 )
                 if isinstance(salvage, Response):
                     return salvage
@@ -1265,9 +1392,10 @@ async def _resolve_outcome(
                 _quarantine(located, run_dir=run_dir,
                             reason=f"salvage candidate failed verification: {reason}")
         # salvage found nothing valid ⇒ original failure taxonomy
-        return _finish_failure(bridge, kind=kind, request_id=request_id, attempt_id=attempt_id,
-                               screenshot=screenshot, message=exec_result.notes or kind,
-                               final_url=exec_result.final_url)
+        return _fail(kind=kind, message=exec_result.notes or kind)
+
+    if defer_failure and kind in _FALLBACK_KINDS:  # auth_error / codex_quota: nothing to salvage
+        return _fail(kind=kind, message=exec_result.notes or kind)
 
     # terminal failures (throttled/paywalled/bot_wall/gave_up-with-no-file/auth).
     # _finish_failure reads deterministic-tier wall evidence itself (bridge.

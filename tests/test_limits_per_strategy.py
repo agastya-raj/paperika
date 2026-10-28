@@ -59,6 +59,7 @@ def test_rate_rules_values():
         "direct_fetch": (30, 100),
         "scripted_browser": (90, 40),
         "codex_bridge": (180, 20),
+        "claude_bridge": (180, 20),
     }
     # module-level codex defaults are retained for backward compat.
     assert (limits.MIN_SPACING_SECONDS, limits.DAILY_CAP) == limits.RATE_RULES["codex_bridge"]

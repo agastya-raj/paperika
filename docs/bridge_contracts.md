@@ -198,7 +198,8 @@ collide with these. The bridge uses, on its OWN rows:
 - request status: `in_progress` (write-ahead) → `completed` | `failed`.
 - attempt `outcome` (new column): `running` → `completed` | `wrong_paper` |
   `throttled` | `no_access` | `bot_wall` | `executor_gave_up` | `auth_error` |
-  `timeout` | `interrupted`.
+  `timeout` | `executor_died` | `codex_quota` | `claude_auth` | `claude_budget` |
+  `interrupted`.
 - attempt `status` (NOT NULL mirror): `running` while in-flight; `downloaded` on
   success/salvage; `failed` otherwise.
 
@@ -257,11 +258,12 @@ tier 3 is bounded by `executor.EXEC_WALL_SECONDS`):
 |------|----------------|-----------|--------|
 | 1 | `direct_fetch` | `direct_fetch.attempt_direct_fetch` — authenticated HTTP GET of the DOI redirect chain + a `citation_pdf_url`/per-publisher ruleset, Chrome cookies exported over CDP | 60 s |
 | 2 | `scripted_browser` | `scripted_browser.attempt_scripted_fetch` — deterministic Playwright over the managed CDP Chrome (no LLM) | 45 s |
-| 3 | `codex_bridge` | `executor.run_codex` — the LLM-steered browser session | 900 s |
+| 3 | `codex_bridge` | `executor.run_codex` — the LLM-steered browser session (`codex exec -m gpt-6.1-sol`, high effort, fast tier) | 900 s |
+| 3b | `claude_bridge` | `executor.run_claude` — FALLBACK driver: `claude -p --bare --model claude-sonnet-5-5 --tools Bash --max-budget-usd 0.60`, same prompt/schema | 900 s |
 
 **Per-strategy rate discipline** (`limits.RATE_RULES`, `(min_spacing_seconds,
 daily_cap)`): `direct_fetch` `(30, 100)`, `scripted_browser` `(90, 40)`,
-`codex_bridge` `(180, 20)`. `check_rate(conn, strategy)` and
+`codex_bridge` `(180, 20)`, `claude_bridge` `(180, 20)`. `check_rate(conn, strategy)` and
 `attempts_today(conn, strategy)` consult ONLY that strategy's rows; the clocks are
 independent (a recent codex attempt never blocks a direct fetch). The module-level
 `MIN_SPACING_SECONDS`/`DAILY_CAP` remain the `codex_bridge` values for backward
@@ -291,7 +293,7 @@ compat, and a bare `check_rate(conn)` still defaults to the codex strategy.
   bare plain-text 500. Non-retryable, operator-attention. The lock is released; a
   request/attempt row left `in_progress` is reaped by the startup sweep.
 - Successful responses carry `X-Paperika-Tier: direct_fetch | scripted_browser |
-  codex_bridge`.
+  codex_bridge | claude_bridge`.
 
 **Pre-flight gating changes**
 - The sandbox gate (`503 selftest_required` when no persisted `sandbox_mode`) gates
@@ -307,3 +309,35 @@ compat, and a bare `check_rate(conn)` still defaults to the codex strategy.
 `/healthz` `limits` gains a per-strategy `attempts_today` map
 (`{"direct_fetch", "scripted_browser", "codex_bridge"}`) alongside the existing
 total `downloads_today`.
+
+## 8. Tier-3 driver chain (AGA-1460)
+
+Tier 3 = codex (`gpt-6.1-sol`) PRIMARY, Claude Sonnet 5.5 via the Anthropic API
+FALLBACK. Same prompt, same `OUTCOME_SCHEMA`, same acceptance/identity gate, same
+salvage and wall handoff; each driver writes its own write-ahead attempt row
+(`codex_bridge` / `claude_bridge`) under its own rate rule.
+
+- **When claude runs:** codex unusable (no persisted `sandbox_mode`, rate-blocked,
+  `codex_auth`, `codex_quota`) or codex ended `executor_died` / `timeout` (including
+  a claimed download whose file is not found) with no salvageable PDF. **Never**
+  after a codex verdict (`downloaded`, `bot_wall`, `paywalled_no_access`,
+  `throttled`, `gave_up`, `wrong_paper`).
+- **Key:** `ANTHROPIC_API_KEY` from the process env, else `~/.cache/secrets_env`,
+  resolved once per process, passed only in the claude subprocess env (never argv,
+  state or logs). No key => claude is unavailable and the codex result stands.
+- **claude outcomes:** one JSON envelope. Invalid/missing envelope, `is_error`,
+  refusal => `executor_died`; budget exhausted => `claude_budget`; 401 =>
+  `claude_auth` (latches claude off until `POST /selftest/claude` passes). A valid
+  structured outcome maps exactly like codex's.
+- **Infra failures are retryable:** a run reporting `gave_up` whose events/notes
+  contain `INFRA_FAILURE_MARKERS` (`ERR_NAME_NOT_RESOLVED`, `net::ERR_`,
+  `Target closed`, `Browser has been closed`, `connection refused`) is
+  `executor_died`, not terminal `codex_gave_up`.
+- **`POST /selftest/claude`:** no-browse CLI+key+schema check; persists
+  `claude_last_selftest_ok/at` in bridge state. `/healthz` gains a `claude` block
+  (`key_present`, `claude_usable`, `last_selftest_*`, `claude_cost_usd` month-to-date
+  from `paper_attempts.cost_usd`, a new additive REAL column).
+
+New `error_code`s: `claude_auth` (503, operator), `claude_budget` (502, retryable),
+`codex_quota` (502, retryable). `executor_died` now also covers AGA-490's "claimed
+download not found" (was `codex_gave_up`).

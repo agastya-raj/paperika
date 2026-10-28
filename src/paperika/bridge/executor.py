@@ -15,10 +15,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import time
 
 CODEX_BIN = "codex"
+CLAUDE_BIN = "claude"
 # 240 was too tight: run 62 burned 204s on navigation alone, and run 63 was
 # killed AT Optica's "your PDF will open shortly" delivery page. 480 then became
 # too tight in turn once the executor moved to high reasoning effort (below): a
@@ -38,14 +40,24 @@ MCP_OFF: list[str] = ["-c", "mcp_servers={}"]
 # Pinned (rather than inherited) so the bridge is self-contained and an unrelated
 # edit to config.toml can never silently change what downloads papers.
 #
-# gpt-5.6-sol at HIGH effort: the download task is judgment work (is this a wall or
-# just header chrome? is this the article PDF or a figure?), which low effort was
-# losing; the fast service tier buys back the latency high effort costs, and the
-# two compose — Sol's reasoning at fast-tier latency. All verified on the gpu host
-# with codex-cli 0.144.5.
-CODEX_MODEL: list[str] = ["-m", "gpt-5.6-sol"]
+# gpt-6.1-sol at HIGH effort (AGA-1460; was gpt-5.6-sol): the download task is
+# judgment work (is this a wall or just header chrome? is this the article PDF or a
+# figure?), which low effort was losing; the fast service tier buys back the latency
+# high effort costs, and the two compose. The flags are the codex exec contract
+# verified on the gpu host; re-verify the model id there after a codex-cli upgrade.
+CODEX_MODEL: list[str] = ["-m", "gpt-6.1-sol"]
 REASONING_HIGH: list[str] = ["-c", 'model_reasoning_effort="high"']
 SERVICE_TIER_FAST: list[str] = ["-c", 'service_tier="fast"']
+
+# Tier-3 FALLBACK driver (AGA-1460): Claude Sonnet 5.5 through the Anthropic API,
+# used when codex is unusable (dead ChatGPT login, exhausted quota) or died. Flags
+# verified against claude 2.1.312 (`claude --help` + a live 401 envelope):
+# --bare skips OAuth/keychain/hooks/CLAUDE.md so the run uses ONLY the API key we
+# pass in the subprocess env; --tools Bash is the only tool (the task is Python
+# scripts over CDP); --json-schema makes the final answer a structured_output.
+CLAUDE_MODEL = "claude-sonnet-5-5"
+CLAUDE_MAX_BUDGET_USD = "0.60"
+ANTHROPIC_KEY_ENV = "ANTHROPIC_API_KEY"
 
 # Final-message JSON Schema (--output-schema). Forces the executor's last message
 # into the shape the bridge parses. OpenAI strict structured outputs require
@@ -213,6 +225,7 @@ class ExecResult:
     # Bridge-internal classification of an executor run.
     kind: str  # "downloaded" | "throttled" | "paywalled_no_access" | "bot_wall"
     #            | "gave_up" | "executor_died" | "timeout" | "auth_error"
+    #            | "codex_quota" | "claude_auth" | "claude_budget"
     file_path: str | None = None
     final_url: str | None = None
     notes: str = ""
@@ -220,6 +233,7 @@ class ExecResult:
     exit_code: int | None = None
     events: list[dict] = field(default_factory=list)
     raw_last_message: str | None = None
+    cost_usd: float | None = None  # claude only: envelope total_cost_usd
 
 
 def _parse_events(jsonl_text: str) -> list[dict]:
@@ -259,60 +273,63 @@ def _turn_completed(events: list[dict]) -> bool:
     return any(ev.get("type") == "turn.completed" for ev in events)
 
 
-def classify(
-    *,
-    exit_code: int,
-    events: list[dict],
-    last_message: str,
-    stderr: str,
-    timed_out: bool,
-    wall_seconds: float,
-) -> ExecResult:
-    """Map a raw codex run to an ExecResult (§2.4, §2.7)."""
-    base = dict(wall_seconds=wall_seconds, exit_code=exit_code, events=events, raw_last_message=last_message)
+# AGA-1460: a run that ends `gave_up` because the NETWORK/BROWSER broke (DNS, a
+# closed target, CDP refused) never judged the paper, so "gave_up" (terminal) would
+# be a lie — it is a retryable executor_died. Small explicit list, one test each.
+INFRA_FAILURE_MARKERS: tuple[str, ...] = (
+    "err_name_not_resolved",
+    "net::err_",
+    "target closed",
+    "browser has been closed",
+    "connection refused",
+)
 
-    if _is_auth_failure(events, stderr):
-        return ExecResult(kind="auth_error", notes="codex auth: refresh token revoked / 401", **base)
 
-    if timed_out or exit_code == 124:
-        return ExecResult(kind="timeout", notes="executor exceeded the wall-clock budget", **base)
+def _infra_failure_marker(*texts: str) -> str | None:
+    blob = "\n".join(t for t in texts if t).lower()
+    for marker in INFRA_FAILURE_MARKERS:
+        if marker in blob:
+            return marker
+    return None
 
-    # A DEATH is not a verdict (AGA-489). Without this gate every non-timeout death
-    # — crash, turn.failed, stream error, context overflow, non-zero exit — fell
-    # through to the parse below, produced no last message, and got stamped
-    # "gave_up" / "unparseable last message": terminal advice ("stop, this paper is
-    # not obtainable") derived from the executor never having judged the paper at
-    # all. The two honest markers of a run that reached its own conclusion are a
-    # turn.completed event and a clean exit (124 is the `timeout` wrapper's code,
-    # already classified above). Anything else is executor_died — retryable.
-    if not _turn_completed(events) or exit_code not in {0, 124}:
-        return ExecResult(
-            kind="executor_died",
-            notes=(
-                "executor died before completing its turn "
-                f"(turn.completed={_turn_completed(events)}, exit={exit_code}); "
-                "no verdict was reached"
-            ),
-            **base,
-        )
 
-    # Parse the structured last message.
-    parsed: dict | None = None
-    text = (last_message or "").strip()
-    if text:
+# codex CLI quota/usage-limit wording (ChatGPT plan exhausted). Checked only on
+# error/turn.failed events and stderr, never on the model's own output.
+_QUOTA_MARKERS = ("usage limit", "usage_limit", "insufficient_quota", "hit your")
+
+
+def _is_quota_failure(events: list[dict], stderr: str) -> bool:
+    for ev in events:
+        if ev.get("type") in {"error", "turn.failed"}:
+            blob = json.dumps(ev).lower()
+            if any(m in blob for m in _QUOTA_MARKERS):
+                return True
+    low = (stderr or "").lower()
+    return "usage limit" in low or "insufficient_quota" in low
+
+
+def _parse_outcome_text(text: str) -> dict | None:
+    """Parse a final-message JSON object, tolerating a fenced/embedded one."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            return None
         try:
-            parsed = json.loads(text)
+            parsed = json.loads(text[start : end + 1])
         except json.JSONDecodeError:
-            # tolerate a fenced/embedded object
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                try:
-                    parsed = json.loads(text[start : end + 1])
-                except json.JSONDecodeError:
-                    parsed = None
+            return None
+    return parsed if isinstance(parsed, dict) else None
 
-    if not isinstance(parsed, dict) or "outcome" not in parsed:
+
+def _outcome_to_result(parsed: dict | None, base: dict, *, infra_text: str = "") -> ExecResult:
+    """Map a parsed structured outcome to an ExecResult. Shared by codex and claude
+    so the two drivers' verdicts mean exactly the same thing."""
+    if parsed is None or "outcome" not in parsed:
         # Reachable only for a run that DID complete its turn and exit 0 (the death
         # cases are executor_died above). --output-schema is enforced, so a turn
         # that reaches a final message emits conforming JSON by construction — an
@@ -342,6 +359,15 @@ def classify(
     if isinstance(outcome, str) and outcome in {"throttled", "paywalled_no_access", "bot_wall"}:
         return ExecResult(kind=outcome, final_url=final_url, notes=notes, **base)
     if outcome == "gave_up":
+        # AGA-1460: gave_up caused by network/browser infrastructure is a death, not
+        # a verdict on the paper.
+        marker = _infra_failure_marker(notes, infra_text)
+        if marker:
+            return ExecResult(
+                kind="executor_died", final_url=final_url,
+                notes=f"infrastructure failure ({marker}) reported as gave_up: {notes}"[:500],
+                **base,
+            )
         # The model examined the paper and declined it — the one genuinely
         # terminal self-report (KC maps codex_gave_up → terminal). Distinct from
         # the anomaly cases above, which are retryable executor_died (AGA-493).
@@ -353,6 +379,54 @@ def classify(
         final_url=final_url,
         notes=notes or f"executor returned an unrecognized outcome: {outcome!r}",
         **base,
+    )
+
+
+def classify(
+    *,
+    exit_code: int,
+    events: list[dict],
+    last_message: str,
+    stderr: str,
+    timed_out: bool,
+    wall_seconds: float,
+) -> ExecResult:
+    """Map a raw codex run to an ExecResult (§2.4, §2.7)."""
+    base = dict(wall_seconds=wall_seconds, exit_code=exit_code, events=events, raw_last_message=last_message)
+
+    if _is_auth_failure(events, stderr):
+        return ExecResult(kind="auth_error", notes="codex auth: refresh token revoked / 401", **base)
+
+    if _is_quota_failure(events, stderr):
+        return ExecResult(kind="codex_quota", notes="codex usage limit / quota exhausted", **base)
+
+    if timed_out or exit_code == 124:
+        return ExecResult(kind="timeout", notes="executor exceeded the wall-clock budget", **base)
+
+    # A DEATH is not a verdict (AGA-489). Without this gate every non-timeout death
+    # — crash, turn.failed, stream error, context overflow, non-zero exit — fell
+    # through to the parse below, produced no last message, and got stamped
+    # "gave_up" / "unparseable last message": terminal advice ("stop, this paper is
+    # not obtainable") derived from the executor never having judged the paper at
+    # all. The two honest markers of a run that reached its own conclusion are a
+    # turn.completed event and a clean exit (124 is the `timeout` wrapper's code,
+    # already classified above). Anything else is executor_died — retryable.
+    if not _turn_completed(events) or exit_code not in {0, 124}:
+        return ExecResult(
+            kind="executor_died",
+            notes=(
+                "executor died before completing its turn "
+                f"(turn.completed={_turn_completed(events)}, exit={exit_code}); "
+                "no verdict was reached"
+            ),
+            **base,
+        )
+
+    # Only the events' error-ish payloads and command output could hold an infra
+    # marker; the whole event blob is searched (explicit marker list, AGA-1460).
+    return _outcome_to_result(
+        _parse_outcome_text(last_message), base,
+        infra_text=json.dumps(events, ensure_ascii=False) if events else "",
     )
 
 
@@ -402,6 +476,46 @@ def write_outcome_schema(run_dir: Path) -> None:
     (run_dir / "outcome.schema.json").write_text(json.dumps(OUTCOME_SCHEMA), encoding="utf-8")
 
 
+async def _spawn(
+    argv: list[str], run_dir: Path, run_env: dict[str, str], *, wait_seconds: float
+) -> tuple[str, str, int, bool, float]:
+    """Run ``argv`` in its own process group (start_new_session) with an immediate
+    stdin EOF; on overrun killpg the whole group (the CLI + any spawned python).
+    Returns (stdout, stderr, exit_code, timed_out, wall_seconds)."""
+    started = time.monotonic()
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        # Non-TTY stdin is read as "additional input" by both CLIs; give it an
+        # immediate EOF instead of whatever handle the service inherited.
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+        env=run_env,
+        cwd=str(run_dir),
+    )
+    timed_out = False
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=wait_seconds)
+    except asyncio.TimeoutError:
+        timed_out = True
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            stdout_b, stderr_b = b"", b""
+    wall = time.monotonic() - started
+    exit_code = proc.returncode if proc.returncode is not None else -1
+    return (
+        (stdout_b or b"").decode("utf-8", errors="replace"),
+        (stderr_b or b"").decode("utf-8", errors="replace"),
+        exit_code, timed_out, wall,
+    )
+
+
 async def run_codex(
     run_dir: Path,
     prompt: str,
@@ -422,49 +536,20 @@ async def run_codex(
     argv = build_argv(run_dir, prompt, sandbox_mode, with_schema=write_schema)
 
     run_env = dict(os.environ)
+    run_env.pop(ANTHROPIC_KEY_ENV, None)  # codex never needs the claude fallback's key
     if env:
         run_env.update(env)
     # CODEX_HOME intentionally NOT set here; codex resolves /home/agastya/.codex.
 
-    started = time.monotonic()
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        # codex exec reads "additional input" from a non-TTY stdin; give it an
-        # immediate EOF instead of whatever handle the service inherited.
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-        env=run_env,
-        cwd=str(run_dir),
+    stdout, stderr, exit_code, timed_out, wall = await _spawn(
+        argv, run_dir, run_env, wait_seconds=EXEC_WALL_SECONDS + KILL_GRACE_SECONDS
     )
-
-    timed_out = False
-    try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=EXEC_WALL_SECONDS + KILL_GRACE_SECONDS
-        )
-    except asyncio.TimeoutError:
-        timed_out = True
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=10)
-        except asyncio.TimeoutError:
-            stdout_b, stderr_b = b"", b""
-
-    wall = time.monotonic() - started
-    stdout = (stdout_b or b"").decode("utf-8", errors="replace")
-    stderr = (stderr_b or b"").decode("utf-8", errors="replace")
     events = _parse_events(stdout)
     try:
         last_message = (run_dir / "last_message.txt").read_text(encoding="utf-8")
     except OSError:
         last_message = ""
 
-    exit_code = proc.returncode if proc.returncode is not None else -1
     return classify(
         exit_code=exit_code,
         events=events,
@@ -535,4 +620,187 @@ async def run_selftest(run_dir: Path, *, env: dict[str, str] | None = None) -> S
         detail=f"selftest failed under both sandbox variants (v1={v1.kind}, v2={v2.kind})",
         wall_seconds=v1.wall_seconds + v2.wall_seconds,
         variant1_failure_reason=v1_reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Claude fallback driver (AGA-1460)
+# ---------------------------------------------------------------------------
+
+SECRETS_ENV_CACHE = Path.home() / ".cache" / "secrets_env"
+_UNSET = object()
+_key_cache: object = _UNSET
+
+
+def _read_key_from_secrets_cache(path: Path) -> str | None:
+    """Parse ``export ANTHROPIC_API_KEY='value'`` (or bare KEY=value) out of the
+    login shell's mode-600 secrets cache. Never logs or returns anything but the
+    value itself."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        name, sep, raw = line.partition("=")
+        if not sep or name.strip() != ANTHROPIC_KEY_ENV:
+            continue
+        try:
+            parts = shlex.split(raw, posix=True)
+        except ValueError:
+            return None
+        return parts[0] if parts else None
+    return None
+
+
+def anthropic_api_key() -> str | None:
+    """The Anthropic API key for the claude executor, resolved ONCE per process:
+    the process environment first, else ``~/.cache/secrets_env``. Held only in
+    this module-level cache and passed only in the claude subprocess env — never
+    stored in state, argv or logs. ``None`` ⇒ the claude executor is unavailable."""
+    global _key_cache
+    if _key_cache is _UNSET:
+        key = (os.environ.get(ANTHROPIC_KEY_ENV) or "").strip()
+        if not key:
+            key = _read_key_from_secrets_cache(SECRETS_ENV_CACHE) or ""
+        _key_cache = key or None
+    return _key_cache  # type: ignore[return-value]
+
+
+def reset_anthropic_key_cache() -> None:
+    global _key_cache
+    _key_cache = _UNSET
+
+
+def build_argv_claude(run_dir: Path, prompt: str) -> list[str]:
+    """``claude -p`` argv. The key is NEVER in argv (env only, see run_claude);
+    the prompt is the same static template codex gets (task.json stays data)."""
+    return [
+        CLAUDE_BIN,
+        "-p",
+        "--bare",
+        "--tools", "Bash",
+        "--no-session-persistence",
+        "--model", CLAUDE_MODEL,
+        "--max-budget-usd", CLAUDE_MAX_BUDGET_USD,
+        "--output-format", "json",
+        "--json-schema", json.dumps(OUTCOME_SCHEMA),
+        "--permission-mode", "bypassPermissions",
+        prompt,
+    ]
+
+
+def classify_claude(
+    *, exit_code: int, stdout: str, stderr: str, timed_out: bool, wall_seconds: float
+) -> ExecResult:
+    """Map one ``claude -p --output-format json`` envelope to an ExecResult.
+    Anything that is not a valid structured outcome is a RETRYABLE kind
+    (executor_died / claude_budget) or the operator code claude_auth — never a
+    verdict. A valid outcome maps exactly as codex's does."""
+    base = dict(wall_seconds=wall_seconds, exit_code=exit_code, raw_last_message=stdout[-2000:])
+
+    if timed_out:
+        return ExecResult(kind="timeout", notes="executor exceeded the wall-clock budget", **base)
+
+    envelope: dict | None = None
+    try:
+        loaded = json.loads((stdout or "").strip())
+        envelope = loaded if isinstance(loaded, dict) else None
+    except json.JSONDecodeError:
+        envelope = None
+
+    low_err = (stderr or "").lower()
+    if envelope is None:
+        if "invalid api key" in low_err or ("401" in low_err and "auth" in low_err):
+            return ExecResult(kind="claude_auth", notes="claude auth: invalid API key", **base)
+        return ExecResult(
+            kind="executor_died",
+            notes=f"claude produced no valid JSON envelope (exit={exit_code})",
+            **base,
+        )
+
+    cost = envelope.get("total_cost_usd")
+    cost_usd = float(cost) if isinstance(cost, (int, float)) else None
+    base["cost_usd"] = cost_usd
+    result_text = envelope.get("result")
+    result_text = result_text if isinstance(result_text, str) else ""
+    subtype = str(envelope.get("subtype") or "")
+    terminal = str(envelope.get("terminal_reason") or "")
+
+    if envelope.get("api_error_status") == 401 or (
+        envelope.get("is_error") and "invalid api key" in result_text.lower()
+    ):
+        return ExecResult(kind="claude_auth", notes="claude auth: 401 / invalid API key", **base)
+
+    if "budget" in subtype.lower() or "budget" in terminal.lower():
+        return ExecResult(
+            kind="claude_budget", notes=f"claude hit its per-run budget ({subtype or terminal})", **base
+        )
+
+    if envelope.get("stop_reason") == "refusal" or "refusal" in terminal.lower():
+        return ExecResult(kind="executor_died", notes="claude refused the task", **base)
+
+    if envelope.get("is_error") or (subtype and subtype != "success"):
+        return ExecResult(
+            kind="executor_died",
+            notes=f"claude run errored (subtype={subtype!r}): {result_text[:200]}",
+            **base,
+        )
+
+    structured = envelope.get("structured_output")
+    parsed = structured if isinstance(structured, dict) else _parse_outcome_text(result_text)
+    return _outcome_to_result(parsed, base, infra_text=result_text)
+
+
+async def run_claude(
+    run_dir: Path,
+    prompt: str,
+    api_key: str,
+    *,
+    write_schema: bool = False,
+    env: dict[str, str] | None = None,
+) -> ExecResult:
+    """Spawn ``claude -p ...`` in its own process group with the same wall /
+    kill-grace discipline as run_codex. The key travels only in this subprocess's
+    env. (``write_schema`` is accepted for signature parity; the schema is inline.)"""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_env = dict(os.environ)
+    if env:
+        run_env.update(env)
+    run_env[ANTHROPIC_KEY_ENV] = api_key
+    stdout, stderr, exit_code, timed_out, wall = await _spawn(
+        build_argv_claude(run_dir, prompt), run_dir, run_env, wait_seconds=EXEC_WALL_SECONDS
+    )
+    return classify_claude(
+        exit_code=exit_code, stdout=stdout, stderr=stderr, timed_out=timed_out, wall_seconds=wall
+    )
+
+
+# No-browse selftest: proves the CLI, the key and the structured-output schema.
+CLAUDE_SELFTEST_MARKER = "claude_selftest_ok"
+CLAUDE_SELFTEST_PROMPT = (
+    "This is a connectivity self-test. Do NOT use any tools and do not browse. "
+    "Report the structured outcome gave_up with file_path null, final_url null and "
+    f"notes exactly {CLAUDE_SELFTEST_MARKER}."
+)
+
+
+async def run_claude_selftest(
+    run_dir: Path, api_key: str, *, env: dict[str, str] | None = None
+) -> SelftestResult:
+    result = await run_claude(run_dir, CLAUDE_SELFTEST_PROMPT, api_key, env=env)
+    if result.kind == "claude_auth":
+        return SelftestResult(
+            False, error_code="claude_auth",
+            detail="ANTHROPIC_API_KEY was rejected (401); refresh it in 1Password and restart the bridge",
+            wall_seconds=result.wall_seconds,
+        )
+    if result.kind == "gave_up" and CLAUDE_SELFTEST_MARKER in result.notes:
+        return SelftestResult(True, wall_seconds=result.wall_seconds)
+    return SelftestResult(
+        False, error_code="executor_failed",
+        detail=f"claude selftest failed (kind={result.kind}): {result.notes[:200]}",
+        wall_seconds=result.wall_seconds,
     )

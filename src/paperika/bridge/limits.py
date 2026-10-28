@@ -32,6 +32,8 @@ RATE_RULES: dict[str, tuple[int, int]] = {
     "direct_fetch": (30, 100),
     "scripted_browser": (90, 40),
     "codex_bridge": (MIN_SPACING_SECONDS, DAILY_CAP),
+    # AGA-1460: the claude fallback mirrors codex's shape (own clock, own cap).
+    "claude_bridge": (180, 20),
 }
 
 # Columns the bridge adds to paper_attempts (request_id already exists in the
@@ -41,6 +43,8 @@ _BRIDGE_ATTEMPT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("finished_at", "TEXT"),
     ("outcome", "TEXT"),
     ("run_dir", "TEXT"),
+    # AGA-1460: claude's envelope total_cost_usd, summed for /healthz month-to-date.
+    ("cost_usd", "REAL"),
 )
 
 
@@ -234,6 +238,25 @@ def resolve_attempt(
         (outcome, status, iso(now), message, paper_id, screenshot_path, current_url, attempt_id),
     )
     conn.commit()
+
+
+def record_attempt_cost(conn: sqlite3.Connection, attempt_id: int, cost_usd: float) -> None:
+    conn.execute("UPDATE paper_attempts SET cost_usd = ? WHERE id = ?", (cost_usd, attempt_id))
+    conn.commit()
+
+
+def month_cost_usd(
+    conn: sqlite3.Connection, strategy: str, *, now: datetime | None = None
+) -> float:
+    """Sum of ``cost_usd`` for ``strategy`` attempts started this UTC month."""
+    now = (now or utc_now()).astimezone(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    row = conn.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM paper_attempts "
+        "WHERE strategy = ? AND started_at >= ?",
+        (strategy, iso(month_start)),
+    ).fetchone()
+    return round(float(row[0]), 4) if row else 0.0
 
 
 def running_attempts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
