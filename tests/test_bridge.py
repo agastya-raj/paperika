@@ -3148,3 +3148,30 @@ def test_codex_skipped_retryably_when_deadline_leaves_too_little(cfg, monkeypatc
     con = _conn(cfg)
     assert con.execute("SELECT COUNT(*) FROM paper_requests WHERE status='in_progress'").fetchone()[0] == 0
     con.close()
+
+
+def test_tier1_freed_by_cooldown_wait_runs_after_an_elsevier_miss(cfg, els, monkeypatch):
+    """Codex round 2: the blocked flag is recomputed after the tier-1 cooldown wait,
+    so an Elsevier miss falls through to tier 1 instead of a stale 429."""
+    for strat in ("scripted_browser", "codex_bridge", "claude_bridge"):
+        monkeypatch.setitem(limits.RATE_RULES, strat, (0, 0))
+    real_check = limits.check_rate
+    calls = {"direct_fetch": 0}
+
+    def _check(conn, strategy="codex_bridge", **kw):
+        if strategy == "direct_fetch":
+            calls["direct_fetch"] += 1
+            if calls["direct_fetch"] == 1:
+                return limits.RateDecision(False, "cooldown", 5)
+            return limits.RateDecision(True)
+        return real_check(conn, strategy, **kw)
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(limits, "check_rate", _check)
+    monkeypatch.setattr(bridge_app, "SLEEP", _no_sleep)
+    els.handler = lambda req: httpx.Response(404)
+    _, resp = _els_post(cfg)
+    assert resp.status_code == 200
+    assert resp.headers["X-Paperika-Tier"] == "direct_fetch"

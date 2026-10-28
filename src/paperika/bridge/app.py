@@ -1096,8 +1096,9 @@ async def _download_locked(
         if isinstance(outcome, Response):
             return outcome
         tier_kinds["elsevier_api"] = outcome
-    if regular_blocked:
-        # Only the Elsevier step was available and it missed.
+    if all(not d.allowed for d in rate.values()):
+        # Only the Elsevier step was available and it missed. Recomputed, not the
+        # pre-flight flag: the tier-1 cooldown wait above may have freed tier 1.
         return finalize_if_created(
             _json_error(429, "rate_limited", "all download tiers are rate-limited")
         )
