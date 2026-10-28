@@ -34,6 +34,9 @@ RATE_RULES: dict[str, tuple[int, int]] = {
     "codex_bridge": (MIN_SPACING_SECONDS, DAILY_CAP),
     # AGA-1460: the claude fallback mirrors codex's shape (own clock, own cap).
     "claude_bridge": (180, 20),
+    # AGA-1462: Elsevier Article Retrieval API (allows 10 req/s, 50k/week); we pace
+    # far below that.
+    "elsevier_api": (3, 500),
 }
 
 # Columns the bridge adds to paper_attempts (request_id already exists in the

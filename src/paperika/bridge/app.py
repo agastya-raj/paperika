@@ -13,6 +13,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import functools
 import hashlib
 import hmac
 import json
@@ -35,7 +36,7 @@ from ..db import Database
 from ..downloader import Downloader
 from ..models import LocateCandidate, ManualIntervention, ParsedInput
 from ..notifications import NotificationEvent, emit_notification_event
-from . import chrome, executor, limits
+from . import chrome, elsevier_api, executor, limits
 from .direct_fetch import attempt_direct_fetch
 from .executor import run_claude, run_codex
 from .scripted_browser import attempt_scripted_fetch
@@ -116,6 +117,8 @@ class BridgeState(BaseModel):
     last_recovery_action: str | None = None
     claude_last_selftest_ok: bool | None = None
     claude_last_selftest_at: str | None = None
+    # AGA-1462: latched on a 401 from the Elsevier API, cleared on the next 200.
+    elsevier_key_invalid: bool = False
 
 
 # --- bridge state (persisted) ---------------------------------------------
@@ -631,7 +634,9 @@ def _parse_iso(value: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-_STRATEGIES = ("direct_fetch", "scripted_browser", "codex_bridge", "claude_bridge")
+_STRATEGIES = (
+    "direct_fetch", "scripted_browser", "codex_bridge", "claude_bridge", "elsevier_api",
+)
 
 # A selftest older than this is treated as stale for the /healthz codex_usable
 # signal — codex auth/CLI can rot silently between requests (a revoked ChatGPT
@@ -762,6 +767,11 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 "last_selftest_ok": state.claude_last_selftest_ok,
                 "last_selftest_at": state.claude_last_selftest_at,
                 "claude_cost_usd": claude_cost,
+            },
+            "elsevier": {
+                "key_present": bool(executor.elsevier_api_key()),
+                "key_invalid": bool(state.elsevier_key_invalid),
+                "attempts_today": attempts_by_strategy.get("elsevier_api"),
             },
             "limits": {
                 "active_request": "locked" if bridge.lock.locked() else None,
@@ -1063,6 +1073,29 @@ async def _download_locked(
 
     tier_kinds: dict[str, str] = {}
 
+    # --- AGA-1462: Elsevier Article Retrieval API, before tier 1, 10.1016/ DOIs only.
+    # Deterministic; success returns, every miss falls through (never a verdict).
+    # An absent key or a rate-blocked strategy skips it silently.
+    if elsevier_api.applies_to(doi):
+        els_key = executor.elsevier_api_key()
+        if els_key:
+            with bridge.db.transaction() as conn:
+                els_rate = limits.check_rate(conn, "elsevier_api")
+            if els_rate.allowed:
+                request_id, run_dir = ensure_request()
+                outcome = await _run_deterministic_tier(
+                    bridge, strategy="elsevier_api",
+                    fetch_fn=functools.partial(
+                        elsevier_api.attempt_elsevier_fetch, api_key=els_key,
+                        set_key_invalid=lambda bad: _set_elsevier_key_invalid(bridge, bad),
+                    ),
+                    budget=elsevier_api.BUDGET_SECONDS, request_id=request_id,
+                    run_dir=run_dir, doi=doi, title=title, start_url=start_url,
+                )
+                if isinstance(outcome, Response):
+                    return outcome
+                tier_kinds["elsevier_api"] = outcome
+
     # --- tier 1: direct HTTP fetch (no Chrome-health requirement) ---
     if rate["direct_fetch"].allowed:
         request_id, run_dir = ensure_request()
@@ -1134,6 +1167,12 @@ def _locate_downloaded(
         if bridge._within_download_window(p, window_start, window_end):
             return p
     return bridge._locate_in_window(window_start, window_end)
+
+
+def _set_elsevier_key_invalid(bridge: Bridge, invalid: bool) -> None:
+    """Persist the 401 latch; write only on a change (a 200 clears it)."""
+    if bridge.state_store.load().elsevier_key_invalid != invalid:
+        bridge.state_store.update(elsevier_key_invalid=invalid)
 
 
 async def _run_deterministic_tier(

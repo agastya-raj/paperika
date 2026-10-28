@@ -256,14 +256,24 @@ tier 3 is bounded by `executor.EXEC_WALL_SECONDS`):
 
 | Tier | Strategy label | Mechanism | Budget |
 |------|----------------|-----------|--------|
+| 0 | `elsevier_api` | `elsevier_api.attempt_elsevier_fetch` — only for `10.1016/` DOIs, only with `ELSEVIER_API_KEY` (env, else `~/.cache/secrets_env`): `GET api.elsevier.com/content/article/doi/{doi}` (`X-ELS-APIKey`, `Accept: application/pdf`, no auto-redirect; a 302/303 Location is fetched WITHOUT the key through the SSRF guard) | 60 s |
 | 1 | `direct_fetch` | `direct_fetch.attempt_direct_fetch` — authenticated HTTP GET of the DOI redirect chain + a `citation_pdf_url`/per-publisher ruleset, Chrome cookies exported over CDP | 60 s |
 | 2 | `scripted_browser` | `scripted_browser.attempt_scripted_fetch` — deterministic Playwright over the managed CDP Chrome (no LLM) | 45 s |
 | 3 | `codex_bridge` | `executor.run_codex` — the LLM-steered browser session (`codex exec -m gpt-6.1-sol`, high effort, fast tier) | 900 s |
 | 3b | `claude_bridge` | `executor.run_claude` — FALLBACK driver: `claude -p --bare --model claude-sonnet-5-5 --tools Bash --max-budget-usd 0.60`, same prompt/schema | 900 s |
 
+**`elsevier_api` (AGA-1462):** runs BEFORE tier 1, deterministic, rate rule `(3, 500)`, own
+write-ahead attempt row. It only succeeds or misses: 403/404/202/429/non-PDF/network error/
+identity-gate failure (quarantined) all fall through to tier 1 unchanged, never a verdict;
+a 401 also falls through and latches `elsevier_key_invalid` in bridge state (cleared by the
+next 200). A missing key or a rate-blocked strategy skips it silently. Success carries
+`X-Paperika-Tier: elsevier_api`. **Provenance:** the `paper_attempts` row with strategy
+`elsevier_api` + outcome `completed` is the ledger of API-fetched papers (for purge on
+termination). `/healthz` gains `elsevier: {key_present, key_invalid, attempts_today}`.
+
 **Per-strategy rate discipline** (`limits.RATE_RULES`, `(min_spacing_seconds,
 daily_cap)`): `direct_fetch` `(30, 100)`, `scripted_browser` `(90, 40)`,
-`codex_bridge` `(180, 20)`, `claude_bridge` `(180, 20)`. `check_rate(conn, strategy)` and
+`codex_bridge` `(180, 20)`, `claude_bridge` `(180, 20)`, `elsevier_api` `(3, 500)`. `check_rate(conn, strategy)` and
 `attempts_today(conn, strategy)` consult ONLY that strategy's rows; the clocks are
 independent (a recent codex attempt never blocks a direct fetch). The module-level
 `MIN_SPACING_SECONDS`/`DAILY_CAP` remain the `codex_bridge` values for backward
@@ -292,7 +302,7 @@ compat, and a bare `check_rate(conn)` still defaults to the codex strategy.
   `detail` = `ExcType: message`, truncated to 300 chars; AGA-1457) instead of a
   bare plain-text 500. Non-retryable, operator-attention. The lock is released; a
   request/attempt row left `in_progress` is reaped by the startup sweep.
-- Successful responses carry `X-Paperika-Tier: direct_fetch | scripted_browser |
+- Successful responses carry `X-Paperika-Tier: elsevier_api | direct_fetch | scripted_browser |
   codex_bridge | claude_bridge`.
 
 **Pre-flight gating changes**

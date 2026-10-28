@@ -554,6 +554,7 @@ async def run_codex(
 
     run_env = dict(os.environ)
     run_env.pop(ANTHROPIC_KEY_ENV, None)  # codex never needs the claude fallback's key
+    run_env.pop(ELSEVIER_KEY_ENV, None)  # nor the Elsevier API key
     if env:
         run_env.update(env)
     # CODEX_HOME intentionally NOT set here; codex resolves /home/agastya/.codex.
@@ -645,14 +646,13 @@ async def run_selftest(run_dir: Path, *, env: dict[str, str] | None = None) -> S
 # ---------------------------------------------------------------------------
 
 SECRETS_ENV_CACHE = Path.home() / ".cache" / "secrets_env"
-_UNSET = object()
-_key_cache: object = _UNSET
+ELSEVIER_KEY_ENV = "ELSEVIER_API_KEY"
+_key_cache: dict[str, str | None] = {}
 
 
-def _read_key_from_secrets_cache(path: Path) -> str | None:
-    """Parse ``export ANTHROPIC_API_KEY='value'`` (or bare KEY=value) out of the
-    login shell's mode-600 secrets cache. Never logs or returns anything but the
-    value itself."""
+def _read_key_from_secrets_cache(path: Path, name: str = ANTHROPIC_KEY_ENV) -> str | None:
+    """Parse ``export NAME='value'`` (or bare NAME=value) out of the login shell's
+    mode-600 secrets cache. Never logs or returns anything but the value itself."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -661,8 +661,8 @@ def _read_key_from_secrets_cache(path: Path) -> str | None:
         line = line.strip()
         if line.startswith("export "):
             line = line[len("export "):].lstrip()
-        name, sep, raw = line.partition("=")
-        if not sep or name.strip() != ANTHROPIC_KEY_ENV:
+        key_name, sep, raw = line.partition("=")
+        if not sep or key_name.strip() != name:
             continue
         try:
             parts = shlex.split(raw, posix=True)
@@ -672,23 +672,32 @@ def _read_key_from_secrets_cache(path: Path) -> str | None:
     return None
 
 
-def anthropic_api_key() -> str | None:
-    """The Anthropic API key for the claude executor, resolved ONCE per process:
-    the process environment first, else ``~/.cache/secrets_env``. Held only in
-    this module-level cache and passed only in the claude subprocess env — never
-    stored in state, argv or logs. ``None`` ⇒ the claude executor is unavailable."""
-    global _key_cache
-    if _key_cache is _UNSET:
-        key = (os.environ.get(ANTHROPIC_KEY_ENV) or "").strip()
+def load_secret(name: str) -> str | None:
+    """A secret resolved ONCE per process: the process environment first, else
+    ``~/.cache/secrets_env``. Held only in this module-level cache — never stored
+    in state, argv or logs. ``None`` means the secret is unavailable."""
+    if name not in _key_cache:
+        key = (os.environ.get(name) or "").strip()
         if not key:
-            key = _read_key_from_secrets_cache(SECRETS_ENV_CACHE) or ""
-        _key_cache = key or None
-    return _key_cache  # type: ignore[return-value]
+            key = _read_key_from_secrets_cache(SECRETS_ENV_CACHE, name) or ""
+        _key_cache[name] = key or None
+    return _key_cache[name]
+
+
+def anthropic_api_key() -> str | None:
+    """The Anthropic API key for the claude executor (see ``load_secret``); passed
+    only in the claude subprocess env. ``None`` ⇒ the claude executor is unavailable."""
+    return load_secret(ANTHROPIC_KEY_ENV)
+
+
+def elsevier_api_key() -> str | None:
+    """The Elsevier Article Retrieval API key (AGA-1462); sent only as the
+    ``X-ELS-APIKey`` header to api.elsevier.com. ``None`` ⇒ the strategy is skipped."""
+    return load_secret(ELSEVIER_KEY_ENV)
 
 
 def reset_anthropic_key_cache() -> None:
-    global _key_cache
-    _key_cache = _UNSET
+    _key_cache.clear()
 
 
 def build_argv_claude(run_dir: Path, prompt: str) -> list[str]:
@@ -815,6 +824,7 @@ async def run_claude(
     read it; anything retained from the run has the key value redacted."""
     run_dir.mkdir(parents=True, exist_ok=True)
     run_env = dict(os.environ)
+    run_env.pop(ELSEVIER_KEY_ENV, None)
     if env:
         run_env.update(env)
     run_env[ANTHROPIC_KEY_ENV] = api_key

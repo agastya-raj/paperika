@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import http.server
+import logging
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ import threading
 import time
 
 from fastapi.testclient import TestClient
+import httpx
 import pytest
 
 from paperika.bridge import app as bridge_app
@@ -88,6 +90,12 @@ def _no_claude_key(monkeypatch):
     """Default: the claude fallback is UNAVAILABLE (no key), regardless of the
     developer's real env / ~/.cache/secrets_env. Driver-chain tests opt in."""
     monkeypatch.setattr(executor, "anthropic_api_key", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_elsevier_key(monkeypatch):
+    """Default: the Elsevier API step is skipped (no key). AGA-1462 tests opt in."""
+    monkeypatch.setattr(executor, "elsevier_api_key", lambda: None)
 
 
 def _now() -> datetime:
@@ -1681,6 +1689,7 @@ def test_healthz_reports_per_strategy_attempts(cfg):
     body = client.get("/healthz", headers=_auth()).json()
     assert body["limits"]["attempts_today"] == {
         "direct_fetch": 2, "scripted_browser": 1, "codex_bridge": 3, "claude_bridge": 0,
+        "elsevier_api": 0,
     }
     assert body["limits"]["downloads_today"] == 6
 
@@ -2800,3 +2809,207 @@ def test_missing_claude_cli_is_retryable_not_a_crash(tmp_path, monkeypatch):
     result = asyncio.run(executor.run_claude(tmp_path / "run", "prompt", "sk-test"))
     assert result.kind == "executor_died"
     assert "not found" in result.notes
+
+
+# ------------------------------------- AGA-1462: Elsevier Article Retrieval API ---
+
+ELS_KEY = "els-SUPERSECRET-key-0123456789abcdef"
+ELS_DOI = "10.1016/j.example.2026.01.001"
+ELS_TITLE = "Elsevier Entitled Paper On Optical Networks"
+
+
+def _els_pdf(doi: str = ELS_DOI, title: str = ELS_TITLE) -> bytes:
+    return (b"%PDF-1.4\n/Title (" + title.encode() + b")\n" + doi.encode() + b"\n"
+            + b"x" * 12_000 + b"\n%%EOF\n")
+
+
+@pytest.fixture
+def els(cfg, monkeypatch):
+    """Elsevier step enabled with a key; MockTransport records every request.
+    ``els.handler`` is replaced per test; tier 1 is a counting stub that lands a
+    verified PDF so a fall-through is observable as X-Paperika-Tier: direct_fetch."""
+    class Ctx:
+        requests: list = []
+        tier1_runs = {"n": 0}
+        handler = staticmethod(lambda req: httpx.Response(200, content=_els_pdf(),
+                                                          headers={"content-type": "application/pdf"}))
+    ctx = Ctx()
+    ctx.requests = []
+    monkeypatch.setattr(executor, "elsevier_api_key", lambda: ELS_KEY)
+    monkeypatch.setattr(direct_fetch, "is_public_http_url", lambda url: "internal" not in url)
+    monkeypatch.setitem(limits.RATE_RULES, "elsevier_api", (0, 500))
+
+    def _handle(req: httpx.Request) -> httpx.Response:
+        ctx.requests.append(req)
+        return ctx.handler(req)
+    monkeypatch.setattr(direct_fetch, "_TEST_TRANSPORT", httpx.MockTransport(_handle))
+
+    inner = _tier_download_stub()
+
+    async def _tier1(**kwargs):
+        ctx.tier1_runs["n"] += 1
+        return await inner(**kwargs)
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _tier1)
+    return ctx
+
+
+def _els_post(cfg, doi: str = ELS_DOI):
+    client = TestClient(bridge_app.create_app(cfg))
+    return client, client.post("/download", headers=_auth(), json={"doi": doi, "title": ELS_TITLE})
+
+
+def _els_rows(cfg):
+    con = _conn(cfg)
+    rows = con.execute(
+        "SELECT strategy, outcome FROM paper_attempts WHERE strategy='elsevier_api'").fetchall()
+    con.close()
+    return [(r["strategy"], r["outcome"]) for r in rows]
+
+
+def test_elsevier_200_pdf_delivered_with_tier_and_attempt_row(cfg, els):
+    client, resp = _els_post(cfg)
+    assert resp.status_code == 200
+    assert resp.headers["X-Paperika-Tier"] == "elsevier_api"
+    assert resp.content.startswith(b"%PDF-")
+    assert els.tier1_runs["n"] == 0
+    req = els.requests[0]
+    assert str(req.url) == "https://api.elsevier.com/content/article/doi/" + ELS_DOI
+    assert req.headers["X-ELS-APIKey"] == ELS_KEY and req.headers["Accept"] == "application/pdf"
+    assert _els_rows(cfg) == [("elsevier_api", "completed")]
+    health = client.get("/healthz", headers=_auth()).json()
+    assert health["elsevier"] == {"key_present": True, "key_invalid": False, "attempts_today": 1}
+    assert ELS_KEY not in json.dumps(health)
+
+
+def test_elsevier_303_location_fetched_without_key(cfg, els):
+    def handler(req):
+        if req.url.host == "api.elsevier.com":
+            return httpx.Response(303, headers={"location": "https://cdn.example.org/p.pdf?sig=1"})
+        return httpx.Response(200, content=_els_pdf(), headers={"content-type": "application/pdf"})
+    els.handler = handler
+    _, resp = _els_post(cfg)
+    assert resp.status_code == 200 and resp.headers["X-Paperika-Tier"] == "elsevier_api"
+    assert len(els.requests) == 2
+    assert els.requests[1].url.host == "cdn.example.org"
+    assert "x-els-apikey" not in els.requests[1].headers
+    assert ELS_KEY not in str(els.requests[1].headers) + str(els.requests[1].url)
+
+
+def test_elsevier_redirect_to_internal_host_is_refused_and_falls_through(cfg, els):
+    els.handler = lambda req: httpx.Response(302, headers={"location": "http://internal.local/x"})
+    _, resp = _els_post(cfg)
+    assert resp.status_code == 200 and resp.headers["X-Paperika-Tier"] == "direct_fetch"
+    assert len(els.requests) == 1  # the internal target was never requested
+    assert _els_rows(cfg) == [("elsevier_api", "error")]
+
+
+@pytest.mark.parametrize("status,headers,content", [
+    (403, {}, b"not entitled"),
+    (404, {}, b"no such article"),
+    (202, {}, b""),
+    (429, {"X-ELS-Status": "QUOTA_EXCEEDED", "X-RateLimit-Remaining": "0"}, b""),
+    (200, {"content-type": "text/html"}, b"<html>" + b"x" * 20_000),
+    (200, {"content-type": "application/pdf"}, b"%PDF-1.4 tiny"),
+])
+def test_elsevier_miss_falls_through_to_tier1_without_verdict(cfg, els, status, headers, content):
+    els.handler = lambda req: httpx.Response(status, headers=headers, content=content)
+    _, resp = _els_post(cfg)
+    assert resp.status_code == 200 and resp.headers["X-Paperika-Tier"] == "direct_fetch"
+    assert els.tier1_runs["n"] == 1
+    rows = _els_rows(cfg)
+    assert len(rows) == 1 and rows[0][1] in ("no_pdf", "error")
+
+
+def test_elsevier_network_error_falls_through(cfg, els):
+    def boom(req):
+        raise httpx.ConnectError("boom")
+    els.handler = boom
+    _, resp = _els_post(cfg)
+    assert resp.headers["X-Paperika-Tier"] == "direct_fetch"
+    assert _els_rows(cfg) == [("elsevier_api", "error")]
+
+
+def test_elsevier_429_logs_rate_headers_but_not_key(cfg, els, caplog):
+    els.handler = lambda req: httpx.Response(
+        429, headers={"X-ELS-Status": "QUOTA_EXCEEDED", "X-RateLimit-Remaining": "0"})
+    with caplog.at_level(logging.DEBUG):
+        _els_post(cfg)
+    assert "QUOTA_EXCEEDED" in caplog.text and "x-ratelimit-remaining" in caplog.text.lower()
+    assert ELS_KEY not in caplog.text
+
+
+def test_elsevier_401_latches_key_invalid_and_later_200_clears(cfg, els, caplog):
+    els.handler = lambda req: httpx.Response(401)
+    with caplog.at_level(logging.WARNING):
+        client, resp = _els_post(cfg)
+    assert resp.headers["X-Paperika-Tier"] == "direct_fetch"
+    assert "401" in caplog.text and ELS_KEY not in caplog.text
+    assert client.get("/healthz", headers=_auth()).json()["elsevier"]["key_invalid"] is True
+    state = json.loads((cfg.db_path.parent / "bridge_state.json").read_text())
+    assert state["elsevier_key_invalid"] is True and ELS_KEY not in json.dumps(state)
+
+    # A distinct DOI so the dedupe cache does not answer the second request.
+    els.handler = lambda req: httpx.Response(
+        200, content=_els_pdf("10.1016/j.example.2026.02.002", "Second Distinct Paper Title"),
+        headers={"content-type": "application/pdf"})
+    resp2 = client.post("/download", headers=_auth(),
+                        json={"doi": "10.1016/j.example.2026.02.002",
+                              "title": "Second Distinct Paper Title"})
+    assert resp2.headers["X-Paperika-Tier"] == "elsevier_api"
+    assert client.get("/healthz", headers=_auth()).json()["elsevier"]["key_invalid"] is False
+
+
+def test_elsevier_not_attempted_for_other_prefix(cfg, els):
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(),
+                       json={"doi": "10.1364/jocn.12345", "title": "Some Optica Paper"})
+    assert resp.headers["X-Paperika-Tier"] == "direct_fetch"
+    assert els.requests == [] and _els_rows(cfg) == []
+
+
+def test_elsevier_not_attempted_without_key(cfg, els, monkeypatch):
+    monkeypatch.setattr(executor, "elsevier_api_key", lambda: None)
+    client, resp = _els_post(cfg)
+    assert resp.headers["X-Paperika-Tier"] == "direct_fetch"
+    assert els.requests == [] and _els_rows(cfg) == []
+    assert client.get("/healthz", headers=_auth()).json()["elsevier"]["key_present"] is False
+
+
+def test_elsevier_rate_blocked_is_skipped_silently(cfg, els, monkeypatch):
+    monkeypatch.setitem(limits.RATE_RULES, "elsevier_api", (0, 0))
+    _, resp = _els_post(cfg)
+    assert resp.headers["X-Paperika-Tier"] == "direct_fetch"
+    assert els.requests == [] and _els_rows(cfg) == []
+
+
+def test_elsevier_identity_mismatch_quarantined_and_falls_through(cfg, els):
+    els.handler = lambda req: httpx.Response(
+        200, content=_els_pdf("10.9999/wrong", "Completely Different Words Here"),
+        headers={"content-type": "application/pdf"})
+    _, resp = _els_post(cfg)
+    assert resp.status_code == 200 and resp.headers["X-Paperika-Tier"] == "direct_fetch"
+    assert _els_rows(cfg) == [("elsevier_api", "verify_failed")]
+    assert els.tier1_runs["n"] == 1
+
+
+def test_elsevier_key_never_in_db_or_response(cfg, els):
+    _, resp = _els_post(cfg)
+    assert ELS_KEY.encode() not in resp.content
+    assert ELS_KEY not in json.dumps(dict(resp.headers))
+    assert ELS_KEY.encode() not in cfg.db_path.read_bytes()
+    for f in cfg.db_path.parent.glob("*"):
+        if f.is_file():
+            assert ELS_KEY.encode() not in f.read_bytes()
+
+
+def test_load_secret_generic_env_and_cache(monkeypatch, tmp_path):
+    cache = tmp_path / "secrets_env"
+    cache.write_text(f"export ELSEVIER_API_KEY='{ELS_KEY}'\n", encoding="utf-8")
+    monkeypatch.undo()
+    monkeypatch.delenv("ELSEVIER_API_KEY", raising=False)
+    monkeypatch.setattr(executor, "SECRETS_ENV_CACHE", cache)
+    executor.reset_anthropic_key_cache()
+    try:
+        assert executor.elsevier_api_key() == ELS_KEY
+    finally:
+        executor.reset_anthropic_key_cache()
