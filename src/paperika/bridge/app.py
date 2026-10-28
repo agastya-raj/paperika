@@ -313,8 +313,10 @@ class Bridge:
 
     # --- locate + verify (§2.6) ---
 
-    def _locate_in_window(self, window_start: datetime, window_end: datetime) -> Path | None:
-        downloads = self.config.download_dir
+    def _locate_in_window(
+        self, window_start: datetime, window_end: datetime, *, download_dir: Path | None = None
+    ) -> Path | None:
+        downloads = download_dir or self.config.download_dir
         if not downloads.exists():
             return None
         start_ts = (window_start - timedelta(seconds=SALVAGE_GRACE_SECONDS)).timestamp()
@@ -335,7 +337,8 @@ class Bridge:
         return candidates[0][1]
 
     def _within_download_window(
-        self, path: Path, window_start: datetime, window_end: datetime
+        self, path: Path, window_start: datetime, window_end: datetime,
+        *, download_dir: Path | None = None,
     ) -> bool:
         """Containment + mtime gate for a codex-REPORTED file_path (review fix,
         finding 1). The window locator already enforces both; the primary
@@ -347,7 +350,7 @@ class Bridge:
         run window (same grace as _locate_in_window)."""
         try:
             resolved = path.resolve()
-            downloads = self.config.download_dir.resolve()
+            downloads = (download_dir or self.config.download_dir).resolve()
         except OSError:
             return False
         if downloads not in resolved.parents:
@@ -413,12 +416,16 @@ class Bridge:
             ).fetchone()
         if row:
             return int(row["id"])
-        request_id = self.db.create_request(
-            raw_input=TRIAL_LEDGER_RAW_INPUT, inferred_title=None, inferred_doi=None,
-            inferred_url=None, paper_id=None,
-        )
-        self.db.update_request_status(request_id, "completed")
-        return request_id
+        # ONE statement, already in its final state: a crash can never leave a
+        # production-retryable 'queued' request behind.
+        now = limits.iso(_utc_now())
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO paper_requests (raw_input, status, created_at, updated_at) "
+                "VALUES (?, 'completed', ?, ?)",
+                (TRIAL_LEDGER_RAW_INPUT, now, now),
+            )
+            return int(cursor.lastrowid)
 
     # --- notification helper ---
 
@@ -1344,16 +1351,17 @@ async def _download_locked(
 
 
 def _locate_downloaded(
-    bridge: Bridge, file_path: str | None, window_start: datetime, window_end: datetime
+    bridge: Bridge, file_path: str | None, window_start: datetime, window_end: datetime,
+    *, download_dir: Path | None = None,
 ) -> Path | None:
     """Resolve a reported download to a trusted on-disk path (shared by codex and
     the deterministic tiers): accept the reported file ONLY when it passes the
     containment + mtime-window gate, else fall back to the window locator."""
     if file_path:
         p = Path(file_path)
-        if bridge._within_download_window(p, window_start, window_end):
+        if bridge._within_download_window(p, window_start, window_end, download_dir=download_dir):
             return p
-    return bridge._locate_in_window(window_start, window_end)
+    return bridge._locate_in_window(window_start, window_end, download_dir=download_dir)
 
 
 def _set_elsevier_key_invalid(bridge: Bridge, invalid: bool) -> None:
@@ -1852,36 +1860,6 @@ def _policy_flags(run_dir: Path) -> list[str]:
     return flags
 
 
-def _set_aside_prod_pdf(bridge: Bridge, doi: str, aside_dir: Path) -> list[tuple[Path, Path]]:
-    """The executor saves to ``<sanitized-doi>.pdf``; a trial for a DOI that
-    production already holds would overwrite (and then delete!) the dedupe cache's
-    file. Move any production-linked PDF for this DOI out of the way for the
-    trial's duration; ``_restore_aside`` puts it back (mtime preserved)."""
-    moved: list[tuple[Path, Path]] = []
-    try:
-        row = bridge.db.find_verified_pdf(doi=doi)
-        raw = row["local_pdf_path"] if row else None
-        if not raw:
-            return moved
-        original = Path(raw)
-        if original.is_file():
-            aside_dir.mkdir(parents=True, exist_ok=True)
-            target = aside_dir / original.name
-            original.replace(target)
-            moved.append((original, target))
-    except OSError:
-        logger.exception("could not set aside the production PDF for %s", doi)
-    return moved
-
-
-def _restore_aside(moved: list[tuple[Path, Path]]) -> None:
-    for original, target in moved:
-        try:
-            target.replace(original)  # overwrites any stray trial file at that name
-        except OSError:
-            logger.exception("could not restore the production PDF %s", original)
-
-
 async def _trial_locked(
     bridge: Bridge, *, doi: str, title: str, driver: str, model: str,
     effort: str | None, max_budget_usd: float | None,
@@ -1926,11 +1904,13 @@ async def _trial_locked(
     attempt_id = bridge.write_ahead(
         request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
     )
-    moved: list[tuple[Path, Path]] = []
+    # The trial's OWN download dir: nothing it writes can collide with, or be mistaken
+    # for, production files (and nothing in the production dir is ever touched).
+    trial_dl = run_dir / "downloads"
+    trial_dl.mkdir(parents=True, exist_ok=True)
     try:
-        moved = _set_aside_prod_pdf(bridge, doi, run_dir / "prod_aside")
         executor.write_task_json(run_dir, doi=doi, title=title, start_url=f"https://doi.org/{doi}")
-        prompt = executor.PROMPT_TEMPLATE.format(run_dir=str(run_dir))
+        prompt = executor.render_prompt(run_dir, download_dir=trial_dl)
         started = _utc_now()
         if driver == "claude":
             exec_result = await run_claude(
@@ -1953,9 +1933,11 @@ async def _trial_locked(
         salvaged = False
         located: Path | None = None
         if kind == "downloaded":
-            located = _locate_downloaded(bridge, exec_result.file_path, started, ended)
+            located = _locate_downloaded(
+                bridge, exec_result.file_path, started, ended, download_dir=trial_dl)
         elif kind in {"timeout", "gave_up", "executor_died", "claude_budget"}:
-            located = bridge._locate_in_window(started, ended)  # same salvage pass as prod
+            # same salvage pass as prod, confined to the trial dir
+            located = bridge._locate_in_window(started, ended, download_dir=trial_dl)
             salvaged = located is not None
         if located is not None and bridge._mechanical_gates(located):
             ok, reason = bridge.verify_identity(doi=doi, title=title, path=located)
@@ -2041,8 +2023,6 @@ async def _trial_locked(
         except Exception:
             logger.exception("could not close the trial attempt row")
         raise
-    finally:
-        _restore_aside(moved)
 
 
 # Module-level app for uvicorn (paperika.bridge.app:app). Built lazily so importing

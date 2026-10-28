@@ -3311,7 +3311,7 @@ def _fake_trial_codex(cfg, *, kind="downloaded", write_pdf=True, doi=TRIAL_DOI,
         if seen is not None:
             seen.update(kw)
             seen["run_dir"] = run_dir
-        path = cfg.download_dir / "trial.pdf"
+        path = run_dir / "downloads" / "trial.pdf"
         if write_pdf:
             _make_pdf(path, doi=doi, title=title)
         if script:
@@ -3322,6 +3322,10 @@ def _fake_trial_codex(cfg, *, kind="downloaded", write_pdf=True, doi=TRIAL_DOI,
             events=events or [],
         )
     return _fake
+
+
+def body_dir(cfg, body) -> Path:
+    return cfg.db_path.parent / "trials" / body["trial_id"]
 
 
 def _counts(cfg):
@@ -3474,7 +3478,7 @@ def test_trial_accepted_pdf_is_hashed_then_deleted_and_leaves_no_production_rows
         b"%PDF-1.4\n" + f"/Title ({TRIAL_TITLE})".encode() + b"\n" + TRIAL_DOI.encode() + b"\n%%EOF\n"
     ).hexdigest()
     assert body["file_sha256"] == expected and body["file_size"] > 0
-    assert not (cfg.download_dir / "trial.pdf").exists()  # deleted
+    assert not (body_dir(cfg, body) / "downloads" / "trial.pdf").exists()  # deleted
     assert body["tokens"] == 120 and body["cost_usd"] is None
     assert body["wall_seconds"] == 12.5 and body["final_url"] == "https://pub.example/x"
     assert body["trial_id"] and body["model"] == "gpt-6.1-sol" and body["effort"] == "medium"
@@ -3501,8 +3505,8 @@ def test_trial_gate_failure_is_reported_and_quarantined(cfg, monkeypatch):
     body = resp.json()
     assert resp.status_code == 200
     assert body["gate"] == "fail" and body["gate_reason"] and body["file_sha256"] is None
-    assert not (cfg.download_dir / "trial.pdf").exists()
-    q = cfg.db_path.parent / "trials" / body["trial_id"] / "quarantine"
+    assert not (body_dir(cfg, body) / "downloads" / "trial.pdf").exists()
+    q = body_dir(cfg, body) / "quarantine"
     assert (q / "trial.pdf").exists()
     assert _strategies(cfg) == [("trial_codex", "wrong_paper")]
     assert _counts(cfg)["papers"] == 0
@@ -3529,30 +3533,110 @@ def test_trial_salvage_on_timeout_passes_the_gate(cfg, monkeypatch):
     monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(cfg, kind="timeout"))
     body = _post_trial(TestClient(bridge_app.create_app(cfg))).json()
     assert body["kind"] == "timeout" and body["gate"] == "pass" and body["salvaged"] is True
-    assert not (cfg.download_dir / "trial.pdf").exists()
+    assert not (body_dir(cfg, body) / "downloads" / "trial.pdf").exists()
 
 
-def test_trial_leaves_a_production_pdf_for_the_same_doi_untouched(cfg, monkeypatch):
+def _prod_pdf(cfg, app, name="10.1364_jocn.trial1.pdf"):
+    prod = cfg.download_dir / name
+    _make_pdf(prod, doi=TRIAL_DOI, title=TRIAL_TITLE)
+    app.state.bridge.link_paper(doi=TRIAL_DOI, title=TRIAL_TITLE, path=prod, final_url=None)
+    return prod
+
+
+def test_trial_for_a_doi_production_holds_leaves_the_production_file_untouched(cfg, monkeypatch):
     _seed_sandbox_mode(cfg)
     app = bridge_app.create_app(cfg)
-    bridge = app.state.bridge
-    prod = cfg.download_dir / "10.1364_jocn.trial1.pdf"
-    _make_pdf(prod, doi=TRIAL_DOI, title=TRIAL_TITLE)
-    original = prod.read_bytes()
-    pid = bridge.link_paper(doi=TRIAL_DOI, title=TRIAL_TITLE, path=prod, final_url=None)
+    prod = _prod_pdf(cfg, app)
+    original, mtime = prod.read_bytes(), prod.stat().st_mtime_ns
     seen = {}
 
     async def _codex(run_dir, prompt, sandbox_mode, **kw):
-        seen["prod_present_during_run"] = prod.exists()  # set aside while the trial runs
-        _make_pdf(prod, doi=TRIAL_DOI, title=TRIAL_TITLE)  # the executor's own save target
-        return executor.ExecResult(kind="downloaded", file_path=str(prod), notes="ok")
+        seen["prod_present_during_run"] = prod.exists()  # never moved
+        seen["prompt"] = prompt
+        # the executor's save target is the TRIAL dir (prompt was redirected)
+        target = run_dir / "downloads" / "10.1364_jocn.trial1.pdf"
+        _make_pdf(target, doi=TRIAL_DOI, title=TRIAL_TITLE)
+        # production dedupe never sees trial files, even while the trial runs
+        seen["dedupe_during"] = app.state.bridge.dedupe_hit(doi=TRIAL_DOI, title=TRIAL_TITLE)
+        return executor.ExecResult(kind="downloaded", file_path=str(target), notes="ok")
     monkeypatch.setattr(bridge_app, "run_codex", _codex)
     body = _post_trial(TestClient(app)).json()
-    assert seen["prod_present_during_run"] is False
+    assert seen["prod_present_during_run"] is True and seen["dedupe_during"] == prod
+    assert executor.PROD_DOWNLOAD_DIR not in seen["prompt"]
+    assert str(body_dir(cfg, body) / "downloads") in seen["prompt"]
     assert body["gate"] == "pass"
-    assert prod.read_bytes() == original  # restored
-    assert bridge.dedupe_hit(doi=TRIAL_DOI, title=TRIAL_TITLE) == prod
-    assert bridge.db.find_verified_pdf(doi=TRIAL_DOI)["id"] == pid
+    assert prod.read_bytes() == original and prod.stat().st_mtime_ns == mtime
+    assert sorted(p.name for p in cfg.download_dir.iterdir()) == [prod.name]
+
+
+def test_trial_salvage_ignores_a_fresh_production_pdf_in_the_production_dir(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    app = bridge_app.create_app(cfg)
+    other = cfg.download_dir / "other_paper.pdf"
+    _make_pdf(other, doi="10.9999/other", title="Another Paper Entirely")
+    app.state.bridge.link_paper(doi="10.9999/other", title="Another Paper Entirely",
+                                path=other, final_url=None)
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        other.touch()  # production wrote it moments ago, inside the trial's window
+        return executor.ExecResult(kind="timeout", notes="t")
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    body = _post_trial(TestClient(app)).json()
+    assert body["gate"] == "not_run" and body["salvaged"] is False
+    assert other.exists() and app.state.bridge.dedupe_hit(
+        doi="10.9999/other", title="Another Paper Entirely") == other
+    assert not (body_dir(cfg, body) / "quarantine").exists()
+
+
+def test_crash_mid_trial_leaves_production_state_intact(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    app = bridge_app.create_app(cfg)
+    prod = _prod_pdf(cfg, app)
+    original = prod.read_bytes()
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        raise SystemExit  # process death: no finally-based cleanup would run
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    with pytest.raises(SystemExit):
+        _post_trial(TestClient(app))
+    assert prod.read_bytes() == original
+    assert app.state.bridge.dedupe_hit(doi=TRIAL_DOI, title=TRIAL_TITLE) == prod
+    assert sorted(p.name for p in cfg.download_dir.iterdir()) == [prod.name]
+
+
+def test_trial_ledger_row_is_never_queued(cfg):
+    app = bridge_app.create_app(cfg)
+    bridge = app.state.bridge
+    rid = bridge.trial_ledger_request_id()
+    assert bridge.trial_ledger_request_id() == rid
+    con = _conn(cfg)
+    rows = con.execute("SELECT status FROM paper_requests WHERE raw_input = ?",
+                       (bridge_app.TRIAL_LEDGER_RAW_INPUT,)).fetchall()
+    con.close()
+    assert [r["status"] for r in rows] == ["completed"]
+    assert bridge.db.list_retryable_requests() == []
+
+
+def test_executor_spawn_envs_lack_the_bridge_token(tmp_path, monkeypatch):
+    import asyncio
+    monkeypatch.setenv(executor.BRIDGE_TOKEN_ENV, TOKEN)
+    envs = {}
+
+    async def _spawn(argv, run_dir, run_env, *, wait_seconds):
+        envs[argv[0]] = dict(run_env)
+        return "", "", 0, False, 0.1
+    monkeypatch.setattr(executor, "_spawn", _spawn)
+    asyncio.run(executor.run_codex(tmp_path / "a", "P", "workspace-write"))
+    asyncio.run(executor.run_claude(tmp_path / "b", "P", "sk-test"))
+    assert len(envs) == 2
+    for env in envs.values():
+        assert executor.BRIDGE_TOKEN_ENV not in env and TOKEN not in env.values()
+
+
+def test_production_prompt_is_unchanged_without_a_download_dir(tmp_path):
+    assert executor.render_prompt(tmp_path) == executor.PROMPT_TEMPLATE.format(run_dir=str(tmp_path))
+    assert executor.PROD_DOWNLOAD_DIR in executor.render_prompt(tmp_path)
+    assert executor.render_prompt(tmp_path, download_dir=tmp_path / "d").count(str(tmp_path / "d")) == 3
 
 
 def test_trial_global_llm_spacing_refuses_60s_after_a_production_codex_attempt(cfg, monkeypatch):

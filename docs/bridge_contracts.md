@@ -393,8 +393,12 @@ drivers/models, under the same global lock (`429 busy` if held) and leaves no pr
 state: no dedupe/cache lookup, no Elsevier step, no tiers 1-2, nothing written to
 `papers`/`paper_links`/`paper_requests` (attempt rows hang off one reserved ledger request,
 `raw_input = 'paperika:trial_ledger'`, status `completed`). The accepted PDF is sha256'd,
-sized, then DELETED; a gate failure is quarantined under the trial's run dir. A production-
-linked PDF for the same DOI is moved aside for the trial's duration and restored.
+sized, then DELETED; a gate failure is quarantined under the trial's run dir. Every trial
+file operation is confined to the trial's OWN download dir, `<state dir>/trials/<trial_id>/downloads`
+(the prompt's download path is redirected there via `executor.render_prompt`; locate-in-window,
+salvage and quarantine all use it), so production's dir and dedupe cache are never touched.
+The ledger row is inserted already `completed` in one statement. Neither executor's spawn env
+carries `PAPERIKA_BRIDGE_TOKEN`, `ANTHROPIC_API_KEY` (codex) or `ELSEVIER_API_KEY`.
 
 Request: `{doi, title, driver: "codex"|"claude", model, effort: str|null,
 max_budget_usd: float|null}`. doi/title are sanitized exactly like `/download`.

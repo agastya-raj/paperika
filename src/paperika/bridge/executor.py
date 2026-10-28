@@ -78,6 +78,9 @@ SERVICE_TIER_FAST: list[str] = ["-c", 'service_tier="fast"']
 CLAUDE_MODEL = "claude-sonnet-5-5"
 CLAUDE_MAX_BUDGET_USD = "0.60"
 ANTHROPIC_KEY_ENV = "ANTHROPIC_API_KEY"
+# The bridge's own bearer token must never reach an executor (its last_message.txt /
+# scripts are persisted on disk): stripped from both spawn envs.
+BRIDGE_TOKEN_ENV = "PAPERIKA_BRIDGE_TOKEN"
 # Claude Code's subprocess credential scrub: strips ANTHROPIC_API_KEY (and other
 # credential-shaped vars) from the env of the Bash tool the model controls, so a
 # publisher-page prompt injection cannot read the key. Documented at
@@ -223,6 +226,17 @@ including anything suspicious you ignored)."""
 # endpoint, so a blocked/failed execution narrative cannot fabricate it the way
 # a bare "TITLE=" prefix could (the v1 false-pass: codex printed
 # "TITLE=Execution blocked (bwrap ...)" and satisfied the old substring check).
+PROD_DOWNLOAD_DIR = "/home/agastya/Downloads/papers"
+
+
+def render_prompt(run_dir: Path, *, download_dir: Path | None = None) -> str:
+    """The static prompt with ``{run_dir}`` filled. ``download_dir`` (AGA-1461 trials)
+    redirects every mention of the production download dir to a trial-private one;
+    ``None`` leaves the production prompt byte-identical."""
+    text = PROMPT_TEMPLATE.format(run_dir=str(run_dir))
+    return text.replace(PROD_DOWNLOAD_DIR, str(download_dir)) if download_dir else text
+
+
 SELFTEST_PROMPT = (
     "Use the Python at /home/agastya/paperika/.venv/bin/python. Step 1: fetch "
     "http://127.0.0.1:9224/json/version with urllib and print exactly one line: "
@@ -573,6 +587,7 @@ async def run_codex(
     run_env = dict(os.environ)
     run_env.pop(ANTHROPIC_KEY_ENV, None)  # codex never needs the claude fallback's key
     run_env.pop(ELSEVIER_KEY_ENV, None)  # nor the Elsevier API key
+    run_env.pop(BRIDGE_TOKEN_ENV, None)  # nor the bridge's bearer token
     if env:
         run_env.update(env)
     # CODEX_HOME intentionally NOT set here; codex resolves /home/agastya/.codex.
@@ -876,6 +891,7 @@ async def run_claude(
     run_dir.mkdir(parents=True, exist_ok=True)
     run_env = dict(os.environ)
     run_env.pop(ELSEVIER_KEY_ENV, None)
+    run_env.pop(BRIDGE_TOKEN_ENV, None)
     if env:
         run_env.update(env)
     run_env[ANTHROPIC_KEY_ENV] = api_key
