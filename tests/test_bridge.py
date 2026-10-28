@@ -2733,3 +2733,23 @@ def test_claude_wall_leaves_cleanup_reserve_and_recovery_skipped_past_deadline(c
     assert walls == [210.0]
     assert resp.json()["error_code"] == "executor_died"
     assert recovered["n"] == 1  # codex's recovery only; none after the overrunning claude run
+
+    # Codex round 3: the skipped recovery is latched for the next request.
+    assert client.app.state.bridge.recovery_pending is True
+
+
+def test_deferred_recovery_runs_before_browser_work_on_next_request(cfg, monkeypatch):
+    """A recovery skipped at the deadline runs at the next request's pre-flight,
+    under the lock, even though CDP probes healthy (an orphan page may be alive)."""
+    recovered = {"n": 0}
+
+    async def _recover():
+        recovered["n"] += 1
+        return chrome.RecoveryResult(True, "restart")
+    monkeypatch.setattr(chrome, "recover", _recover)
+    app = bridge_app.create_app(cfg)
+    app.state.bridge.recovery_pending = True
+    client = TestClient(app)
+    client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.r3a", "title": "Round Three A"})
+    assert recovered["n"] >= 1
+    assert app.state.bridge.recovery_pending is False

@@ -203,6 +203,10 @@ class Bridge:
     downloader: Downloader
     state_store: StateStore
     lock: asyncio.Lock
+    # A chrome recovery skipped at the request deadline (AGA-1460): the next
+    # request runs it under the lock before any browser work, even if CDP probes
+    # healthy (an orphan page from the overrun run may still be alive).
+    recovery_pending: bool = False
 
     # --- boundary sanitization (§2.4 layer 2) ---
 
@@ -977,6 +981,10 @@ async def _download_locked(
     # 5. chrome pre-flight. A sick Chrome no longer fails the whole request: tier 1
     # runs cookie-less regardless, tier 2 is skipped, and tier 3 keeps the legacy
     # 503 chrome_down behavior.
+    if bridge.recovery_pending:
+        rec = await chrome.recover()
+        bridge.state_store.update(last_recovery_action=rec.action)
+        bridge.recovery_pending = False
     await chrome.idle_recycle_if_stale()
     probe = await chrome.probe(fresh=True)
     chrome_ok = probe.ok
@@ -1268,7 +1276,10 @@ async def _run_executor_attempt(
     # lock must be released; the next request's chrome pre-flight recovers.
     if bad_outcome or exec_result.kind in {"auth_error", "claude_auth"}:
         if driver == "claude" and MONOTONIC() >= deadline:
-            logger.warning("skipping post-claude chrome recovery: request deadline passed")
+            logger.warning(
+                "deferring post-claude chrome recovery to the next request: deadline passed"
+            )
+            bridge.recovery_pending = True
             return response
         rec = await chrome.recover()
         bridge.state_store.update(last_recovery_action=rec.action)
