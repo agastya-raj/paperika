@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -37,6 +38,8 @@ from . import chrome, executor, limits
 from .direct_fetch import attempt_direct_fetch
 from .executor import run_codex
 from .scripted_browser import attempt_scripted_fetch
+
+logger = logging.getLogger(__name__)
 
 # --- constants -------------------------------------------------------------
 
@@ -135,15 +138,10 @@ _TAXONOMY: dict[str, tuple[str, str, int, str]] = {
     "bot_wall": ("bot_wall", "bot_wall", 502, "bot_wall"),
     # Both deterministic tiers walled and codex was unavailable to classify — a
     # DISTINCT error_code from codex-confirmed "bot_wall" (AGA-596 P1), still a
-    # retryable 502. Review finding 4 (2026-07-31): KC main does NOT yet contain
-    # this code in RETRYABLE_CODES today — its sources/paperika.py only documents
-    # the future addition in a comment ("have _finish_wall_evidence emit a
-    # distinct retryable code... add it to RETRYABLE_CODES when it lands"). The KC
-    # side must ship first (separate commit/PR) before this bridge change is
-    # retryable end-to-end; until then KC treats this error_code as unknown/
-    # non-retryable, same as it would treat bare "bot_wall". The notification
-    # event_type stays the documented "bot_wall" (unchanged contract) — only the
-    # HTTP error_code differs.
+    # retryable 502. KC has carried it in RETRYABLE_CODES since AGA-596 P1
+    # (knowledge-center sources/paperika.py). The notification event_type stays
+    # the documented "bot_wall" (unchanged contract) — only the HTTP error_code
+    # differs.
     "bot_wall_unclassified": (
         "bot_wall_unclassified", "bot_wall", 502, "bot_wall_unclassified",
     ),
@@ -157,6 +155,10 @@ _TAXONOMY: dict[str, tuple[str, str, int, str]] = {
     "executor_died": ("executor_died", "executor_failed", 502, "executor_died"),
     "auth_error": ("auth_error", "executor_failed", 503, "codex_auth"),
     "timeout": ("timeout", "executor_failed", 504, "executor_timeout"),
+    # AGA-1457: an UNEXPECTED exception escaped the ladder (a bug, not a verdict).
+    # 500, non-retryable, operator attention (KC: NEEDS_OPERATOR_CODES). Not an
+    # expected-failure channel: expected failures map to the kinds above.
+    "bridge_error": ("bridge_error", "executor_failed", 500, "bridge_error"),
 }
 
 
@@ -833,8 +835,15 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
         if bridge.lock.locked():
             return _json_error(429, "busy", "a download is in progress")
         async with bridge.lock:
-            return await _download_locked(bridge, doi=doi, title=title, start_url=start_url,
-                                          requested_by=payload.requested_by)
+            try:
+                return await _download_locked(bridge, doi=doi, title=title, start_url=start_url,
+                                              requested_by=payload.requested_by)
+            except Exception as exc:  # CancelledError is a BaseException: not caught
+                logger.exception("unhandled exception in /download ladder (doi=%s)", doi)
+                return _json_error(
+                    _TAXONOMY["bridge_error"][2], _TAXONOMY["bridge_error"][3],
+                    f"{type(exc).__name__}: {exc}"[:300],
+                )
 
     return app
 

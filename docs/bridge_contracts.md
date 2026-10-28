@@ -255,9 +255,9 @@ tier 3 is bounded by `executor.EXEC_WALL_SECONDS`):
 
 | Tier | Strategy label | Mechanism | Budget |
 |------|----------------|-----------|--------|
-| 1 | `direct_fetch` | `direct_fetch.attempt_direct_fetch` — authenticated HTTP GET of the DOI redirect chain + a `citation_pdf_url`/per-publisher ruleset, Chrome cookies exported over CDP | 20 s |
+| 1 | `direct_fetch` | `direct_fetch.attempt_direct_fetch` — authenticated HTTP GET of the DOI redirect chain + a `citation_pdf_url`/per-publisher ruleset, Chrome cookies exported over CDP | 60 s |
 | 2 | `scripted_browser` | `scripted_browser.attempt_scripted_fetch` — deterministic Playwright over the managed CDP Chrome (no LLM) | 45 s |
-| 3 | `codex_bridge` | `executor.run_codex` — the LLM-steered browser session | 480 s |
+| 3 | `codex_bridge` | `executor.run_codex` — the LLM-steered browser session | 900 s |
 
 **Per-strategy rate discipline** (`limits.RATE_RULES`, `(min_spacing_seconds,
 daily_cap)`): `direct_fetch` `(30, 100)`, `scripted_browser` `(90, 40)`,
@@ -286,6 +286,10 @@ compat, and a bare `check_rate(conn)` still defaults to the codex strategy.
   `sandbox_mode`, or Chrome down), the wall evidence maps to a retryable
   `502 bot_wall_unclassified` (AGA-596 P1 — distinct from codex-confirmed
   `bot_wall`) instead of `selftest_required`.
+- An UNEXPECTED exception escaping the ladder returns `500 bridge_error` (JSON,
+  `detail` = `ExcType: message`, truncated to 300 chars; AGA-1457) instead of a
+  bare plain-text 500. Non-retryable, operator-attention. The lock is released; a
+  request/attempt row left `in_progress` is reaped by the startup sweep.
 - Successful responses carry `X-Paperika-Tier: direct_fetch | scripted_browser |
   codex_bridge`.
 

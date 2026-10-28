@@ -2088,3 +2088,26 @@ def test_wall_manual_cleared_by_a_later_success_status(cfg, monkeypatch):
     assert row["manual_current_url"] is None
     assert row["manual_suggested_next_action"] is None
     con.close()
+
+
+def test_unexpected_ladder_exception_returns_coded_bridge_error(cfg, monkeypatch):
+    """AGA-1457: an unexpected exception is a JSON 500 bridge_error, and frees the lock."""
+    _seed_sandbox_mode(cfg)
+    calls = {"n": 0}
+
+    async def boom(*args, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(bridge_app, "_download_locked", boom)
+    client = TestClient(bridge_app.create_app(cfg))
+    body = {"doi": "10.1364/jocn.boom", "title": "Boom Paper"}
+    resp = client.post("/download", headers=_auth(), json=body)
+    assert resp.status_code == 500
+    assert resp.json()["error_code"] == "bridge_error"
+    assert "RuntimeError: kaboom" in resp.json()["detail"]
+    # lock was released: the second request reaches the ladder again (not 429 busy)
+    resp2 = client.post("/download", headers=_auth(), json=body)
+    assert resp2.status_code == 500
+    assert resp2.json()["error_code"] == "bridge_error"
+    assert calls["n"] == 2
