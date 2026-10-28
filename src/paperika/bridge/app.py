@@ -56,10 +56,14 @@ SWEEP_WINDOW_SECONDS = executor.EXEC_WALL_SECONDS + 30
 # 1200 s (knowledge-center sources/paperika.py paperika_timeout), so the bridge
 # must answer before it: TIER1 + TIER2 + codex's own wall (60+45+900 = 1005 s)
 # always fits, and the claude FALLBACK only starts when at least
-# FALLBACK_MIN_SECONDS remain, with its wall capped at remaining - FALLBACK_TAIL_SECONDS.
+# FALLBACK_MIN_SECONDS remain (re-checked right before its attempt row, AFTER codex
+# salvage + Chrome recovery), with its wall capped at remaining - CLEANUP_RESERVE_SECONDS.
 REQUEST_BUDGET_SECONDS = 1140
 FALLBACK_MIN_SECONDS = 180
-FALLBACK_TAIL_SECONDS = 30
+# Time held back at the end of the budget for everything that runs AFTER a claude
+# attempt's wall: salvage drain (10) + PDF verification (~20) + Chrome recovery
+# (~70) + margin. The claude wall is capped to remaining - this.
+CLEANUP_RESERVE_SECONDS = 120
 MONOTONIC = time.monotonic  # module attribute so tests can stub the clock
 
 # Per-tier wall-clock budgets for the deterministic ladder (AGA-339). Tier 3
@@ -1178,26 +1182,30 @@ async def _run_tier3(
     """Tier 3 driver chain (AGA-1460): codex first when usable, claude as the
     automatic fallback. ``sandbox_mode=None`` means codex is unusable (no selftest /
     rate-blocked / chrome) and claude runs directly."""
+    pending: dict[str, Any] = {}
     if sandbox_mode is not None:
         response = await _run_executor_attempt(
             bridge, driver="codex", request_id=request_id, run_dir=run_dir, doi=doi,
             title=title, start_url=start_url, sandbox_mode=sandbox_mode,
-            # Decided AFTER codex ran: only fall back if the claude run still fits
-            # inside the request deadline (else codex's retryable failure stands).
-            defer_failure=claude_go,
-            can_fallback=lambda: deadline - MONOTONIC() >= FALLBACK_MIN_SECONDS,
+            defer_failure=claude_go, deadline=deadline, pending=pending,
         )
         if response is not None:
             return response
-    # codex died / is unusable and claude is ready: its own attempt row.
+    # Codex died / is unusable and claude is ready. Re-read the budget NOW — after
+    # codex's salvage and Chrome recovery, which can eat it — immediately before
+    # the claude attempt row exists. Too little left: codex's retryable failure
+    # stands and no attempt row is consumed.
+    remaining = deadline - MONOTONIC()
+    if pending and remaining < FALLBACK_MIN_SECONDS:
+        return _finish_failure(bridge, request_id=request_id, **pending)
     api_key = executor.anthropic_api_key()
     assert api_key  # claude_go implies a key
     response = await _run_executor_attempt(
         bridge, driver="claude", request_id=request_id, run_dir=run_dir, doi=doi,
         title=title, start_url=start_url, sandbox_mode=None, defer_failure=False,
-        api_key=api_key,
+        api_key=api_key, deadline=deadline,
         claude_wall=max(1.0, min(float(executor.EXEC_WALL_SECONDS),
-                                 deadline - MONOTONIC() - FALLBACK_TAIL_SECONDS)),
+                                 remaining - CLEANUP_RESERVE_SECONDS)),
     )
     assert response is not None
     return response
@@ -1205,8 +1213,9 @@ async def _run_tier3(
 
 async def _run_executor_attempt(
     bridge: Bridge, *, driver: str, request_id: int, run_dir: Path, doi: str, title: str,
-    start_url: str, sandbox_mode: str | None, defer_failure: bool, api_key: str | None = None,
-    can_fallback: Any = None, claude_wall: float = float(executor.EXEC_WALL_SECONDS),
+    start_url: str, sandbox_mode: str | None, defer_failure: bool, deadline: float, api_key: str | None = None,
+    claude_wall: float = float(executor.EXEC_WALL_SECONDS),
+    pending: dict[str, Any] | None = None,
 ) -> Response | None:
     """One tier-3 executor attempt (``driver`` = codex | claude). Writes its own
     write-ahead row, runs the executor, resolves the terminal taxonomy (§2.7) — the
@@ -1235,13 +1244,11 @@ async def _run_executor_attempt(
             limits.record_attempt_cost(conn, attempt_id, exec_result.cost_usd)
 
     bad_outcome = exec_result.kind in {"timeout", "gave_up", "executor_died", "claude_budget"}
-    if defer_failure and can_fallback is not None and not can_fallback():
-        defer_failure = False  # no time left for a fallback: codex's failure stands
     response = await _resolve_outcome(
         bridge, exec_result=exec_result, request_id=request_id, attempt_id=attempt_id,
         doi=doi, title=title, run_dir=run_dir, window_start=started, window_end=ended,
         screenshot=screenshot, tier_label=strategy,
-        defer_failure=defer_failure,
+        defer_failure=defer_failure, deferred=pending,
     )
 
     # A runtime auth failure means that driver's login/key is dead. Retrying burns
@@ -1256,8 +1263,13 @@ async def _run_executor_attempt(
     elif exec_result.kind == "claude_auth":
         bridge.state_store.update(claude_last_selftest_ok=False)
 
-    # chrome recovery on bad outcomes (still holding the lock)
+    # chrome recovery on bad outcomes (still holding the lock). After a claude run
+    # that overran the request deadline, skip it: KC has already timed out and the
+    # lock must be released; the next request's chrome pre-flight recovers.
     if bad_outcome or exec_result.kind in {"auth_error", "claude_auth"}:
+        if driver == "claude" and MONOTONIC() >= deadline:
+            logger.warning("skipping post-claude chrome recovery: request deadline passed")
+            return response
         rec = await chrome.recover()
         bridge.state_store.update(last_recovery_action=rec.action)
 
@@ -1341,6 +1353,7 @@ async def _resolve_outcome(
     bridge: Bridge, *, exec_result: executor.ExecResult, request_id: int, attempt_id: int,
     doi: str, title: str, run_dir: Path, window_start: datetime, window_end: datetime,
     screenshot: str | None, tier_label: str = "codex_bridge", defer_failure: bool = False,
+    deferred: dict[str, Any] | None = None,
 ) -> Response | None:
     """Resolve an executor result. ``defer_failure`` (tier-3 fallback, AGA-1460):
     a failure that survives salvage resolves only the attempt row and returns None,
@@ -1353,6 +1366,9 @@ async def _resolve_outcome(
                 attempt_id, outcome=_TAXONOMY[kind][0], message=message,
                 screenshot_path=screenshot, current_url=exec_result.final_url,
             )
+            if deferred is not None:  # lets the caller finalize it if no fallback runs
+                deferred.update(kind=kind, attempt_id=attempt_id, screenshot=screenshot,
+                                message=message, final_url=exec_result.final_url)
             return None
         return _finish_failure(bridge, kind=kind, request_id=request_id,
                                attempt_id=attempt_id, screenshot=screenshot,

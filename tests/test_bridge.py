@@ -2599,11 +2599,12 @@ def test_request_budget_pinned_under_kc_client_timeout():
     # tiers 1+2 and codex's own wall always fit, so codex is never cut short
     assert (bridge_app.TIER1_BUDGET + bridge_app.TIER2_BUDGET + executor.EXEC_WALL_SECONDS
             < bridge_app.REQUEST_BUDGET_SECONDS)
-    # a fallback that starts at the minimum still has a positive wall after the tail
-    assert bridge_app.FALLBACK_MIN_SECONDS - bridge_app.FALLBACK_TAIL_SECONDS > 0
-    # worst case: fallback wall = remaining - tail, so the chain ends inside the budget
-    assert (bridge_app.REQUEST_BUDGET_SECONDS - bridge_app.FALLBACK_TAIL_SECONDS
-            < kc_timeout)
+    # a fallback that starts at the minimum still has a positive wall after the reserve
+    assert bridge_app.FALLBACK_MIN_SECONDS - bridge_app.CLEANUP_RESERVE_SECONDS > 0
+    # worst case: claude wall = remaining - reserve, so wall + drain/verify/recovery
+    # (the reserve) lands exactly on the budget, inside KC's timeout
+    assert bridge_app.REQUEST_BUDGET_SECONDS < kc_timeout
+    assert bridge_app.CLEANUP_RESERVE_SECONDS >= 10 + 20 + 70  # drain + verify + recovery
 
 
 def _clock(monkeypatch, *times):
@@ -2625,7 +2626,7 @@ def test_fallback_skipped_when_less_than_minimum_remains(cfg, monkeypatch):
     codex, claude = {"n": 0}, {"n": 0}
     monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind="executor_died"))
     monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude))
-    # deadline = 0 + 1140; after codex only 100 s remain (< 180)
+    # deadline = 0 + 1140; by the post-salvage/recovery re-check only 100 s remain (< 180)
     _clock(monkeypatch, 0, 1040)
     client = TestClient(bridge_app.create_app(cfg))
     resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.dl1", "title": "Deadline One"})
@@ -2643,11 +2644,11 @@ def test_fallback_wall_is_capped_to_remaining_minus_tail(cfg, monkeypatch):
         walls.append(kw["wall_seconds"])
         return executor.ExecResult(kind="paywalled_no_access", notes="n")
     monkeypatch.setattr(bridge_app, "run_claude", _claude)
-    # deadline 1140; at the fallback check remaining = 400; at launch remaining = 300
-    _clock(monkeypatch, 0, 740, 840)
+    # deadline 1140; at the re-check (right before the claude row) remaining = 300
+    _clock(monkeypatch, 0, 840)
     client = TestClient(bridge_app.create_app(cfg))
     client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.dl2", "title": "Deadline Two"})
-    assert walls == [270.0]  # min(900, 300 - 30)
+    assert walls == [180.0]  # min(900, 300 - CLEANUP_RESERVE_SECONDS)
 
 
 def test_claude_budget_exhausted_after_writing_pdf_is_salvaged(cfg, monkeypatch):
@@ -2671,3 +2672,64 @@ def test_claude_budget_without_pdf_stays_retryable_claude_budget(cfg, monkeypatc
     client = TestClient(bridge_app.create_app(cfg))
     resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.nb", "title": "No PDF Budget"})
     assert resp.status_code == 502 and resp.json()["error_code"] == "claude_budget"
+
+
+def test_recovery_after_codex_death_cannot_eat_the_fallback_minimum(cfg, monkeypatch):
+    """Round 2 #2: codex dies with 181 s left; its Chrome recovery takes the clock to
+    111 s remaining. The budget is re-checked AFTER recovery, right before the claude
+    row: no claude attempt row, codex's retryable failure stands."""
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    claude = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder({"n": 0}, kind="executor_died"))
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude))
+    t = {"now": 0.0}
+    monkeypatch.setattr(bridge_app, "MONOTONIC", lambda: t["now"])
+
+    async def _slow_recover():
+        t["now"] = 1140 - 181 + 70  # codex ended with 181 s left; recovery takes 70 s -> 111 s left
+        return chrome.RecoveryResult(True, "restart")
+    monkeypatch.setattr(chrome, "recover", _slow_recover)
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.r2a", "title": "Round Two A"})
+    assert claude["n"] == 0 and resp.json()["error_code"] == "executor_died"
+    assert [st for st, _ in _strategies(cfg)] == [
+        "direct_fetch", "scripted_browser", "codex_bridge"]  # no claude row consumed
+    con = _conn(cfg)
+    status = con.execute("SELECT status FROM paper_requests ORDER BY id DESC LIMIT 1").fetchone()[0]
+    con.close()
+    assert status == "failed"
+
+
+def test_claude_wall_leaves_cleanup_reserve_and_recovery_skipped_past_deadline(cfg, monkeypatch):
+    """Round 2 #1: claude starts with 330 s left -> wall 210 (reserve 120); when its
+    run ends past the deadline, Chrome recovery is skipped so the lock is released."""
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder({"n": 0}, kind="executor_died"))
+    t = {"now": 0.0}
+    monkeypatch.setattr(bridge_app, "MONOTONIC", lambda: t["now"])
+    recovered = {"n": 0}
+
+    async def _recover():
+        recovered["n"] += 1
+        return chrome.RecoveryResult(True, "restart")
+    monkeypatch.setattr(chrome, "recover", _recover)
+    walls = []
+
+    async def _claude(run_dir, prompt, api_key, **kw):
+        walls.append(kw["wall_seconds"])
+        t["now"] = 1141.0  # ran to / past the deadline
+        return executor.ExecResult(kind="executor_died", notes="died late")
+    monkeypatch.setattr(bridge_app, "run_claude", _claude)
+
+    # put the clock at 810 s elapsed (330 remaining) once codex is done
+    async def _codex(run_dir, prompt, sandbox_mode):
+        t["now"] = 810.0
+        return executor.ExecResult(kind="executor_died", notes="codex died")
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.r2b", "title": "Round Two B"})
+    assert walls == [210.0]
+    assert resp.json()["error_code"] == "executor_died"
+    assert recovered["n"] == 1  # codex's recovery only; none after the overrunning claude run

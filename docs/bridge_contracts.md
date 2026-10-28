@@ -349,6 +349,11 @@ download not found" (was `codex_gave_up`).
 **Request budget.** KC's client timeout is 1200 s, so `/download` carries one
 deadline (`app.REQUEST_BUDGET_SECONDS` = 1140) set when the ladder starts. Tiers
 1+2+codex's wall (60+45+900 = 1005 s) always fit. The claude fallback only starts
-when at least `FALLBACK_MIN_SECONDS` (180) remain (otherwise codex's retryable
-failure stands) and its wall is `min(900, remaining - FALLBACK_TAIL_SECONDS (30))`.
+when at least `FALLBACK_MIN_SECONDS` (180) remain, re-checked right before the
+claude attempt row is created (i.e. AFTER codex's salvage and Chrome recovery, which
+can consume budget); otherwise codex's retryable failure stands and no claude row is
+written. Claude's wall is `min(900, remaining - CLEANUP_RESERVE_SECONDS (120))`; the
+reserve covers the salvage drain (10 s) + PDF verification (~20 s) + Chrome recovery
+(~70 s). If a claude run ends past the deadline, Chrome recovery is skipped (the next
+request's pre-flight recovers it) so the lock is released promptly.
 `claude_budget` runs go through the same salvage path as timeouts/`executor_died`.
