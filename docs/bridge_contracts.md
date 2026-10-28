@@ -324,13 +324,17 @@ salvage and wall handoff; each driver writes its own write-ahead attempt row
   `throttled`, `gave_up`, `wrong_paper`).
 - **Key:** `ANTHROPIC_API_KEY` from the process env, else `~/.cache/secrets_env`,
   resolved once per process, passed only in the claude subprocess env (never argv,
-  state or logs). No key => claude is unavailable and the codex result stands.
-- **claude outcomes:** one JSON envelope. Invalid/missing envelope, `is_error`,
-  refusal => `executor_died`; budget exhausted => `claude_budget`; 401 =>
+  state or logs; the claude run sets `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` so the
+  model's Bash tool cannot read it, with `--allowedTools Bash` because the scrub
+  resets the permission mode; the key value is redacted from everything retained).
+  No key => claude is unavailable and the codex result stands.
+- **claude outcomes:** one JSON envelope. ONLY a schema-valid `structured_output`
+  on a non-error envelope is a verdict; free-text `result` is never parsed. Invalid/
+  missing envelope, `is_error`, refusal, or no valid structured output => `executor_died`; budget exhausted => `claude_budget`; 401 =>
   `claude_auth` (latches claude off until `POST /selftest/claude` passes). A valid
   structured outcome maps exactly like codex's.
-- **Infra failures are retryable:** a run reporting `gave_up` whose events/notes
-  contain `INFRA_FAILURE_MARKERS` (`ERR_NAME_NOT_RESOLVED`, `net::ERR_`,
+- **Infra failures are retryable:** a run reporting `gave_up` whose FINAL notes
+  (not tool inputs/outputs or earlier recovered errors) contain `INFRA_FAILURE_MARKERS` (`ERR_NAME_NOT_RESOLVED`, `net::ERR_`,
   `Target closed`, `Browser has been closed`, `connection refused`) is
   `executor_died`, not terminal `codex_gave_up`.
 - **`POST /selftest/claude`:** no-browse CLI+key+schema check; persists
@@ -341,3 +345,10 @@ salvage and wall handoff; each driver writes its own write-ahead attempt row
 New `error_code`s: `claude_auth` (503, operator), `claude_budget` (502, retryable),
 `codex_quota` (502, retryable). `executor_died` now also covers AGA-490's "claimed
 download not found" (was `codex_gave_up`).
+
+**Request budget.** KC's client timeout is 1200 s, so `/download` carries one
+deadline (`app.REQUEST_BUDGET_SECONDS` = 1140) set when the ladder starts. Tiers
+1+2+codex's wall (60+45+900 = 1005 s) always fit. The claude fallback only starts
+when at least `FALLBACK_MIN_SECONDS` (180) remain (otherwise codex's retryable
+failure stands) and its wall is `min(900, remaining - FALLBACK_TAIL_SECONDS (30))`.
+`claude_budget` runs go through the same salvage path as timeouts/`executor_died`.

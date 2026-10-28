@@ -58,6 +58,12 @@ SERVICE_TIER_FAST: list[str] = ["-c", 'service_tier="fast"']
 CLAUDE_MODEL = "claude-sonnet-5-5"
 CLAUDE_MAX_BUDGET_USD = "0.60"
 ANTHROPIC_KEY_ENV = "ANTHROPIC_API_KEY"
+# Claude Code's subprocess credential scrub: strips ANTHROPIC_API_KEY (and other
+# credential-shaped vars) from the env of the Bash tool the model controls, so a
+# publisher-page prompt injection cannot read the key. Documented at
+# code.claude.com/docs/en/env-vars. Side effect: it forces the permission mode back
+# to default, so the Bash tool must be allow-listed explicitly (--allowedTools).
+CLAUDE_SCRUB_ENV = {"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"}
 
 # Final-message JSON Schema (--output-schema). Forces the executor's last message
 # into the shape the bridge parses. OpenAI strict structured outputs require
@@ -326,7 +332,7 @@ def _parse_outcome_text(text: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _outcome_to_result(parsed: dict | None, base: dict, *, infra_text: str = "") -> ExecResult:
+def _outcome_to_result(parsed: dict | None, base: dict) -> ExecResult:
     """Map a parsed structured outcome to an ExecResult. Shared by codex and claude
     so the two drivers' verdicts mean exactly the same thing."""
     if parsed is None or "outcome" not in parsed:
@@ -359,9 +365,10 @@ def _outcome_to_result(parsed: dict | None, base: dict, *, infra_text: str = "")
     if isinstance(outcome, str) and outcome in {"throttled", "paywalled_no_access", "bot_wall"}:
         return ExecResult(kind=outcome, final_url=final_url, notes=notes, **base)
     if outcome == "gave_up":
-        # AGA-1460: gave_up caused by network/browser infrastructure is a death, not
-        # a verdict on the paper.
-        marker = _infra_failure_marker(notes, infra_text)
+        # AGA-1460: gave_up whose FINAL stated reason (the outcome's notes) is a
+        # network/browser infrastructure failure is a death, not a verdict. Tool
+        # inputs/outputs and earlier recovered errors are deliberately NOT searched.
+        marker = _infra_failure_marker(notes)
         if marker:
             return ExecResult(
                 kind="executor_died", final_url=final_url,
@@ -422,12 +429,7 @@ def classify(
             **base,
         )
 
-    # Only the events' error-ish payloads and command output could hold an infra
-    # marker; the whole event blob is searched (explicit marker list, AGA-1460).
-    return _outcome_to_result(
-        _parse_outcome_text(last_message), base,
-        infra_text=json.dumps(events, ensure_ascii=False) if events else "",
-    )
+    return _outcome_to_result(_parse_outcome_text(last_message), base)
 
 
 def build_argv(
@@ -682,6 +684,7 @@ def build_argv_claude(run_dir: Path, prompt: str) -> list[str]:
         "-p",
         "--bare",
         "--tools", "Bash",
+        "--allowedTools", "Bash",
         "--no-session-persistence",
         "--model", CLAUDE_MODEL,
         "--max-budget-usd", CLAUDE_MAX_BUDGET_USD,
@@ -749,9 +752,37 @@ def classify_claude(
             **base,
         )
 
+    # ONLY a schema-valid structured_output is a verdict (Anthropic's structured
+    # outputs contract). Free-text `result` is never parsed: a refusal or an example
+    # JSON in prose must not become a terminal verdict.
     structured = envelope.get("structured_output")
-    parsed = structured if isinstance(structured, dict) else _parse_outcome_text(result_text)
-    return _outcome_to_result(parsed, base, infra_text=result_text)
+    if not _outcome_schema_valid(structured):
+        return ExecResult(
+            kind="executor_died",
+            notes="claude returned no schema-valid structured_output; no verdict was reached",
+            **base,
+        )
+    return _outcome_to_result(structured, base)
+
+
+def _outcome_schema_valid(value: object) -> bool:
+    """Validate against OUTCOME_SCHEMA (additionalProperties=false, all required)."""
+    if not isinstance(value, dict):
+        return False
+    props = OUTCOME_SCHEMA["properties"]
+    if set(value) != set(props):
+        return False
+    if value["outcome"] not in props["outcome"]["enum"]:
+        return False
+    for key in ("file_path", "final_url"):
+        if value[key] is not None and not isinstance(value[key], str):
+            return False
+    return isinstance(value["notes"], str)
+
+
+def redact_secret(text: str, secret: str | None) -> str:
+    """Exact-string replace of a known secret with ``***``."""
+    return text.replace(secret, "***") if secret and text else text
 
 
 async def run_claude(
@@ -759,23 +790,31 @@ async def run_claude(
     prompt: str,
     api_key: str,
     *,
-    write_schema: bool = False,
+    wall_seconds: float = EXEC_WALL_SECONDS,
     env: dict[str, str] | None = None,
 ) -> ExecResult:
     """Spawn ``claude -p ...`` in its own process group with the same wall /
-    kill-grace discipline as run_codex. The key travels only in this subprocess's
-    env. (``write_schema`` is accepted for signature parity; the schema is inline.)"""
+    kill-grace discipline as run_codex (``wall_seconds`` lets the ladder shrink it
+    to the request deadline). The key travels only in this subprocess's env, with
+    Claude Code's subprocess credential scrub on so the model's Bash tool cannot
+    read it; anything retained from the run has the key value redacted."""
     run_dir.mkdir(parents=True, exist_ok=True)
     run_env = dict(os.environ)
     if env:
         run_env.update(env)
     run_env[ANTHROPIC_KEY_ENV] = api_key
+    run_env.update(CLAUDE_SCRUB_ENV)
     stdout, stderr, exit_code, timed_out, wall = await _spawn(
-        build_argv_claude(run_dir, prompt), run_dir, run_env, wait_seconds=EXEC_WALL_SECONDS
+        build_argv_claude(run_dir, prompt), run_dir, run_env, wait_seconds=wall_seconds
     )
-    return classify_claude(
-        exit_code=exit_code, stdout=stdout, stderr=stderr, timed_out=timed_out, wall_seconds=wall
+    result = classify_claude(
+        exit_code=exit_code, stdout=redact_secret(stdout, api_key),
+        stderr=redact_secret(stderr, api_key), timed_out=timed_out, wall_seconds=wall,
     )
+    result.notes = redact_secret(result.notes, api_key)
+    result.final_url = redact_secret(result.final_url or "", api_key) or None
+    result.file_path = redact_secret(result.file_path or "", api_key) or None
+    return result
 
 
 # No-browse selftest: proves the CLI, the key and the structured-output schema.

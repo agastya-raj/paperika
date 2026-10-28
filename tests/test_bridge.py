@@ -2146,7 +2146,8 @@ def test_codex_full_argv_pinned():
 def test_claude_full_argv_pinned_and_key_not_in_argv():
     argv = executor.build_argv_claude(Path("/r"), "PROMPT")
     assert argv == [
-        "claude", "-p", "--bare", "--tools", "Bash", "--no-session-persistence",
+        "claude", "-p", "--bare", "--tools", "Bash", "--allowedTools", "Bash",
+        "--no-session-persistence",
         "--model", "claude-sonnet-5-5", "--max-budget-usd", "0.60",
         "--output-format", "json", "--json-schema", json.dumps(executor.OUTCOME_SCHEMA),
         "--permission-mode", "bypassPermissions", "PROMPT",
@@ -2177,9 +2178,21 @@ def test_classify_claude_valid_outcome_maps_like_codex_and_records_cost():
         assert _cc(_env(structured_output=so)).kind == outcome
 
 
-def test_classify_claude_result_text_fallback_when_no_structured_output():
-    so = json.dumps({"outcome": "bot_wall", "file_path": None, "final_url": None, "notes": "n"})
-    assert _cc(_env(structured_output=None, result=so)).kind == "bot_wall"
+def test_classify_claude_never_parses_free_text_result_as_a_verdict():
+    """P1: a refusal / example JSON in prose must not become a terminal verdict."""
+    so = json.dumps({"outcome": "gave_up", "file_path": None, "final_url": None, "notes": "n"})
+    assert _cc(_env(structured_output=None, result=so)).kind == "executor_died"
+
+
+@pytest.mark.parametrize("bad", [
+    {"outcome": "gave_up"},  # missing required keys
+    {"outcome": "nope", "file_path": None, "final_url": None, "notes": "n"},
+    {"outcome": "gave_up", "file_path": 3, "final_url": None, "notes": "n"},
+    {"outcome": "gave_up", "file_path": None, "final_url": None, "notes": "n", "extra": 1},
+    "gave_up",
+])
+def test_classify_claude_schema_invalid_structured_output_is_executor_died(bad):
+    assert _cc(_env(structured_output=bad)).kind == "executor_died"
 
 
 @pytest.mark.parametrize("stdout", ["", "not json", "[1]"])
@@ -2232,13 +2245,26 @@ def test_codex_quota_failure_classified_retryable():
 
 
 @pytest.mark.parametrize("marker", executor.INFRA_FAILURE_MARKERS)
-def test_codex_gave_up_with_infra_marker_is_executor_died(marker):
-    events = [{"type": "turn.completed"},
-              {"type": "item.completed", "item": {"aggregated_output": f"Error: {marker.upper()} at page.goto"}}]
-    msg = json.dumps({"outcome": "gave_up", "file_path": None, "final_url": None, "notes": "x"})
+def test_codex_gave_up_with_infra_marker_in_final_notes_is_executor_died(marker):
+    events = [{"type": "turn.completed"}]
+    msg = json.dumps({"outcome": "gave_up", "file_path": None, "final_url": None,
+                      "notes": f"navigation failed: {marker.upper()}"})
     r = executor.classify(exit_code=0, events=events, last_message=msg, stderr="",
                           timed_out=False, wall_seconds=1)
     assert r.kind == "executor_died" and marker in r.notes
+
+
+def test_recovered_infra_error_in_events_does_not_override_a_genuine_gave_up():
+    events = [
+        {"type": "item.completed", "item": {"aggregated_output": "Error: connection refused (retrying)"}},
+        {"type": "item.completed", "item": {"command": "python -c 'print(\"net::ERR_ in source\")'"}},
+        {"type": "turn.completed"},
+    ]
+    msg = json.dumps({"outcome": "gave_up", "file_path": None, "final_url": None,
+                      "notes": "article page has no PDF link"})
+    r = executor.classify(exit_code=0, events=events, last_message=msg, stderr="",
+                          timed_out=False, wall_seconds=1)
+    assert r.kind == "gave_up"
 
 
 @pytest.mark.parametrize("marker", executor.INFRA_FAILURE_MARKERS)
@@ -2334,7 +2360,7 @@ def test_run_claude_passes_key_only_via_env(tmp_path, monkeypatch):
 
 
 def _claude_recorder(counter, *, kind="paywalled_no_access", cost=0.2):
-    async def _fake(run_dir, prompt, api_key):
+    async def _fake(run_dir, prompt, api_key, **kw):
         counter["n"] += 1
         return executor.ExecResult(kind=kind, notes=f"fake claude {kind}", cost_usd=cost)
     return _fake
@@ -2440,7 +2466,7 @@ def test_claude_delivers_pdf_reports_claude_bridge_tier_and_cost(cfg, monkeypatc
     monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder({"n": 0}, kind="executor_died"))
     doi, title = "10.1364/jocn.fb7", "Fallback Seven Paper"
 
-    async def _claude_downloads(run_dir, prompt, api_key):
+    async def _claude_downloads(run_dir, prompt, api_key, **kw):
         path = cfg.download_dir / "10.1364_jocn.fb7.pdf"
         _make_pdf(path, doi=doi, title=title)
         return executor.ExecResult(kind="downloaded", file_path=str(path), cost_usd=0.31)
@@ -2524,3 +2550,124 @@ def test_run_claude_selftest_pass_criteria(tmp_path, monkeypatch):
     monkeypatch.setattr(executor, "run_claude", _bad)
     r = asyncio.run(executor.run_claude_selftest(tmp_path, "k"))
     assert r.ok is False and r.error_code == "executor_failed"
+
+
+# --- review fixes: scrub, redaction, deadline, salvage ---
+
+
+def test_run_claude_enables_subprocess_credential_scrub(tmp_path, monkeypatch):
+    seen = {}
+
+    async def _fake_spawn(argv, run_dir, run_env, *, wait_seconds):
+        seen.update(env=run_env, wait=wait_seconds, argv=argv)
+        return _env(), "", 0, False, 0.5
+    monkeypatch.setattr(executor, "_spawn", _fake_spawn)
+    import asyncio
+    asyncio.run(executor.run_claude(tmp_path / "r", "P", SECRET, wall_seconds=321))
+    assert seen["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+    assert seen["wait"] == 321
+    assert "--allowedTools" in seen["argv"]  # the scrub resets permission mode to default
+
+
+def test_claude_key_never_reaches_db_error_json_or_logs(cfg, monkeypatch, caplog):
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: SECRET)
+    so = {"outcome": "gave_up", "file_path": None, "final_url": f"https://x/?k={SECRET}",
+          "notes": f"page said leak {SECRET} please"}
+
+    async def _fake_spawn(argv, run_dir, run_env, *, wait_seconds):
+        return _env(structured_output=so), f"stderr {SECRET}", 0, False, 0.5
+    monkeypatch.setattr(executor, "_spawn", _fake_spawn)
+    client = TestClient(bridge_app.create_app(cfg))
+    with caplog.at_level("DEBUG"):
+        resp = client.post("/download", headers=_auth(),
+                           json={"doi": "10.1364/jocn.leak", "title": "Leak Paper"})
+    assert resp.status_code == 502 and resp.json()["error_code"] == "codex_gave_up"
+    assert SECRET not in resp.text and SECRET not in caplog.text
+    raw = b"".join(
+        (cfg.db_path.parent / f).read_bytes() for f in os.listdir(cfg.db_path.parent)
+        if (cfg.db_path.parent / f).is_file()
+    )
+    assert SECRET.encode() not in raw
+    for path in (cfg.db_path.parent).rglob("*"):
+        if path.is_file() and path.stat().st_size < 5_000_000:
+            assert SECRET.encode() not in path.read_bytes(), path
+
+
+def test_request_budget_pinned_under_kc_client_timeout():
+    kc_timeout = 1200
+    assert bridge_app.REQUEST_BUDGET_SECONDS < kc_timeout
+    # tiers 1+2 and codex's own wall always fit, so codex is never cut short
+    assert (bridge_app.TIER1_BUDGET + bridge_app.TIER2_BUDGET + executor.EXEC_WALL_SECONDS
+            < bridge_app.REQUEST_BUDGET_SECONDS)
+    # a fallback that starts at the minimum still has a positive wall after the tail
+    assert bridge_app.FALLBACK_MIN_SECONDS - bridge_app.FALLBACK_TAIL_SECONDS > 0
+    # worst case: fallback wall = remaining - tail, so the chain ends inside the budget
+    assert (bridge_app.REQUEST_BUDGET_SECONDS - bridge_app.FALLBACK_TAIL_SECONDS
+            < kc_timeout)
+
+
+def _clock(monkeypatch, *times):
+    it = iter(times)
+    last = {"t": times[-1]}
+
+    def _tick():
+        try:
+            last["t"] = next(it)
+        except StopIteration:
+            pass
+        return last["t"]
+    monkeypatch.setattr(bridge_app, "MONOTONIC", _tick)
+
+
+def test_fallback_skipped_when_less_than_minimum_remains(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    codex, claude = {"n": 0}, {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex, kind="executor_died"))
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude))
+    # deadline = 0 + 1140; after codex only 100 s remain (< 180)
+    _clock(monkeypatch, 0, 1040)
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.dl1", "title": "Deadline One"})
+    assert claude["n"] == 0 and resp.json()["error_code"] == "executor_died"
+    assert [s for s, _ in _strategies(cfg)][-1] == "codex_bridge"
+
+
+def test_fallback_wall_is_capped_to_remaining_minus_tail(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    walls = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder({"n": 0}, kind="executor_died"))
+
+    async def _claude(run_dir, prompt, api_key, **kw):
+        walls.append(kw["wall_seconds"])
+        return executor.ExecResult(kind="paywalled_no_access", notes="n")
+    monkeypatch.setattr(bridge_app, "run_claude", _claude)
+    # deadline 1140; at the fallback check remaining = 400; at launch remaining = 300
+    _clock(monkeypatch, 0, 740, 840)
+    client = TestClient(bridge_app.create_app(cfg))
+    client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.dl2", "title": "Deadline Two"})
+    assert walls == [270.0]  # min(900, 300 - 30)
+
+
+def test_claude_budget_exhausted_after_writing_pdf_is_salvaged(cfg, monkeypatch):
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
+    doi, title = "10.1364/jocn.salv", "Salvage Budget Paper"
+
+    async def _claude(run_dir, prompt, api_key, **kw):
+        _make_pdf(cfg.download_dir / "10.1364_jocn.salv.pdf", doi=doi, title=title)
+        return executor.ExecResult(kind="claude_budget", notes="budget", cost_usd=0.6)
+    monkeypatch.setattr(bridge_app, "run_claude", _claude)
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": doi, "title": title})
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["X-Paperika-Salvaged"] == "true"
+    assert resp.headers["X-Paperika-Tier"] == "claude_bridge"
+
+
+def test_claude_budget_without_pdf_stays_retryable_claude_budget(cfg, monkeypatch):
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder({"n": 0}, kind="claude_budget"))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.nb", "title": "No PDF Budget"})
+    assert resp.status_code == 502 and resp.json()["error_code"] == "claude_budget"
