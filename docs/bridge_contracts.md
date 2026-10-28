@@ -363,14 +363,76 @@ download not found" (was `codex_gave_up`).
 
 **Request budget.** KC's client timeout is 1200 s, so `/download` carries one
 deadline (`app.REQUEST_BUDGET_SECONDS` = 1140) set when the ladder starts. Elsevier (30 s) + tiers
-1+2 (60+45 s) run first; codex's wall is capped like claude's: `min(900, remaining -
-CLEANUP_RESERVE_SECONDS)`, and when that is below `FALLBACK_MIN_SECONDS` tier 3 is not run
-(retryable `429 cooldown`, `retry_after_seconds` 30). The claude fallback only starts
-when at least `FALLBACK_MIN_SECONDS` (180) remain, re-checked right before the
-claude attempt row is created (i.e. AFTER codex's salvage and Chrome recovery, which
-can consume budget); otherwise codex's retryable failure stands and no claude row is
-written. Claude's wall is `min(900, remaining - CLEANUP_RESERVE_SECONDS (120))`; the
-reserve covers the salvage drain (10 s) + PDF verification (~20 s) + Chrome recovery
-(~70 s). If a claude run ends past the deadline, Chrome recovery is skipped (the next
-request's pre-flight recovers it) so the lock is released promptly.
+1+2 (60+45 s) run first. Let `R` = `CLEANUP_RESERVE_SECONDS` (120) and `W` =
+`CLAUDE_FALLBACK_WINDOW_SECONDS` (300), `remaining` = budget left at tier-3 start:
+
+- **claude fallback ready** (key present, claude selftest latch not failed, its rate rule
+  allows, Chrome ok): codex's wall is capped to leave claude a guaranteed window even after
+  a full codex TIMEOUT: `codex_wall = min(900, remaining - R - (W + R))` (495 s after the
+  usual ~105 s of deterministic tiers). The first `R` covers codex's own post-run salvage
+  drain + verification + Chrome recovery, the second claude's. If that cap is below
+  `FALLBACK_MIN_SECONDS` (180) codex is skipped and claude runs alone.
+- **claude not ready**: codex keeps `min(900, remaining - R)`.
+- **either way** a first driver whose wall would be below `FALLBACK_MIN_SECONDS` is not
+  run; tier 3 ends retryably (`429 cooldown`, `retry_after_seconds` 30).
+
+The claude fallback after a codex failure re-checks the budget right before its attempt
+row is created (AFTER codex's salvage and Chrome recovery, which consume budget): it runs
+only when `remaining - R >= W`, i.e. its wall is at least 300 s — the same window codex's cap
+reserved, so the two agree; otherwise codex's retryable failure stands and no claude row is
+written. Claude's wall is `min(900, remaining - R)`; `R` covers the salvage drain (10 s) +
+PDF verification (~20 s) + Chrome recovery (~70 s). If a claude run ends past the deadline,
+Chrome recovery is skipped (the next request's pre-flight recovers it) so the lock is
+released promptly.
 `claude_budget` runs go through the same salvage path as timeouts/`executor_died`.
+
+## `POST /admin/trial` (AGA-1461, driver bake-off)
+
+Bearer-authed like `/download`. Runs ONE named executor against one paper to compare
+drivers/models, under the same global lock (`429 busy` if held) and leaves no production
+state: no dedupe/cache lookup, no Elsevier step, no tiers 1-2, nothing written to
+`papers`/`paper_links`/`paper_requests` (attempt rows hang off one reserved ledger request,
+`raw_input = 'paperika:trial_ledger'`, status `completed`). The accepted PDF is sha256'd,
+sized, then DELETED; a gate failure is quarantined under the trial's run dir. A production-
+linked PDF for the same DOI is moved aside for the trial's duration and restored.
+
+Request: `{doi, title, driver: "codex"|"claude", model, effort: str|null,
+max_budget_usd: float|null}`. doi/title are sanitized exactly like `/download`.
+Allowlists: codex models `gpt-5.6-sol`, `gpt-6.1-sol`, effort `medium|high`; claude models
+`claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-opus-5-5`, effort `low|medium|high`
+(claude CLI `--effort <level>`); `max_budget_usd` is claude only (default 1.50, hard max
+3.00). Violations: `422 invalid_driver|invalid_model|invalid_effort|invalid_budget|invalid_doi`.
+Overrides default to the pinned values in `build_argv` / `build_argv_claude`
+(`/download` passes none).
+
+Same prompt, `task.json`, Chrome pre-flight, and wall (`min(900, budget - R)`); same
+acceptance + identity gate; same Chrome recovery latch after a bad outcome.
+
+Rate rules: strategies `trial_codex` / `trial_claude`, own daily cap 60 each, plus a GLOBAL
+LLM spacing shared with production: `429 cooldown` (+`retry_after_seconds`) when ANY of
+`codex_bridge|claude_bridge|trial_codex|trial_claude` started < 180 s ago. Production rate
+rules, `/healthz` `downloads_today`, and the production spacing never count trial rows
+(`/healthz` `limits.attempts_today` lists the trial strategies; `claude.trial_cost_usd`
+is month-to-date trial spend). Other refusals: `503 selftest_required` (codex unusable),
+`503 claude_auth` (no key / latched), `503 chrome_down`.
+
+Response (200 for every outcome that reached a run): `{trial_id, driver, model, effort,
+kind, gate: "pass"|"fail"|"not_run", gate_reason, verified_by, file_sha256, file_size,
+wall_seconds, cost_usd, tokens, final_url, notes (redacted, <= 500 chars), policy_flags,
+salvaged}`. `kind` is the executor `ExecResult.kind`; `cost_usd` is claude's envelope
+`total_cost_usd`; `tokens` sums codex JSONL `turn.completed`/`token_count` usage (null when
+absent). `policy_flags` lists `"<pattern>@<file>"` for credential/cookie/CAPTCHA-solver
+patterns (`captcha`, `solver`, `2captcha`, `anticaptcha`, `capsolver`, `password`,
+`document.cookie`, `Network.getAllCookies`, `Network.getCookies`, `storage_state`) found in
+the run dir's model-authored scripts/logs; reported, never blocking. No secret is ever in
+the response. A startup sweep closes a `running` trial row as `interrupted` without touching
+any request.
+
+## `/healthz` pinned driver models (AGA-1461)
+
+The authenticated `/healthz` reports the pinned driver models as plain constants (no
+network, no codex `models_cache.json`, which is client-version filtered and omits
+`gpt-6.1-sol`): `codex.model` (`executor.CODEX_MODEL_ID`, e.g. `"gpt-6.1-sol"`),
+`codex.reasoning_effort` (`executor.CODEX_REASONING_EFFORT`, `"high"`) and `claude.model`
+(`executor.CLAUDE_MODEL`). The daily KC watcher compares them with the Sol tier named in the
+canon; on a bump, change the constant and `POST /selftest/codex`.

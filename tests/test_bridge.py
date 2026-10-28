@@ -768,6 +768,14 @@ def _seed_full_state(cfg: PaperikaConfig, **fields) -> None:
     state_path.write_text(json.dumps(fields), encoding="utf-8")
 
 
+def test_healthz_reports_pinned_driver_models(cfg):
+    body = TestClient(bridge_app.create_app(cfg)).get("/healthz", headers=_auth()).json()
+    assert body["codex"]["model"] == "gpt-6.1-sol" == executor.CODEX_MODEL[1]
+    assert body["codex"]["reasoning_effort"] == "high"
+    assert 'model_reasoning_effort="high"' in executor.REASONING_HIGH
+    assert body["claude"]["model"] == executor.CLAUDE_MODEL == "claude-sonnet-5-5"
+
+
 def test_healthz_codex_usable_false_without_selftest(cfg):
     """AGA-493: no selftest state ⇒ codex_usable is False even if auth.json exists
     on the host — file-presence is not proof codex works."""
@@ -1689,7 +1697,7 @@ def test_healthz_reports_per_strategy_attempts(cfg):
     body = client.get("/healthz", headers=_auth()).json()
     assert body["limits"]["attempts_today"] == {
         "direct_fetch": 2, "scripted_browser": 1, "codex_bridge": 3, "claude_bridge": 0,
-        "elsevier_api": 0,
+        "elsevier_api": 0, "trial_codex": 0, "trial_claude": 0,
     }
     assert body["limits"]["downloads_today"] == 6
 
@@ -2613,6 +2621,13 @@ def test_request_budget_pinned_under_kc_client_timeout():
            + bridge_app.TIER2_BUDGET)
     assert (pre + bridge_app.FALLBACK_MIN_SECONDS + bridge_app.CLEANUP_RESERVE_SECONDS
             < bridge_app.REQUEST_BUDGET_SECONDS)
+    # AGA-1461: with claude ready, codex's capped wall + both cleanup reserves + the
+    # claude window fit the budget, and codex still gets a useful (> minimum) wall
+    # after the worst-case pre-tier-3 time
+    reserved = (2 * bridge_app.CLEANUP_RESERVE_SECONDS
+                + bridge_app.CLAUDE_FALLBACK_WINDOW_SECONDS)
+    assert bridge_app.CLAUDE_FALLBACK_WINDOW_SECONDS == 300
+    assert bridge_app.REQUEST_BUDGET_SECONDS - pre - reserved >= bridge_app.FALLBACK_MIN_SECONDS
     # a fallback that starts at the minimum still has a positive wall after the reserve
     assert bridge_app.FALLBACK_MIN_SECONDS - bridge_app.CLEANUP_RESERVE_SECONDS > 0
     # worst case: claude wall = remaining - reserve, so wall + drain/verify/recovery
@@ -2658,11 +2673,107 @@ def test_fallback_wall_is_capped_to_remaining_minus_tail(cfg, monkeypatch):
         walls.append(kw["wall_seconds"])
         return executor.ExecResult(kind="paywalled_no_access", notes="n")
     monkeypatch.setattr(bridge_app, "run_claude", _claude)
-    # deadline 1140; at the re-check (right before the claude row) remaining = 300
-    _clock(monkeypatch, 0, 0, 840)
+    # deadline 1140; at the re-check (right before the claude row) remaining = 420,
+    # the smallest that still gives claude its 300 s window after the 120 s reserve
+    _clock(monkeypatch, 0, 0, 720)
     client = TestClient(bridge_app.create_app(cfg))
     client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.dl2", "title": "Deadline Two"})
-    assert walls == [180.0]  # min(900, 300 - CLEANUP_RESERVE_SECONDS)
+    assert walls == [300.0]  # min(900, 420 - CLEANUP_RESERVE_SECONDS)
+
+
+def test_fallback_skipped_when_window_would_be_under_300(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    claude = {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder({"n": 0}, kind="executor_died"))
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude))
+    _clock(monkeypatch, 0, 0, 721)  # 419 left -> claude wall 299 < 300
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.dl2b", "title": "Deadline 2b"})
+    assert claude["n"] == 0 and resp.json()["error_code"] == "executor_died"
+
+
+def test_codex_timeout_with_claude_ready_still_gives_claude_a_300s_wall(cfg, monkeypatch):
+    """AGA-1461: realistic ladder. ~105 s of tiers, codex takes its CAPPED wall and
+    times out, codex's cleanup eats the whole reserve: claude still runs, wall >= 300."""
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    t = {"now": 0.0}
+    monkeypatch.setattr(bridge_app, "MONOTONIC", lambda: t["now"])
+    walls = {}
+
+    async def _miss_direct(**kwargs):
+        t["now"] += 60
+        return direct_fetch.DirectFetchResult(kind="no_pdf", notes="m")
+
+    async def _miss_scripted(**kwargs):
+        t["now"] += 45
+        return scripted_browser.ScriptedFetchResult(kind="no_pdf", notes="m")
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _miss_direct)
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _miss_scripted)
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        walls["codex"] = kw["wall_seconds"]
+        t["now"] += kw["wall_seconds"]
+        return executor.ExecResult(kind="timeout", notes="codex timed out")
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+
+    async def _slow_recover():
+        t["now"] += bridge_app.CLEANUP_RESERVE_SECONDS  # worst case: the whole reserve
+        return chrome.RecoveryResult(True, "restart")
+    monkeypatch.setattr(chrome, "recover", _slow_recover)
+
+    async def _claude(run_dir, prompt, api_key, **kw):
+        walls["claude"] = kw["wall_seconds"]
+        return executor.ExecResult(kind="paywalled_no_access", notes="n", cost_usd=0.2)
+    monkeypatch.setattr(bridge_app, "run_claude", _claude)
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.t1461", "title": "Window Paper"})
+    assert walls["codex"] == 1140 - 105 - 120 - (300 + 120) == 495
+    assert walls["claude"] >= 300
+    assert resp.json()["error_code"] == "paywalled_no_access"
+    assert [s for s, _ in _strategies(cfg)][-2:] == ["codex_bridge", "claude_bridge"]
+
+
+def test_codex_keeps_the_large_wall_when_claude_is_not_ready(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)  # no key: claude not ready
+    walls = []
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        walls.append(kw["wall_seconds"])
+        return executor.ExecResult(kind="paywalled_no_access", notes="n")
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    _clock(monkeypatch, 0, 105)  # 1035 left -> min(900, 915)
+    client = TestClient(bridge_app.create_app(cfg))
+    client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.t1461b", "title": "Big Wall"})
+    assert walls == [900.0]
+
+
+def test_codex_wall_capped_to_leave_claude_window_when_claude_ready(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    walls = []
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        walls.append(kw["wall_seconds"])
+        return executor.ExecResult(kind="paywalled_no_access", notes="n")
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    _clock(monkeypatch, 0, 0)  # remaining 1140 -> min(900, 1140 - 120 - 420) = 600
+    client = TestClient(bridge_app.create_app(cfg))
+    client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.t1461c", "title": "Capped Wall"})
+    assert walls == [600.0]
+
+
+def test_claude_runs_alone_when_the_window_leaves_codex_too_little(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    codex, claude = {"n": 0}, {"n": 0}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex))
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude))
+    _clock(monkeypatch, 0, 500, 500)  # 640 left: codex would get 100 < 180 -> claude alone
+    client = TestClient(bridge_app.create_app(cfg))
+    client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.t1461d", "title": "Claude Alone"})
+    assert (codex["n"], claude["n"]) == (0, 1)
 
 
 def test_claude_budget_exhausted_after_writing_pdf_is_salvaged(cfg, monkeypatch):
@@ -2716,7 +2827,7 @@ def test_recovery_after_codex_death_cannot_eat_the_fallback_minimum(cfg, monkeyp
 
 
 def test_claude_wall_leaves_cleanup_reserve_and_recovery_skipped_past_deadline(cfg, monkeypatch):
-    """Round 2 #1: claude starts with 330 s left -> wall 210 (reserve 120); when its
+    """Round 2 #1 (AGA-1461: window raised to 300): claude starts with 420 s left -> wall 300 (reserve 120); when its
     run ends past the deadline, Chrome recovery is skipped so the lock is released."""
     _seed_sandbox_mode(cfg)
     _with_key(monkeypatch)
@@ -2737,14 +2848,14 @@ def test_claude_wall_leaves_cleanup_reserve_and_recovery_skipped_past_deadline(c
         return executor.ExecResult(kind="executor_died", notes="died late")
     monkeypatch.setattr(bridge_app, "run_claude", _claude)
 
-    # put the clock at 810 s elapsed (330 remaining) once codex is done
+    # put the clock at 720 s elapsed (420 remaining) once codex is done
     async def _codex(run_dir, prompt, sandbox_mode, **_kw):
-        t["now"] = 810.0
+        t["now"] = 720.0
         return executor.ExecResult(kind="executor_died", notes="codex died")
     monkeypatch.setattr(bridge_app, "run_codex", _codex)
     client = TestClient(bridge_app.create_app(cfg))
     resp = client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.r2b", "title": "Round Two B"})
-    assert walls == [210.0]
+    assert walls == [300.0]
     assert resp.json()["error_code"] == "executor_died"
     assert recovered["n"] == 1  # codex's recovery only; none after the overrunning claude run
 
@@ -3175,3 +3286,519 @@ def test_tier1_freed_by_cooldown_wait_runs_after_an_elsevier_miss(cfg, els, monk
     _, resp = _els_post(cfg)
     assert resp.status_code == 200
     assert resp.headers["X-Paperika-Tier"] == "direct_fetch"
+
+
+# ------------------------------------------------ AGA-1461: /admin/trial ---
+
+TRIAL_DOI = "10.1364/jocn.trial1"
+TRIAL_TITLE = "Trial Paper On Flexible Grids"
+
+
+def _trial_body(**over) -> dict:
+    body = {"doi": TRIAL_DOI, "title": TRIAL_TITLE, "driver": "codex",
+            "model": "gpt-6.1-sol", "effort": "medium", "max_budget_usd": None}
+    body.update(over)
+    return body
+
+
+def _post_trial(client, **over):
+    return client.post("/admin/trial", headers=_auth(), json=_trial_body(**over))
+
+
+def _fake_trial_codex(cfg, *, kind="downloaded", write_pdf=True, doi=TRIAL_DOI,
+                      title=TRIAL_TITLE, seen=None, events=None, script=None):
+    async def _fake(run_dir, prompt, sandbox_mode, **kw):
+        if seen is not None:
+            seen.update(kw)
+            seen["run_dir"] = run_dir
+        path = cfg.download_dir / "trial.pdf"
+        if write_pdf:
+            _make_pdf(path, doi=doi, title=title)
+        if script:
+            (run_dir / "step1.py").write_text(script, encoding="utf-8")
+        return executor.ExecResult(
+            kind=kind, file_path=str(path) if write_pdf else None,
+            final_url="https://pub.example/x", notes="trial ok", wall_seconds=12.5,
+            events=events or [],
+        )
+    return _fake
+
+
+def _counts(cfg):
+    con = _conn(cfg)
+    out = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+           for t in ("papers", "paper_links", "paper_requests")}
+    con.close()
+    return out
+
+
+def test_trial_requires_token(cfg):
+    client = TestClient(bridge_app.create_app(cfg))
+    assert client.post("/admin/trial", json=_trial_body()).status_code == 401
+
+
+@pytest.mark.parametrize("over,code", [
+    ({"driver": "grok"}, "invalid_driver"),
+    ({"model": "gpt-4"}, "invalid_model"),
+    ({"driver": "codex", "model": "claude-sonnet-5-5"}, "invalid_model"),
+    ({"driver": "claude", "model": "gpt-6.1-sol"}, "invalid_model"),
+    ({"effort": "xhigh"}, "invalid_effort"),
+    ({"driver": "claude", "model": "claude-sonnet-5-5", "effort": "max"}, "invalid_effort"),
+    ({"driver": "claude", "model": "claude-sonnet-5-5", "effort": None,
+      "max_budget_usd": 3.01}, "invalid_budget"),
+    ({"driver": "claude", "model": "claude-sonnet-5-5", "effort": None,
+      "max_budget_usd": 0}, "invalid_budget"),
+    ({"max_budget_usd": 1.0}, "invalid_budget"),  # codex has no budget
+    ({"doi": "not-a-doi"}, "invalid_doi"),
+])
+def test_trial_validation_rejects_off_allowlist(cfg, over, code):
+    _seed_sandbox_mode(cfg)
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = _post_trial(client, **over)
+    assert resp.status_code == 422 and resp.json()["error_code"] == code
+    assert _strategies(cfg) == []
+
+
+def test_trial_validation_accepts_every_allowlisted_value(cfg):
+    for driver, models in bridge_app.TRIAL_MODELS.items():
+        assert models and bridge_app.TRIAL_EFFORTS[driver]
+    assert bridge_app.TRIAL_MODELS["codex"] == {"gpt-5.6-sol", "gpt-6.1-sol"}
+    assert bridge_app.TRIAL_MODELS["claude"] == {
+        "claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"}
+    assert bridge_app.TRIAL_EFFORTS["codex"] == {"medium", "high"}
+    assert bridge_app.TRIAL_EFFORTS["claude"] == {"low", "medium", "high"}
+
+
+def test_build_argv_overrides_and_defaults(tmp_path):
+    default = executor.build_argv(tmp_path, "P", "workspace-write")
+    assert default[default.index("-m") + 1] == "gpt-6.1-sol"
+    assert 'model_reasoning_effort="high"' in default
+    over = executor.build_argv(tmp_path, "P", "workspace-write", model="gpt-5.6-sol", effort="medium")
+    assert over[over.index("-m") + 1] == "gpt-5.6-sol"
+    assert 'model_reasoning_effort="medium"' in over and 'model_reasoning_effort="high"' not in over
+    # everything else identical
+    stripped = [a for a in over if a not in {"gpt-5.6-sol", 'model_reasoning_effort="medium"'}]
+    assert stripped == [a for a in default if a not in {"gpt-6.1-sol", 'model_reasoning_effort="high"'}]
+
+
+def test_build_argv_claude_overrides_and_defaults(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPERIKA_CLAUDE_BIN", "claude")
+    default = executor.build_argv_claude(tmp_path, "P")
+    assert default[default.index("--model") + 1] == executor.CLAUDE_MODEL
+    assert default[default.index("--max-budget-usd") + 1] == executor.CLAUDE_MAX_BUDGET_USD == "0.60"
+    assert "--effort" not in default
+    over = executor.build_argv_claude(
+        tmp_path, "P", model="claude-opus-5-5", max_budget_usd=2.5, effort="low")
+    assert over[over.index("--model") + 1] == "claude-opus-5-5"
+    assert over[over.index("--max-budget-usd") + 1] == "2.50"
+    assert over[over.index("--effort") + 1] == "low"
+    assert "--effort" not in executor.build_argv_claude(tmp_path, "P", model="claude-opus-5-5")
+
+
+def test_download_still_uses_pinned_argv_for_codex_and_claude(cfg, monkeypatch):
+    """/download passes no overrides: run_codex / run_claude get no model kwargs."""
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    seen = {}
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        seen["codex"] = kw
+        return executor.ExecResult(kind="executor_died", notes="x")
+
+    async def _claude(run_dir, prompt, api_key, **kw):
+        seen["claude"] = kw
+        return executor.ExecResult(kind="paywalled_no_access", notes="x")
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    monkeypatch.setattr(bridge_app, "run_claude", _claude)
+    TestClient(bridge_app.create_app(cfg)).post(
+        "/download", headers=_auth(), json={"doi": "10.1364/jocn.pin1", "title": "Pinned One"})
+    assert set(seen["codex"]) == {"wall_seconds"} and set(seen["claude"]) == {"wall_seconds"}
+
+
+def test_trial_overrides_reach_the_executors(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    _with_key(monkeypatch)
+    seen = {}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(cfg, seen=seen))
+    client = TestClient(bridge_app.create_app(cfg))
+    assert _post_trial(client, model="gpt-5.6-sol", effort="medium").status_code == 200
+    assert seen["model"] == "gpt-5.6-sol" and seen["effort"] == "medium"
+
+    cseen = {}
+
+    async def _claude(run_dir, prompt, api_key, **kw):
+        cseen.update(kw)
+        return executor.ExecResult(kind="paywalled_no_access", notes="n", cost_usd=0.4)
+    monkeypatch.setattr(bridge_app, "run_claude", _claude)
+    # clear the global spacing the first trial started
+    con = _conn(cfg)
+    con.execute("UPDATE paper_attempts SET started_at = '2020-01-01T00:00:00+00:00'")
+    con.commit()
+    con.close()
+    resp = _post_trial(client, driver="claude", model="claude-haiku-5-5", effort="high",
+                       max_budget_usd=2.0)
+    body = resp.json()
+    assert resp.status_code == 200, resp.text
+    assert cseen["model"] == "claude-haiku-5-5" and cseen["effort"] == "high"
+    assert cseen["max_budget_usd"] == 2.0
+    assert body["cost_usd"] == 0.4 and body["tokens"] is None
+    # default budget when omitted
+    con = _conn(cfg)
+    con.execute("UPDATE paper_attempts SET started_at = '2020-01-01T00:00:00+00:00'")
+    con.commit()
+    con.close()
+    _post_trial(client, driver="claude", model="claude-sonnet-5-5", effort=None)
+    assert cseen["max_budget_usd"] == 1.5 and cseen["effort"] is None
+
+
+def test_trial_accepted_pdf_is_hashed_then_deleted_and_leaves_no_production_rows(cfg, monkeypatch):
+    import hashlib
+    _seed_sandbox_mode(cfg)
+    seen = {}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(
+        cfg, seen=seen, events=[{"type": "turn.completed",
+                                 "usage": {"input_tokens": 100, "output_tokens": 20,
+                                           "cached_input_tokens": 50}}]))
+    # the dedupe cache must never be consulted
+    def _boom(*a, **k):
+        raise AssertionError("trial consulted the dedupe cache")
+    monkeypatch.setattr(bridge_app.Bridge, "dedupe_hit", _boom)
+    client = TestClient(bridge_app.create_app(cfg))
+    before = _counts(cfg)
+    resp = _post_trial(client)
+    body = resp.json()
+    assert resp.status_code == 200, resp.text
+    assert body["gate"] == "pass" and body["kind"] == "downloaded"
+    assert body["verified_by"] == "doi" and body["salvaged"] is False
+    expected = hashlib.sha256(
+        b"%PDF-1.4\n" + f"/Title ({TRIAL_TITLE})".encode() + b"\n" + TRIAL_DOI.encode() + b"\n%%EOF\n"
+    ).hexdigest()
+    assert body["file_sha256"] == expected and body["file_size"] > 0
+    assert not (cfg.download_dir / "trial.pdf").exists()  # deleted
+    assert body["tokens"] == 120 and body["cost_usd"] is None
+    assert body["wall_seconds"] == 12.5 and body["final_url"] == "https://pub.example/x"
+    assert body["trial_id"] and body["model"] == "gpt-6.1-sol" and body["effort"] == "medium"
+    after = _counts(cfg)
+    assert after["papers"] == before["papers"] and after["paper_links"] == before["paper_links"]
+    assert after["paper_requests"] - before["paper_requests"] == 1  # the one ledger row
+    assert _strategies(cfg) == [("trial_codex", "completed")]
+    assert (cfg.db_path.parent / "trials" / body["trial_id"]).is_dir()
+    # a second trial reuses the ledger row
+    con = _conn(cfg)
+    con.execute("UPDATE paper_attempts SET started_at = '2020-01-01T00:00:00+00:00'")
+    con.commit()
+    con.close()
+    _post_trial(client)
+    assert _counts(cfg)["paper_requests"] - before["paper_requests"] == 1
+
+
+def test_trial_gate_failure_is_reported_and_quarantined(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(
+        cfg, doi="10.9999/other.paper", title="A Completely Different Paper"))
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = _post_trial(client)
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["gate"] == "fail" and body["gate_reason"] and body["file_sha256"] is None
+    assert not (cfg.download_dir / "trial.pdf").exists()
+    q = cfg.db_path.parent / "trials" / body["trial_id"] / "quarantine"
+    assert (q / "trial.pdf").exists()
+    assert _strategies(cfg) == [("trial_codex", "wrong_paper")]
+    assert _counts(cfg)["papers"] == 0
+
+
+def test_trial_claimed_download_without_file_fails_the_gate(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(cfg, write_pdf=False))
+    body = _post_trial(TestClient(bridge_app.create_app(cfg))).json()
+    assert body["kind"] == "downloaded" and body["gate"] == "fail"
+
+
+def test_trial_non_download_outcome_has_gate_not_run(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    monkeypatch.setattr(bridge_app, "run_codex",
+                        _fake_trial_codex(cfg, kind="paywalled_no_access", write_pdf=False))
+    body = _post_trial(TestClient(bridge_app.create_app(cfg))).json()
+    assert body["gate"] == "not_run" and body["kind"] == "paywalled_no_access"
+    assert _strategies(cfg) == [("trial_codex", "no_access")]
+
+
+def test_trial_salvage_on_timeout_passes_the_gate(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(cfg, kind="timeout"))
+    body = _post_trial(TestClient(bridge_app.create_app(cfg))).json()
+    assert body["kind"] == "timeout" and body["gate"] == "pass" and body["salvaged"] is True
+    assert not (cfg.download_dir / "trial.pdf").exists()
+
+
+def test_trial_leaves_a_production_pdf_for_the_same_doi_untouched(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    app = bridge_app.create_app(cfg)
+    bridge = app.state.bridge
+    prod = cfg.download_dir / "10.1364_jocn.trial1.pdf"
+    _make_pdf(prod, doi=TRIAL_DOI, title=TRIAL_TITLE)
+    original = prod.read_bytes()
+    pid = bridge.link_paper(doi=TRIAL_DOI, title=TRIAL_TITLE, path=prod, final_url=None)
+    seen = {}
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        seen["prod_present_during_run"] = prod.exists()  # set aside while the trial runs
+        _make_pdf(prod, doi=TRIAL_DOI, title=TRIAL_TITLE)  # the executor's own save target
+        return executor.ExecResult(kind="downloaded", file_path=str(prod), notes="ok")
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    body = _post_trial(TestClient(app)).json()
+    assert seen["prod_present_during_run"] is False
+    assert body["gate"] == "pass"
+    assert prod.read_bytes() == original  # restored
+    assert bridge.dedupe_hit(doi=TRIAL_DOI, title=TRIAL_TITLE) == prod
+    assert bridge.db.find_verified_pdf(doi=TRIAL_DOI)["id"] == pid
+
+
+def test_trial_global_llm_spacing_refuses_60s_after_a_production_codex_attempt(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    app = bridge_app.create_app(cfg)
+    bridge = app.state.bridge
+    rid = bridge.db.create_request(raw_input="x", inferred_title="t", inferred_doi="10.1/x",
+                                   inferred_url=None, paper_id=None)
+    aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir="r", strategy="codex_bridge")
+    bridge.resolve_attempt(aid, outcome="gave_up")
+    con = _conn(cfg)
+    con.execute("UPDATE paper_attempts SET started_at = ? WHERE id = ?",
+                (limits.iso(_now() - timedelta(seconds=60)), aid))
+    con.commit()
+    con.close()
+    ran = {}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(cfg, seen=ran))
+    resp = _post_trial(TestClient(app))
+    assert resp.status_code == 429 and resp.json()["error_code"] == "cooldown"
+    assert 100 <= resp.json()["retry_after_seconds"] <= 121
+    assert ran == {}
+    assert [s for s, _ in _strategies(cfg)] == ["codex_bridge"]  # no trial row written
+    # ...and a claude trial is refused by the same clock
+    _with_key(monkeypatch)
+    r2 = _post_trial(TestClient(app), driver="claude", model="claude-sonnet-5-5", effort=None)
+    assert r2.status_code == 429 and r2.json()["error_code"] == "cooldown"
+
+
+@pytest.mark.parametrize("strat", ["trial_codex", "trial_claude"])
+def test_production_rate_rules_ignore_trial_rows(cfg, strat):
+    app = bridge_app.create_app(cfg)
+    bridge = app.state.bridge
+    rid = bridge.trial_ledger_request_id()
+    for _ in range(3):
+        aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir="r", strategy=strat)
+        bridge.resolve_attempt(aid, outcome="gave_up")
+    with bridge.db.transaction() as conn:
+        for prod in ("codex_bridge", "claude_bridge", "direct_fetch", "scripted_browser"):
+            assert limits.check_rate(conn, prod).allowed
+        assert limits.attempts_today(conn) == 0  # healthz production total excludes trials
+        assert limits.attempts_today(conn, strat) == 3
+        assert limits.most_recent_attempt_start(conn) is None
+        assert not limits.check_llm_spacing(conn).allowed  # but trials do start the LLM clock
+
+
+def test_trial_daily_cap_is_60_per_driver(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    app = bridge_app.create_app(cfg)
+    bridge = app.state.bridge
+    rid = bridge.trial_ledger_request_id()
+    day_start = _now().replace(hour=0, minute=0, second=0, microsecond=0)
+    con = _conn(cfg)
+    for i in range(60):
+        con.execute(
+            "INSERT INTO paper_attempts (request_id, attempt_number, status, strategy, created_at,"
+            " started_at, outcome) VALUES (?, ?, 'failed', 'trial_codex', ?, ?, 'gave_up')",
+            (rid, i + 1, limits.iso(day_start), limits.iso(day_start)))
+    con.commit()
+    con.close()
+    ran = {}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(cfg, seen=ran))
+    resp = _post_trial(TestClient(app))
+    assert resp.status_code == 429 and resp.json()["error_code"] == "daily_cap"
+    assert ran == {}
+    # claude's own cap is untouched
+    _with_key(monkeypatch)
+
+    async def _claude(run_dir, prompt, api_key, **kw):
+        return executor.ExecResult(kind="paywalled_no_access", notes="n")
+    monkeypatch.setattr(bridge_app, "run_claude", _claude)
+    r2 = _post_trial(TestClient(app), driver="claude", model="claude-sonnet-5-5", effort=None)
+    assert r2.status_code == 200
+    body = TestClient(app).get("/healthz", headers=_auth()).json()
+    assert body["limits"]["attempts_today"]["trial_codex"] == 60
+    assert body["limits"]["downloads_today"] == 0
+
+
+def test_trial_busy_when_lock_held(cfg):
+    app = bridge_app.create_app(cfg)
+    import asyncio
+    app.state.bridge.lock = asyncio.Lock()
+    client = TestClient(app)
+
+    async def _hold():
+        await app.state.bridge.lock.acquire()
+    asyncio.new_event_loop().run_until_complete(_hold())
+    resp = _post_trial(client)
+    assert resp.status_code == 429 and resp.json()["error_code"] == "busy"
+
+
+def test_trial_unavailable_drivers_are_refused_without_a_row(cfg):
+    client = TestClient(bridge_app.create_app(cfg))
+    r1 = _post_trial(client)  # no sandbox_mode
+    assert r1.status_code == 503 and r1.json()["error_code"] == "selftest_required"
+    r2 = _post_trial(client, driver="claude", model="claude-sonnet-5-5", effort=None)  # no key
+    assert r2.status_code == 503 and r2.json()["error_code"] == "claude_auth"
+    assert _strategies(cfg) == []
+
+
+def test_trial_policy_flags_report_matches_without_content(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    script = "import requests\nrequests.post('https://api.2captcha.com', data={'password': 'hunter2'})\n"
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(cfg, script=script))
+    resp = _post_trial(TestClient(bridge_app.create_app(cfg)))
+    body = resp.json()
+    flags = body["policy_flags"]
+    assert "2captcha@step1.py" in flags and "password@step1.py" in flags
+    assert "captcha@step1.py" in flags
+    assert "hunter2" not in resp.text
+    assert body["gate"] == "pass"  # reported, never blocking
+
+
+def test_trial_policy_flags_empty_for_a_clean_run(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(
+        cfg, script="print('fetch the pdf via the cdp browser')\n"))
+    assert _post_trial(TestClient(bridge_app.create_app(cfg))).json()["policy_flags"] == []
+
+
+@pytest.mark.parametrize("pattern", [
+    "captcha", "solver", "anticaptcha", "document.cookie", "Network.getAllCookies", "PASSWORD",
+])
+def test_policy_flag_patterns(tmp_path, pattern):
+    (tmp_path / "s.py").write_text(f"x = '{pattern}'\n", encoding="utf-8")
+    (tmp_path / "task.json").write_text("captcha password", encoding="utf-8")  # bridge-owned: skipped
+    flags = bridge_app._policy_flags(tmp_path)
+    assert flags and all(f.endswith("@s.py") for f in flags)
+
+
+def test_trial_response_never_contains_a_secret(cfg, monkeypatch):
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: SECRET)
+    monkeypatch.setattr(executor, "elsevier_api_key", lambda: "ELSEVIERKEY123456")
+
+    async def _claude(run_dir, prompt, api_key, **kw):
+        return executor.ExecResult(
+            kind="paywalled_no_access", cost_usd=0.1,
+            final_url=f"https://x/?k={SECRET}",
+            notes=f"leak {SECRET} and ELSEVIERKEY123456 and {TOKEN}")
+    monkeypatch.setattr(bridge_app, "run_claude", _claude)
+    resp = _post_trial(TestClient(bridge_app.create_app(cfg)), driver="claude",
+                       model="claude-sonnet-5-5", effort=None)
+    assert resp.status_code == 200
+    for secret in (SECRET, "ELSEVIERKEY123456", TOKEN):
+        assert secret not in resp.text
+    raw = b"".join(p.read_bytes() for p in cfg.db_path.parent.rglob("*")
+                   if p.is_file() and p.stat().st_size < 5_000_000)
+    assert SECRET.encode() not in raw
+    assert len(resp.json()["notes"]) <= 500
+
+
+def test_trial_notes_are_truncated_to_500(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        return executor.ExecResult(kind="gave_up", notes="n" * 2000)
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    assert len(_post_trial(TestClient(bridge_app.create_app(cfg))).json()["notes"]) == 500
+
+
+def test_trial_chrome_recovery_after_bad_outcome_and_latch(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    recovered = {"n": 0}
+
+    async def _recover():
+        recovered["n"] += 1
+        return chrome.RecoveryResult(True, "restart")
+    monkeypatch.setattr(chrome, "recover", _recover)
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        return executor.ExecResult(kind="executor_died", notes="died")
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    _post_trial(TestClient(bridge_app.create_app(cfg)))
+    assert recovered["n"] == 1
+
+    # claude overrunning the deadline: recovery deferred, latch set
+    _with_key(monkeypatch)
+    t = {"now": 0.0}
+    monkeypatch.setattr(bridge_app, "MONOTONIC", lambda: t["now"])
+
+    async def _claude(run_dir, prompt, api_key, **kw):
+        t["now"] = 1141.0
+        return executor.ExecResult(kind="executor_died", notes="late")
+    monkeypatch.setattr(bridge_app, "run_claude", _claude)
+    app = bridge_app.create_app(cfg)
+    con = _conn(cfg)
+    con.execute("UPDATE paper_attempts SET started_at = '2020-01-01T00:00:00+00:00'")
+    con.commit()
+    con.close()
+    _post_trial(TestClient(app), driver="claude", model="claude-sonnet-5-5", effort=None)
+    assert recovered["n"] == 1 and app.state.bridge.recovery_pending is True
+
+
+def test_trial_chrome_down_is_refused(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+
+    async def _down(*, fresh=False, cdp_http=chrome.CDP_HTTP):
+        return chrome.ProbeResult(False, version=None, checked_at=_now())
+    monkeypatch.setattr(chrome, "probe", _down)
+
+    async def _bad_recover():
+        return chrome.RecoveryResult(False, "unrecovered")
+    monkeypatch.setattr(chrome, "recover", _bad_recover)
+    resp = _post_trial(TestClient(bridge_app.create_app(cfg)))
+    assert resp.status_code == 503 and resp.json()["error_code"] == "chrome_down"
+    assert _strategies(cfg) == []
+
+
+def test_trial_wall_is_min_900_and_budget_minus_reserve(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+    seen = {}
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(cfg, seen=seen, kind="gave_up", write_pdf=False))
+    _post_trial(TestClient(bridge_app.create_app(cfg)))
+    assert seen["wall_seconds"] == 900.0
+
+
+def test_startup_sweep_closes_a_running_trial_row_without_touching_requests(cfg):
+    app = bridge_app.create_app(cfg)
+    bridge = app.state.bridge
+    rid = bridge.trial_ledger_request_id()
+    aid = bridge.write_ahead(request_id=rid, paper_id=None, run_dir="r", strategy="trial_claude")
+    bridge_app.startup_sweep(bridge)
+    con = _conn(cfg)
+    row = con.execute("SELECT outcome FROM paper_attempts WHERE id = ?", (aid,)).fetchone()
+    status = con.execute("SELECT status FROM paper_requests WHERE id = ?", (rid,)).fetchone()[0]
+    con.close()
+    assert row["outcome"] == "interrupted" and status == "completed"
+
+
+def test_trial_exception_closes_the_attempt_row(cfg, monkeypatch):
+    _seed_sandbox_mode(cfg)
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kw):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    resp = _post_trial(TestClient(bridge_app.create_app(cfg)))
+    assert resp.status_code == 500 and resp.json()["error_code"] == "bridge_error"
+    assert _strategies(cfg) == [("trial_codex", "interrupted")]
+
+
+@pytest.mark.parametrize("events,expected", [
+    ([], None),
+    ([{"type": "turn.completed"}], None),
+    ([{"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}},
+      {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 2}}], 18),
+    ([{"msg": {"type": "token_count",
+               "info": {"last_token_usage": {"input_tokens": 7, "output_tokens": 3}}}}], 10),
+])
+def test_codex_token_total(events, expected):
+    assert executor.codex_token_total(events) == expected

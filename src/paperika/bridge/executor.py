@@ -61,8 +61,12 @@ MCP_OFF: list[str] = ["-c", "mcp_servers={}"]
 # figure?), which low effort was losing; the fast service tier buys back the latency
 # high effort costs, and the two compose. The flags are the codex exec contract
 # verified on the gpu host; re-verify the model id there after a codex-cli upgrade.
-CODEX_MODEL: list[str] = ["-m", "gpt-6.1-sol"]
-REASONING_HIGH: list[str] = ["-c", 'model_reasoning_effort="high"']
+# Keep in step with the Sol tier named in the canon (Linear doc 'Infrastructure &
+# budgets'); bump + POST /selftest/codex when it changes. /healthz reports these two.
+CODEX_MODEL_ID = "gpt-6.1-sol"
+CODEX_REASONING_EFFORT = "high"
+CODEX_MODEL: list[str] = ["-m", CODEX_MODEL_ID]
+REASONING_HIGH: list[str] = ["-c", f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"']
 SERVICE_TIER_FAST: list[str] = ["-c", 'service_tier="fast"']
 
 # Tier-3 FALLBACK driver (AGA-1460): Claude Sonnet 5.5 through the Anthropic API,
@@ -450,14 +454,20 @@ def classify(
 
 def build_argv(
     run_dir: Path, prompt: str, sandbox_mode: str, *, with_schema: bool = True,
-    wall_seconds: float = EXEC_WALL_SECONDS,
+    wall_seconds: float = EXEC_WALL_SECONDS, model: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     """Construct the timeout-wrapped codex exec argv (§2.4).
 
     ``--output-schema`` requires the schema file to exist — codex exec exits 1
     immediately ("Failed to read output schema file") otherwise, so the flag is
     only emitted when the caller also writes the schema (selftest does not).
+
+    ``model`` / ``effort`` override the pinned CODEX_MODEL / REASONING_HIGH (AGA-1461
+    trials only); ``None`` keeps the pinned values, so /download is unchanged.
     """
+    model_args = ["-m", model] if model else CODEX_MODEL
+    effort_args = ["-c", f'model_reasoning_effort="{effort}"'] if effort else REASONING_HIGH
     last_message = str(run_dir / "last_message.txt")
     schema_args = (
         ["--output-schema", str(run_dir / "outcome.schema.json")] if with_schema else []
@@ -469,8 +479,8 @@ def build_argv(
         "exec",
         "--skip-git-repo-check",
         *MCP_OFF,
-        *CODEX_MODEL,
-        *REASONING_HIGH,
+        *model_args,
+        *effort_args,
         *SERVICE_TIER_FAST,
         *sandbox_flags(sandbox_mode),
         "-C",
@@ -543,6 +553,8 @@ async def run_codex(
     write_schema: bool = True,
     env: dict[str, str] | None = None,
     wall_seconds: float = EXEC_WALL_SECONDS,
+    model: str | None = None,
+    effort: str | None = None,
 ) -> ExecResult:
     """Spawn ``timeout <wall_seconds=EXEC_WALL_SECONDS> codex exec ...`` with
     start_new_session=True; on overrun killpg the whole process group (codex +
@@ -554,7 +566,8 @@ async def run_codex(
     if write_schema:
         write_outcome_schema(run_dir)
     argv = build_argv(
-        run_dir, prompt, sandbox_mode, with_schema=write_schema, wall_seconds=wall_seconds
+        run_dir, prompt, sandbox_mode, with_schema=write_schema, wall_seconds=wall_seconds,
+        model=model, effort=effort,
     )
 
     run_env = dict(os.environ)
@@ -726,9 +739,17 @@ def reset_anthropic_key_cache() -> None:
     _key_cache.clear()
 
 
-def build_argv_claude(run_dir: Path, prompt: str) -> list[str]:
+def build_argv_claude(
+    run_dir: Path, prompt: str, *, model: str | None = None,
+    max_budget_usd: float | None = None, effort: str | None = None,
+) -> list[str]:
     """``claude -p`` argv. The key is NEVER in argv (env only, see run_claude);
-    the prompt is the same static template codex gets (task.json stays data)."""
+    the prompt is the same static template codex gets (task.json stays data).
+    ``model`` / ``max_budget_usd`` / ``effort`` are AGA-1461 trial overrides; the
+    defaults keep the pinned CLAUDE_MODEL / CLAUDE_MAX_BUDGET_USD and no ``--effort``
+    flag (claude CLI: ``--effort <low|medium|high|xhigh|max>``)."""
+    budget = CLAUDE_MAX_BUDGET_USD if max_budget_usd is None else f"{max_budget_usd:.2f}"
+    effort_args = ["--effort", effort] if effort else []
     return [
         resolve_claude_bin(),
         "-p",
@@ -736,8 +757,9 @@ def build_argv_claude(run_dir: Path, prompt: str) -> list[str]:
         "--tools", "Bash",
         "--allowedTools", "Bash",
         "--no-session-persistence",
-        "--model", CLAUDE_MODEL,
-        "--max-budget-usd", CLAUDE_MAX_BUDGET_USD,
+        "--model", model or CLAUDE_MODEL,
+        *effort_args,
+        "--max-budget-usd", budget,
         "--output-format", "json",
         "--json-schema", json.dumps(OUTCOME_SCHEMA),
         "--permission-mode", "bypassPermissions",
@@ -842,6 +864,9 @@ async def run_claude(
     *,
     wall_seconds: float = EXEC_WALL_SECONDS,
     env: dict[str, str] | None = None,
+    model: str | None = None,
+    max_budget_usd: float | None = None,
+    effort: str | None = None,
 ) -> ExecResult:
     """Spawn ``claude -p ...`` in its own process group with the same wall /
     kill-grace discipline as run_codex (``wall_seconds`` lets the ladder shrink it
@@ -857,7 +882,10 @@ async def run_claude(
     run_env.update(CLAUDE_SCRUB_ENV)
     try:
         stdout, stderr, exit_code, timed_out, wall = await _spawn(
-            build_argv_claude(run_dir, prompt), run_dir, run_env, wait_seconds=wall_seconds
+            build_argv_claude(
+                run_dir, prompt, model=model, max_budget_usd=max_budget_usd, effort=effort
+            ),
+            run_dir, run_env, wait_seconds=wall_seconds
         )
     except FileNotFoundError:
         # A missing CLI is a host fault, not a verdict: retryable, never a crash.
@@ -898,3 +926,38 @@ async def run_claude_selftest(
         detail=f"claude selftest failed (kind={result.kind}): {result.notes[:200]}",
         wall_seconds=result.wall_seconds,
     )
+
+
+def codex_token_total(events: list[dict]) -> int | None:
+    """Sum of token usage reported in codex JSONL events (AGA-1461 trials), or None
+    when no event carries any. Tolerant of both shapes: a ``turn.completed`` event
+    with a ``usage`` object, and a ``token_count`` event (top-level or under
+    ``msg``) whose ``info.last_token_usage`` / ``usage`` holds the per-turn counts.
+    Per-turn dicts contribute input + output tokens (cached / reasoning counts are
+    sub-totals of those and are not added again)."""
+    total = 0
+    found = False
+
+    def _sum(usage: object) -> int | None:
+        if not isinstance(usage, dict):
+            return None
+        parts = [usage.get("input_tokens"), usage.get("output_tokens")]
+        nums = [p for p in parts if isinstance(p, int) and not isinstance(p, bool)]
+        return sum(nums) if nums else None
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        msg = event.get("msg") if isinstance(event.get("msg"), dict) else event
+        etype = str(msg.get("type") or event.get("type") or "")
+        if etype == "turn.completed":
+            got = _sum(event.get("usage"))
+        elif etype == "token_count":
+            info = msg.get("info") if isinstance(msg.get("info"), dict) else {}
+            got = _sum(info.get("last_token_usage") or msg.get("usage"))
+        else:
+            continue
+        if got is not None:
+            total += got
+            found = True
+    return total if found else None

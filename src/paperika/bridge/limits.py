@@ -37,7 +37,22 @@ RATE_RULES: dict[str, tuple[int, int]] = {
     # AGA-1462: Elsevier Article Retrieval API (allows 10 req/s, 50k/week); we pace
     # far below that.
     "elsevier_api": (3, 500),
+    # AGA-1461: driver bake-off trials. Own daily caps; spacing is the GLOBAL LLM
+    # spacing below (shared with production), not a per-strategy clock.
+    "trial_codex": (0, 60),
+    "trial_claude": (0, 60),
 }
+
+# AGA-1461: every LLM-driven strategy, production and trial. ``check_llm_spacing``
+# applies ONE shared clock across them so a trial and a production run never overlap
+# the provider rate limits. Production's own check_rate stays per-strategy and never
+# sees trial rows.
+LLM_STRATEGIES: tuple[str, ...] = ("codex_bridge", "claude_bridge", "trial_codex", "trial_claude")
+LLM_SPACING_SECONDS = 180
+TRIAL_STRATEGIES: tuple[str, ...] = ("trial_codex", "trial_claude")
+# SQL fragment: excludes trial rows from the whole-ledger (strategy=None) counts so
+# the production totals never include bake-off attempts.
+_NOT_TRIAL = "COALESCE(strategy, '') NOT LIKE 'trial\\_%' ESCAPE '\\'"
 
 # Columns the bridge adds to paper_attempts (request_id already exists in the
 # live schema). Guarded idempotent ALTERs — safe to run on every startup.
@@ -97,6 +112,7 @@ def most_recent_attempt_start(
         row = conn.execute(
             "SELECT started_at FROM paper_attempts "
             "WHERE started_at IS NOT NULL AND outcome IS NOT NULL "
+            f"AND {_NOT_TRIAL} "
             "ORDER BY started_at DESC LIMIT 1"
         ).fetchone()
     else:
@@ -123,7 +139,8 @@ def attempts_today(
     if strategy is None:
         row = conn.execute(
             "SELECT COUNT(*) FROM paper_attempts "
-            "WHERE started_at IS NOT NULL AND outcome IS NOT NULL AND started_at >= ?",
+            "WHERE started_at IS NOT NULL AND outcome IS NOT NULL AND started_at >= ? "
+            f"AND {_NOT_TRIAL}",
             (iso(day_start),),
         ).fetchone()
     else:
@@ -165,6 +182,29 @@ def check_rate(
     if attempts_today(conn, strategy, now=now) >= daily_cap:
         return RateDecision(False, "daily_cap")
 
+    return RateDecision(True)
+
+
+def check_llm_spacing(
+    conn: sqlite3.Connection, *, now: datetime | None = None,
+    min_spacing_seconds: int = LLM_SPACING_SECONDS,
+) -> RateDecision:
+    """Global spacing across ALL LLM-driven attempts (production + trial), counted
+    by ``started_at`` of any recorded outcome (``running`` included). Used by the
+    trial endpoint only; production keeps its per-strategy rules."""
+    now = now or utc_now()
+    marks = ",".join("?" for _ in LLM_STRATEGIES)
+    row = conn.execute(
+        "SELECT started_at FROM paper_attempts "
+        f"WHERE started_at IS NOT NULL AND outcome IS NOT NULL AND strategy IN ({marks}) "
+        "ORDER BY started_at DESC LIMIT 1",
+        LLM_STRATEGIES,
+    ).fetchone()
+    last = _parse_iso(row[0]) if row else None
+    if last is not None:
+        elapsed = (now - last).total_seconds()
+        if elapsed < min_spacing_seconds:
+            return RateDecision(False, "cooldown", int(min_spacing_seconds - elapsed) + 1)
     return RateDecision(True)
 
 

@@ -61,6 +61,8 @@ def test_rate_rules_values():
         "codex_bridge": (180, 20),
         "claude_bridge": (180, 20),
         "elsevier_api": (3, 500),
+        "trial_codex": (0, 60),
+        "trial_claude": (0, 60),
     }
     # module-level codex defaults are retained for backward compat.
     assert (limits.MIN_SPACING_SECONDS, limits.DAILY_CAP) == limits.RATE_RULES["codex_bridge"]

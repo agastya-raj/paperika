@@ -21,6 +21,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import subprocess
 import time
@@ -66,6 +67,14 @@ TIER3_SKIP_RETRY_SECONDS = 30
 # attempt's wall: salvage drain (10) + PDF verification (~20) + Chrome recovery
 # (~70) + margin. The claude wall is capped to remaining - this.
 CLEANUP_RESERVE_SECONDS = 120
+# AGA-1461: when the claude fallback is ready at tier-3 start, codex's wall is capped
+# so a full codex TIMEOUT still leaves claude a guaranteed window:
+#   codex_wall = min(EXEC_WALL, remaining - R - (CLAUDE_FALLBACK_WINDOW + R))
+# (R = CLEANUP_RESERVE_SECONDS: one for codex's own post-run cleanup, one for
+# claude's). The post-codex re-check demands the same window: claude's wall
+# (remaining - R) must be >= CLAUDE_FALLBACK_WINDOW_SECONDS. A claude-only or
+# codex-only tier 3 keeps FALLBACK_MIN_SECONDS as its minimum useful wall.
+CLAUDE_FALLBACK_WINDOW_SECONDS = 300
 MONOTONIC = time.monotonic  # module attribute so tests can stub the clock
 
 # Per-tier wall-clock budgets for the deterministic ladder (AGA-339). Tier 3
@@ -108,6 +117,56 @@ class DownloadRequest(BaseModel):
     title: str
     source_url: str | None = None
     requested_by: str = "kc"
+
+
+class TrialRequest(BaseModel):
+    """AGA-1461 driver bake-off request. Free-form text fields are sanitized exactly
+    like /download's; driver/model/effort/budget come from the allowlists below."""
+    doi: str
+    title: str
+    driver: str
+    model: str
+    effort: str | None = None
+    max_budget_usd: float | None = None
+
+
+TRIAL_MODELS: dict[str, frozenset[str]] = {
+    "codex": frozenset({"gpt-5.6-sol", "gpt-6.1-sol"}),
+    "claude": frozenset({"claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"}),
+}
+TRIAL_EFFORTS: dict[str, frozenset[str]] = {
+    "codex": frozenset({"medium", "high"}),
+    # claude 2.1.312 `--effort <low|medium|high|xhigh|max>`; the bake-off uses the first three.
+    "claude": frozenset({"low", "medium", "high"}),
+}
+TRIAL_DEFAULT_BUDGET_USD = 1.50
+TRIAL_MAX_BUDGET_USD = 3.00
+TRIAL_NOTES_MAX = 500
+TRIAL_LEDGER_RAW_INPUT = "paperika:trial_ledger"
+# What the post-trial scan looks for in the run dir's scripts/logs (policy: no
+# logins, no CAPTCHA solving). Matches are REPORTED, never blocking.
+_POLICY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (name, re.compile(rx, re.IGNORECASE)) for name, rx in (
+        ("captcha", r"captcha"),
+        ("solver", r"solver"),
+        ("2captcha", r"2captcha"),
+        ("anticaptcha", r"anti-?captcha"),
+        ("capsolver", r"capsolver"),
+        ("password", r"password"),
+        ("document.cookie", r"document\.cookie"),
+        ("Network.getAllCookies", r"Network\.getAllCookies"),
+        ("Network.getCookies", r"Network\.getCookies"),
+        ("storage_state", r"storage_state"),
+    )
+)
+# Files the bridge itself writes into a run dir (they hold the prompt/task data or
+# the model's final report, not the model's scripts).
+_POLICY_SCAN_SKIP = {
+    "task.json", "outcome.schema.json", "argv.json", "last_message.txt",
+}
+_POLICY_SCAN_SUFFIXES = {".py", ".js", ".mjs", ".sh", ".log", ".txt", ".json", ".md", ".html"}
+_POLICY_SCAN_MAX_BYTES = 2_000_000
+_POLICY_FLAGS_MAX = 30
 
 
 class BridgeState(BaseModel):
@@ -340,6 +399,27 @@ class Bridge:
         self.db.mark_paper_downloaded(paper_id, str(path))
         return paper_id
 
+    # --- AGA-1461 trial ledger ---
+
+    def trial_ledger_request_id(self) -> int:
+        """paper_attempts.request_id is a NOT NULL FK, so trial attempt rows hang off
+        ONE reserved ledger request (created lazily, status 'completed' so no retry
+        or startup pass ever touches it). It is the only paper_requests row trials
+        ever cause; no papers/paper_links rows are written."""
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT id FROM paper_requests WHERE raw_input = ? ORDER BY id LIMIT 1",
+                (TRIAL_LEDGER_RAW_INPUT,),
+            ).fetchone()
+        if row:
+            return int(row["id"])
+        request_id = self.db.create_request(
+            raw_input=TRIAL_LEDGER_RAW_INPUT, inferred_title=None, inferred_doi=None,
+            inferred_url=None, paper_id=None,
+        )
+        self.db.update_request_status(request_id, "completed")
+        return request_id
+
     # --- notification helper ---
 
     def emit(
@@ -518,6 +598,13 @@ def startup_sweep(bridge: Bridge) -> None:
     for row in rows:
         request_id = row["request_id"]
         started = row["started_at"]
+        if (row["strategy"] or "").startswith("trial_"):
+            # AGA-1461: a trial interrupted by a restart. It has no real request to
+            # fail/notify and must never be linked — just close the ledger row.
+            bridge.resolve_attempt(
+                row["id"], outcome="interrupted", message="bridge restarted mid-trial"
+            )
+            continue
         # Recover doi/title from the request row for the salvage verify.
         req = bridge.db.get_request(request_id)
         doi = (req["inferred_doi"] if req else None) or ""
@@ -637,6 +724,7 @@ def _parse_iso(value: str | None) -> datetime | None:
 
 _STRATEGIES = (
     "direct_fetch", "scripted_browser", "codex_bridge", "claude_bridge", "elsevier_api",
+    *limits.TRIAL_STRATEGIES,
 )
 
 # A selftest older than this is treated as stale for the /healthz codex_usable
@@ -733,6 +821,7 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
         state = bridge.state_store.load()
         downloads_today = None
         claude_cost = None
+        trial_cost = None
         attempts_by_strategy: dict[str, int | None] = {
             strat: None for strat in _STRATEGIES
         }
@@ -744,6 +833,7 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                     for strat in _STRATEGIES
                 }
                 claude_cost = limits.month_cost_usd(conn, "claude_bridge")
+                trial_cost = limits.month_cost_usd(conn, "trial_claude")
         body = {
             "status": status,
             "db": {"ok": db_ok, "path": str(bridge.config.db_path)},
@@ -758,16 +848,20 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 # is the honest derived answer (AGA-493).
                 "auth_json_present": Path("/home/agastya/.codex/auth.json").exists(),
                 "codex_usable": _codex_usable(state),
+                "model": executor.CODEX_MODEL_ID,
+                "reasoning_effort": executor.CODEX_REASONING_EFFORT,
                 "last_selftest_ok": state.last_selftest_ok,
                 "last_selftest_at": state.last_selftest_at,
                 "sandbox_mode": state.sandbox_mode,
             },
             "claude": {
                 "key_present": bool(executor.anthropic_api_key()),
+                "model": executor.CLAUDE_MODEL,
                 "claude_usable": _claude_usable(state),
                 "last_selftest_ok": state.claude_last_selftest_ok,
                 "last_selftest_at": state.claude_last_selftest_at,
                 "claude_cost_usd": claude_cost,
+                "trial_cost_usd": trial_cost,
             },
             "elsevier": {
                 "key_present": bool(executor.elsevier_api_key()),
@@ -944,7 +1038,82 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                     f"{type(exc).__name__}: {exc}"[:300],
                 )
 
+    # --- /admin/trial (AGA-1461) ---
+
+    @app.post("/admin/trial")
+    async def admin_trial(payload: TrialRequest, request: Request) -> Response:
+        denied = require_token(request)
+        if denied is not None:
+            return denied
+        doi = bridge.normalize_doi(payload.doi)
+        if doi is None:
+            return _json_error(422, "invalid_doi", "doi must match ^10\\.\\d{4,9}/\\S+$")
+        title = bridge.sanitize_title(payload.title)
+        driver = payload.driver
+        if driver not in TRIAL_MODELS:
+            return _json_error(422, "invalid_driver", "driver must be codex or claude")
+        if payload.model not in TRIAL_MODELS[driver]:
+            return _json_error(
+                422, "invalid_model",
+                f"model for {driver} must be one of {sorted(TRIAL_MODELS[driver])}",
+            )
+        if payload.effort is not None and payload.effort not in TRIAL_EFFORTS[driver]:
+            return _json_error(
+                422, "invalid_effort",
+                f"effort for {driver} must be null or one of {sorted(TRIAL_EFFORTS[driver])}",
+            )
+        budget: float | None = None
+        if driver == "claude":
+            budget = (
+                TRIAL_DEFAULT_BUDGET_USD if payload.max_budget_usd is None
+                else payload.max_budget_usd
+            )
+            if not (0 < budget <= TRIAL_MAX_BUDGET_USD):
+                return _json_error(
+                    422, "invalid_budget",
+                    f"max_budget_usd must be in (0, {TRIAL_MAX_BUDGET_USD:.2f}]",
+                )
+        elif payload.max_budget_usd is not None:
+            return _json_error(422, "invalid_budget", "max_budget_usd applies to claude only")
+
+        if bridge.lock.locked():
+            return _json_error(429, "busy", "a download or trial is in progress")
+        async with bridge.lock:
+            try:
+                return await _trial_locked(
+                    bridge, doi=doi, title=title, driver=driver, model=payload.model,
+                    effort=payload.effort, max_budget_usd=budget,
+                )
+            except Exception as exc:  # CancelledError is a BaseException: not caught
+                logger.exception("unhandled exception in /admin/trial (doi=%s)", doi)
+                return _json_error(
+                    _TAXONOMY["bridge_error"][2], _TAXONOMY["bridge_error"][3],
+                    _redact_all(f"{type(exc).__name__}: {exc}")[:300],
+                )
+
     return app
+
+
+async def _chrome_preflight(bridge: Bridge) -> bool:
+    """Chrome health gate shared by /download and /admin/trial (under the lock):
+    run a deferred recovery first, recycle a stale browser, probe, and recover once
+    if sick. Returns whether browser work may proceed."""
+    if bridge.recovery_pending:
+        rec = await chrome.recover()
+        bridge.state_store.update(last_recovery_action=rec.action)
+        # Cleared only by a successful recovery; until then the browser tiers are
+        # gated off as if Chrome were down (an orphan page may still be alive).
+        bridge.recovery_pending = not rec.recovered
+    await chrome.idle_recycle_if_stale()
+    probe = await chrome.probe(fresh=True)
+    chrome_ok = probe.ok and not bridge.recovery_pending
+    if not chrome_ok:
+        rec = await chrome.recover()
+        if rec.recovered:
+            bridge.recovery_pending = False
+        probe = await chrome.probe(fresh=True)
+        chrome_ok = probe.ok and not bridge.recovery_pending
+    return chrome_ok
 
 
 async def _download_locked(
@@ -997,21 +1166,7 @@ async def _download_locked(
     # 5. chrome pre-flight. A sick Chrome no longer fails the whole request: tier 1
     # runs cookie-less regardless, tier 2 is skipped, and tier 3 keeps the legacy
     # 503 chrome_down behavior.
-    if bridge.recovery_pending:
-        rec = await chrome.recover()
-        bridge.state_store.update(last_recovery_action=rec.action)
-        # Cleared only by a successful recovery; until then the browser tiers are
-        # gated off as if Chrome were down (an orphan page may still be alive).
-        bridge.recovery_pending = not rec.recovered
-    await chrome.idle_recycle_if_stale()
-    probe = await chrome.probe(fresh=True)
-    chrome_ok = probe.ok and not bridge.recovery_pending
-    if not chrome_ok:
-        rec = await chrome.recover()
-        if rec.recovered:
-            bridge.recovery_pending = False
-        probe = await chrome.probe(fresh=True)
-        chrome_ok = probe.ok and not bridge.recovery_pending
+    chrome_ok = await _chrome_preflight(bridge)
 
     # 6. write-ahead bookkeeping is lazy — the FIRST tier that actually runs
     # materializes the request + run_dir, so a fully-gated request (no eligible
@@ -1139,8 +1294,23 @@ async def _download_locked(
         # AGA-1462: the deadline caps codex's wall exactly like claude's. Too little
         # left for a useful run (< FALLBACK_MIN_SECONDS of wall): tier 3 is not run
         # and the request ends retryably, as for a rate-skipped tier.
-        codex_wall = min(codex_wall, deadline - MONOTONIC() - CLEANUP_RESERVE_SECONDS)
-        if codex_wall < FALLBACK_MIN_SECONDS:
+        remaining = deadline - MONOTONIC()
+        if codex_ready and claude_go:
+            # AGA-1461: leave claude a guaranteed window after a full codex timeout
+            # (see CLAUDE_FALLBACK_WINDOW_SECONDS). If that leaves codex too little
+            # to be useful, claude runs alone.
+            capped = min(
+                codex_wall,
+                remaining - CLEANUP_RESERVE_SECONDS
+                - (CLAUDE_FALLBACK_WINDOW_SECONDS + CLEANUP_RESERVE_SECONDS),
+            )
+            codex_ready = capped >= FALLBACK_MIN_SECONDS
+            codex_wall = capped
+        elif codex_ready:
+            codex_wall = min(codex_wall, remaining - CLEANUP_RESERVE_SECONDS)
+        # The wall of whichever driver runs first must be a useful one.
+        first_wall = codex_wall if codex_ready else remaining - CLEANUP_RESERVE_SECONDS
+        if first_wall < FALLBACK_MIN_SECONDS:
             return finalize_if_created(
                 _json_error(429, "cooldown", "request budget exhausted before tier 3",
                             retry_after_seconds=TIER3_SKIP_RETRY_SECONDS)
@@ -1265,7 +1435,9 @@ async def _run_tier3(
     # the claude attempt row exists. Too little left: codex's retryable failure
     # stands and no attempt row is consumed.
     remaining = deadline - MONOTONIC()
-    if pending and remaining < FALLBACK_MIN_SECONDS:
+    # AGA-1461: claude must get its guaranteed window (wall >= 300 s), the same one
+    # codex's capped wall reserved for it.
+    if pending and remaining - CLEANUP_RESERVE_SECONDS < CLAUDE_FALLBACK_WINDOW_SECONDS:
         return _finish_failure(bridge, request_id=request_id, **pending)
     api_key = executor.anthropic_api_key()
     assert api_key  # claude_go implies a key
@@ -1638,6 +1810,239 @@ def _finish_failure(
         )
     return _json_error(http_status, error_code, message, request_id=str(request_id),
                        screenshot=screenshot)
+
+
+def _redact_all(text: str | None) -> str:
+    """Strip every secret the bridge can see (Anthropic / Elsevier keys, the bearer
+    token) from text bound for a trial response or log."""
+    out = text or ""
+    for secret in (executor.anthropic_api_key(), executor.elsevier_api_key(), _configured_token()):
+        out = executor.redact_secret(out, secret)
+    return out
+
+
+def _policy_flags(run_dir: Path) -> list[str]:
+    """Scan the run dir's model-authored scripts/logs for credential / cookie /
+    CAPTCHA-solver patterns. Returns ``"<pattern>@<relative file>"`` entries (never
+    file content, which could hold a secret). Reported, not enforced."""
+    flags: list[str] = []
+    try:
+        files = sorted(p for p in run_dir.rglob("*") if p.is_file())
+    except OSError:
+        return flags
+    for path in files:
+        rel = path.relative_to(run_dir)
+        if (
+            path.name in _POLICY_SCAN_SKIP
+            or path.name.endswith(".reason.txt")
+            or path.suffix.lower() not in _POLICY_SCAN_SUFFIXES
+        ):
+            continue
+        try:
+            if path.stat().st_size > _POLICY_SCAN_MAX_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for name, pattern in _POLICY_PATTERNS:
+            if pattern.search(text):
+                flags.append(f"{name}@{rel}")
+                if len(flags) >= _POLICY_FLAGS_MAX:
+                    return flags
+    return flags
+
+
+def _set_aside_prod_pdf(bridge: Bridge, doi: str, aside_dir: Path) -> list[tuple[Path, Path]]:
+    """The executor saves to ``<sanitized-doi>.pdf``; a trial for a DOI that
+    production already holds would overwrite (and then delete!) the dedupe cache's
+    file. Move any production-linked PDF for this DOI out of the way for the
+    trial's duration; ``_restore_aside`` puts it back (mtime preserved)."""
+    moved: list[tuple[Path, Path]] = []
+    try:
+        row = bridge.db.find_verified_pdf(doi=doi)
+        raw = row["local_pdf_path"] if row else None
+        if not raw:
+            return moved
+        original = Path(raw)
+        if original.is_file():
+            aside_dir.mkdir(parents=True, exist_ok=True)
+            target = aside_dir / original.name
+            original.replace(target)
+            moved.append((original, target))
+    except OSError:
+        logger.exception("could not set aside the production PDF for %s", doi)
+    return moved
+
+
+def _restore_aside(moved: list[tuple[Path, Path]]) -> None:
+    for original, target in moved:
+        try:
+            target.replace(original)  # overwrites any stray trial file at that name
+        except OSError:
+            logger.exception("could not restore the production PDF %s", original)
+
+
+async def _trial_locked(
+    bridge: Bridge, *, doi: str, title: str, driver: str, model: str,
+    effort: str | None, max_budget_usd: float | None,
+) -> Response:
+    """One bake-off trial (AGA-1461): the named executor alone, same prompt/task.json/
+    chrome pre-flight/wall logic as tier 3, scored by the production acceptance +
+    identity gate, but leaving NO production state — nothing is linked into
+    papers/paper_links, the dedupe cache is never consulted, and the accepted PDF is
+    hashed then deleted. Returns 200 for every outcome that reached a run."""
+    strategy = f"trial_{driver}"
+    state = bridge.state_store.load()
+    api_key: str | None = None
+    if driver == "codex":
+        if not state.sandbox_mode:
+            return _json_error(503, "selftest_required", "run POST /selftest/codex first")
+    else:
+        api_key = executor.anthropic_api_key()
+        if not _claude_ready(state) or not api_key:
+            return _json_error(503, "claude_auth", "claude driver is not available")
+
+    # Rate: the shared GLOBAL LLM spacing (production + trial rows), then the trial's
+    # own daily cap. Neither writes a row, so a rejection never starts a clock.
+    with bridge.db.transaction() as conn:
+        spacing = limits.check_llm_spacing(conn)
+        cap = limits.check_rate(conn, strategy)
+    if not spacing.allowed:
+        return _json_error(429, "cooldown", "an LLM-driven attempt started too recently",
+                           retry_after_seconds=spacing.retry_after_seconds)
+    if not cap.allowed:
+        return _json_error(429, cap.error_code or "daily_cap", "trial daily cap reached")
+
+    if not await _chrome_preflight(bridge):
+        return _json_error(503, "chrome_down", "Chrome CDP unreachable")
+
+    deadline = MONOTONIC() + REQUEST_BUDGET_SECONDS
+    wall = max(1.0, min(float(executor.EXEC_WALL_SECONDS),
+                        deadline - MONOTONIC() - CLEANUP_RESERVE_SECONDS))
+    trial_id = f"{_utc_now().strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(4)}"
+    run_dir = bridge.config.db_path.parent / "trials" / trial_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    request_id = bridge.trial_ledger_request_id()
+    attempt_id = bridge.write_ahead(
+        request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
+    )
+    moved: list[tuple[Path, Path]] = []
+    try:
+        moved = _set_aside_prod_pdf(bridge, doi, run_dir / "prod_aside")
+        executor.write_task_json(run_dir, doi=doi, title=title, start_url=f"https://doi.org/{doi}")
+        prompt = executor.PROMPT_TEMPLATE.format(run_dir=str(run_dir))
+        started = _utc_now()
+        if driver == "claude":
+            exec_result = await run_claude(
+                run_dir, prompt, api_key or "", wall_seconds=wall, model=model,
+                max_budget_usd=max_budget_usd, effort=effort,
+            )
+        else:
+            exec_result = await run_codex(
+                run_dir, prompt, state.sandbox_mode or "", wall_seconds=wall,
+                model=model, effort=effort,
+            )
+        ended = _utc_now()
+        exec_result.notes = _redact_all(exec_result.notes)
+        final_url = _redact_all(exec_result.final_url) or None
+        kind = exec_result.kind
+
+        gate, gate_reason, verified_by = "not_run", "", None
+        file_sha: str | None = None
+        file_size: int | None = None
+        salvaged = False
+        located: Path | None = None
+        if kind == "downloaded":
+            located = _locate_downloaded(bridge, exec_result.file_path, started, ended)
+        elif kind in {"timeout", "gave_up", "executor_died", "claude_budget"}:
+            located = bridge._locate_in_window(started, ended)  # same salvage pass as prod
+            salvaged = located is not None
+        if located is not None and bridge._mechanical_gates(located):
+            ok, reason = bridge.verify_identity(doi=doi, title=title, path=located)
+            gate_reason = reason
+            if ok:
+                gate = "pass"
+                verified_by = "doi" if doi else "title"
+                file_sha = bridge._sha256(located)
+                file_size = located.stat().st_size
+                try:
+                    located.unlink()  # metadata only: the PDF is not kept
+                except OSError:
+                    logger.exception("could not delete the accepted trial PDF")
+            else:
+                gate = "fail"
+                salvaged = False
+                _quarantine(located, run_dir=run_dir, reason=reason)
+        elif kind == "downloaded":
+            gate, gate_reason = "fail", "claimed download not found or failed mechanical gates"
+            salvaged = False
+        else:
+            salvaged = False
+
+        if gate == "pass":
+            outcome = "completed"
+        elif gate == "fail":
+            outcome = "wrong_paper" if located is not None else "no_pdf"
+        else:
+            outcome = _TAXONOMY.get(kind, (kind,))[0]
+        message = "salvaged" if (gate == "pass" and salvaged) else (exec_result.notes or kind)
+        bridge.resolve_attempt(
+            attempt_id, outcome=outcome, message=message[:300],
+            screenshot_path=str(run_dir / "final.png") if (run_dir / "final.png").exists() else None,
+            current_url=final_url,
+        )
+        if exec_result.cost_usd is not None:
+            with bridge.db.transaction() as conn:
+                limits.record_attempt_cost(conn, attempt_id, exec_result.cost_usd)
+
+        # Same latch semantics as production for a dead login/key.
+        if kind == "auth_error":
+            bridge.state_store.update(sandbox_mode=None, last_selftest_ok=False)
+        elif kind == "claude_auth":
+            bridge.state_store.update(claude_last_selftest_ok=False)
+
+        # Chrome recovery after a bad outcome, exactly like production: skipped past
+        # the deadline for claude (latched for the next request's pre-flight).
+        bad_outcome = kind in {"timeout", "gave_up", "executor_died", "claude_budget"}
+        if bad_outcome or kind in {"auth_error", "claude_auth"}:
+            if driver == "claude" and MONOTONIC() >= deadline:
+                logger.warning("deferring post-trial chrome recovery: deadline passed")
+                bridge.recovery_pending = True
+            else:
+                rec = await chrome.recover()
+                bridge.state_store.update(last_recovery_action=rec.action)
+
+        tokens = executor.codex_token_total(exec_result.events) if driver == "codex" else None
+        body = {
+            "trial_id": trial_id,
+            "driver": driver,
+            "model": model,
+            "effort": effort,
+            "kind": kind,
+            "gate": gate,
+            "gate_reason": _redact_all(gate_reason)[:300],
+            "verified_by": verified_by,
+            "file_sha256": file_sha,
+            "file_size": file_size,
+            "wall_seconds": round(exec_result.wall_seconds, 2),
+            "cost_usd": exec_result.cost_usd if driver == "claude" else None,
+            "tokens": tokens,
+            "final_url": final_url,
+            "notes": _redact_all(exec_result.notes)[:TRIAL_NOTES_MAX],
+            "policy_flags": _policy_flags(run_dir),
+            "salvaged": bool(gate == "pass" and salvaged),
+        }
+        return JSONResponse(status_code=200, content=body)
+    except BaseException:
+        # A crash/cancel after the write-ahead row: close it so it does not sit
+        # 'running' until the next restart (it still counts toward spacing + caps).
+        try:
+            bridge.resolve_attempt(attempt_id, outcome="interrupted", message="trial aborted")
+        except Exception:
+            logger.exception("could not close the trial attempt row")
+        raise
+    finally:
+        _restore_aside(moved)
 
 
 # Module-level app for uvicorn (paperika.bridge.app:app). Built lazily so importing
