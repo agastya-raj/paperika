@@ -1899,15 +1899,15 @@ async def _trial_locked(
                         deadline - MONOTONIC() - CLEANUP_RESERVE_SECONDS))
     trial_id = f"{_utc_now().strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(4)}"
     run_dir = bridge.config.db_path.parent / "trials" / trial_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    # The trial's OWN download dir: nothing it writes can collide with, or be mistaken
+    # for, production files (and nothing in the production dir is ever touched). Created
+    # BEFORE the write-ahead row, so a filesystem failure here leaves no running attempt.
+    trial_dl = run_dir / "downloads"
+    trial_dl.mkdir(parents=True, exist_ok=True)
     request_id = bridge.trial_ledger_request_id()
     attempt_id = bridge.write_ahead(
         request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
     )
-    # The trial's OWN download dir: nothing it writes can collide with, or be mistaken
-    # for, production files (and nothing in the production dir is ever touched).
-    trial_dl = run_dir / "downloads"
-    trial_dl.mkdir(parents=True, exist_ok=True)
     try:
         executor.write_task_json(run_dir, doi=doi, title=title, start_url=f"https://doi.org/{doi}")
         prompt = executor.render_prompt(run_dir, download_dir=trial_dl)
