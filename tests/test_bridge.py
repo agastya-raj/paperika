@@ -2143,7 +2143,8 @@ def test_codex_full_argv_pinned():
     assert executor.build_argv(Path("/r"), "PROMPT", "workspace-write") == CODEX_ARGV_PIN
 
 
-def test_claude_full_argv_pinned_and_key_not_in_argv():
+def test_claude_full_argv_pinned_and_key_not_in_argv(monkeypatch):
+    monkeypatch.setattr(executor, "resolve_claude_bin", lambda: "claude")
     argv = executor.build_argv_claude(Path("/r"), "PROMPT")
     assert argv == [
         "claude", "-p", "--bare", "--tools", "Bash", "--allowedTools", "Bash",
@@ -2773,3 +2774,29 @@ def test_failed_deferred_recovery_keeps_the_latch_and_gates_browser_tiers(cfg, m
     client.post("/download", headers=_auth(), json={"doi": "10.1364/jocn.r4a", "title": "Round Four A"})
     assert app.state.bridge.recovery_pending is True
     assert scripted["n"] == 0
+
+
+def test_resolve_claude_bin_prefers_override_then_path_then_local_bin(tmp_path, monkeypatch):
+    """systemd's default PATH lacks ~/.local/bin, where the native claude installer
+    puts the CLI (AGA-1460 deploy finding)."""
+    monkeypatch.setenv("PAPERIKA_CLAUDE_BIN", "/opt/x/claude")
+    assert executor.resolve_claude_bin() == "/opt/x/claude"
+    monkeypatch.delenv("PAPERIKA_CLAUDE_BIN")
+    monkeypatch.setattr(executor.shutil, "which", lambda name: None)
+    monkeypatch.setattr(executor.Path, "home", classmethod(lambda cls: tmp_path))
+    assert executor.resolve_claude_bin() == "claude"
+    local = tmp_path / ".local" / "bin"
+    local.mkdir(parents=True)
+    (local / "claude").write_text("#!/bin/sh\n")
+    assert executor.resolve_claude_bin() == str(local / "claude")
+
+
+def test_missing_claude_cli_is_retryable_not_a_crash(tmp_path, monkeypatch):
+    async def _spawn(*a, **kw):
+        raise FileNotFoundError(2, "No such file or directory")
+    monkeypatch.setattr(executor, "_spawn", _spawn)
+    import asyncio
+
+    result = asyncio.run(executor.run_claude(tmp_path / "run", "prompt", "sk-test"))
+    assert result.kind == "executor_died"
+    assert "not found" in result.notes

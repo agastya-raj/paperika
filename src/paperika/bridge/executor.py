@@ -16,11 +16,26 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import time
 
 CODEX_BIN = "codex"
 CLAUDE_BIN = "claude"
+
+
+def resolve_claude_bin() -> str:
+    """The claude CLI as the service sees it: ``PAPERIKA_CLAUDE_BIN``, else PATH,
+    else the native installer's ``~/.local/bin/claude`` (not on systemd's default
+    PATH, AGA-1460). Falls back to the bare name so the spawn error stays loud."""
+    override = os.environ.get("PAPERIKA_CLAUDE_BIN")
+    if override:
+        return override
+    found = shutil.which(CLAUDE_BIN)
+    if found:
+        return found
+    local = Path.home() / ".local" / "bin" / CLAUDE_BIN
+    return str(local) if local.exists() else CLAUDE_BIN
 # 240 was too tight: run 62 burned 204s on navigation alone, and run 63 was
 # killed AT Optica's "your PDF will open shortly" delivery page. 480 then became
 # too tight in turn once the executor moved to high reasoning effort (below): a
@@ -680,7 +695,7 @@ def build_argv_claude(run_dir: Path, prompt: str) -> list[str]:
     """``claude -p`` argv. The key is NEVER in argv (env only, see run_claude);
     the prompt is the same static template codex gets (task.json stays data)."""
     return [
-        CLAUDE_BIN,
+        resolve_claude_bin(),
         "-p",
         "--bare",
         "--tools", "Bash",
@@ -804,9 +819,13 @@ async def run_claude(
         run_env.update(env)
     run_env[ANTHROPIC_KEY_ENV] = api_key
     run_env.update(CLAUDE_SCRUB_ENV)
-    stdout, stderr, exit_code, timed_out, wall = await _spawn(
-        build_argv_claude(run_dir, prompt), run_dir, run_env, wait_seconds=wall_seconds
-    )
+    try:
+        stdout, stderr, exit_code, timed_out, wall = await _spawn(
+            build_argv_claude(run_dir, prompt), run_dir, run_env, wait_seconds=wall_seconds
+        )
+    except FileNotFoundError:
+        # A missing CLI is a host fault, not a verdict: retryable, never a crash.
+        return ExecResult(kind="executor_died", notes="claude CLI not found on the bridge host")
     result = classify_claude(
         exit_code=exit_code, stdout=redact_secret(stdout, api_key),
         stderr=redact_secret(stderr, api_key), timed_out=timed_out, wall_seconds=wall,
