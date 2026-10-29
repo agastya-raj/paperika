@@ -89,6 +89,8 @@ DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.IGNORECASE)
 # DOIs a publisher stamps into every PDF that never identify the article itself, e.g.
 # Optica's open-access licence link (https://doi.org/10.1364/OA_License_v1).
 NON_ARTICLE_DOI_PATTERN = re.compile(r"10\.1364/oa_license", re.IGNORECASE)
+# Old-style Optica journal DOIs: 10.1364/<journal>.<volume>.<first page>.
+OPTICA_VOLUME_PAGE_DOI = re.compile(r"^10\.1364/[a-z]+\.(\d+)\.(\d+)$", re.IGNORECASE)
 
 
 class Downloader:
@@ -731,6 +733,21 @@ class Downloader:
         normalized = (value or "").strip().lower().rstrip(".,;)]")
         return normalized or None
 
+    def _optica_volume_page_on_page(self, doi: str, text: str) -> bool:
+        """Old-style Optica DOIs encode volume and first page (10.1364/oe.20.001798 is
+        Opt. Express 20, 1798) and those papers often print no DOI, only a running
+        footer like "Vol. 20, No. 2 / OPTICS EXPRESS 1798". A title-only match must
+        also find that volume and page, so a follow-up or citing paper that repeats
+        the title cannot pass. True for every other DOI shape (no extra evidence)."""
+        match = OPTICA_VOLUME_PAGE_DOI.match(doi)
+        if not match:
+            return True
+        volume, first_page = match.group(1), str(int(match.group(2)))
+        return bool(
+            re.search(rf"\bvol\.?\s*{volume}\b", text, re.IGNORECASE)
+            and re.search(rf"(?<!\d){first_page}(?!\d)", text)
+        )
+
     def _text_contains_doi(self, text: str, doi: str) -> bool:
         normalized_doi = self._normalize_doi_token(doi)
         if not normalized_doi or not text:
@@ -869,6 +886,13 @@ class Downloader:
                     normalized_observed_doi,
                 )
             if parsed.title and self._text_contains_normalized_title(parsed.title, extracted_text):
+                if not self._optica_volume_page_on_page(normalized_requested_doi, extracted_text):
+                    return PdfIdentityCheck(
+                        False,
+                        "title matched but the volume/first page encoded in the Optica DOI is not printed in the PDF",
+                        observed_title,
+                        None,
+                    )
                 return PdfIdentityCheck(
                     True,
                     "Matched requested title in extracted PDF text after DOI was unavailable",

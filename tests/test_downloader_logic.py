@@ -788,13 +788,46 @@ def test_verify_downloaded_pdf_identity_licence_doi_does_not_block_title_match(t
         "_extract_pdf_text",
         lambda path, max_chars=20000: (
             "Dynamic on-demand defragmentation in flexible\nbandwidth elastic optical networks\n"
-            "Yawei Yin,* Ke Wen, David J. Geisler, Ruiting Liu, and S. J. B. Yoo"
+            "Yawei Yin,* Ke Wen, David J. Geisler, Ruiting Liu, and S. J. B. Yoo\n"
+            "16 January 2012 / Vol. 20, No. 2 / OPTICS EXPRESS 1798"
         ),
     )
 
     result = downloader._verify_downloaded_pdf_identity(parsed, pdf_path)
     assert result.ok is True
     assert "title" in result.reason
+
+
+@pytest.mark.parametrize(
+    "page_text",
+    [
+        # A follow-up paper that extends the title, in another issue.
+        "Dynamic on-demand defragmentation in flexible bandwidth elastic optical networks: "
+        "experimental validation\nA. Author\n3 March 2014 / Vol. 22, No. 5 / OPTICS EXPRESS 5120",
+        # A different paper quoting the title in its introduction.
+        "Spectrum retuning in flexgrid networks\nB. Author\nAs shown in Dynamic on-demand "
+        "defragmentation in flexible bandwidth elastic optical networks [3], ...\n"
+        "1 May 2013 / Vol. 21, No. 9 / OPTICS EXPRESS 11003",
+    ],
+)
+def test_verify_downloaded_pdf_identity_title_only_optica_needs_volume_and_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, page_text: str
+):
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    downloader = StubDownloader(config, db)
+    pdf_path = config.download_dir / "other.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n<< /URI (https://doi.org/10.1364/OA_License_v1) >>\n")
+    parsed = infer_input(
+        "Dynamic on-demand defragmentation in flexible bandwidth elastic optical networks 10.1364/oe.20.001798"
+    )
+    monkeypatch.setattr(downloader, "_extract_pdf_text", lambda path, max_chars=20000: page_text)
+
+    result = downloader._verify_downloaded_pdf_identity(parsed, pdf_path)
+    assert result.ok is False
+    assert "volume/first page" in result.reason
 
 
 def test_download_with_fallback_rejects_pdf_identity_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
