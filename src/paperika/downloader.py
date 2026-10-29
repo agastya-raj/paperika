@@ -789,7 +789,10 @@ class Downloader:
             if not page_at_edge.search(RUNNING_HEAD_DATE.sub(" ", line)):
                 continue
             words = " " + " ".join(re.findall(r"[a-z0-9]+", line.lower())) + " "
-            if any(f" {name} " in words for name in names):
+            # The longest known journal name on the line is the line's journal, so
+            # "BIOMEDICAL OPTICS EXPRESS" is never read as "OPTICS EXPRESS".
+            present = [n for known in OPTICA_RUNNING_HEAD_NAMES.values() for n in known if f" {n} " in words]
+            if present and max(present, key=len) in names:
                 return True
         return False
 

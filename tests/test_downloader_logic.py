@@ -955,6 +955,8 @@ def test_licence_first_pdf_without_volume_page_doi_needs_the_doi_printed(
         ("10.1364/ao.21.002758", "1 August 1982 / Vol. 21, No. 3 / OPTICS EXPRESS 2758"),
         # Codex round 6: an article-id page ("D106") must not satisfy page 106.
         ("10.1364/jocn.17.000106", "Vol. 17, No. 9 / September 2025 / J. OPT. COMMUN. NETW. D106"),
+        # Codex round 7: "BIOMEDICAL OPTICS EXPRESS" contains "OPTICS EXPRESS".
+        ("10.1364/oe.12.002156", "1 April 2021 / Vol. 12, No. 4 / BIOMEDICAL OPTICS EXPRESS 2156"),
         # A journal code without a known running-head name cannot be corroborated.
         ("10.1364/xyz.20.001798", "16 January 2012 / Vol. 20, No. 2 / OPTICS EXPRESS 1798"),
     ],
