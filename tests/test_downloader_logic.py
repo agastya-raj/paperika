@@ -808,6 +808,15 @@ def test_verify_downloaded_pdf_identity_licence_doi_does_not_block_title_match(t
         "Spectrum retuning in flexgrid networks\nB. Author\nAs shown in Dynamic on-demand "
         "defragmentation in flexible bandwidth elastic optical networks [3], ...\n"
         "1 May 2013 / Vol. 21, No. 9 / OPTICS EXPRESS 11003",
+        # Same volume: its own footer says Vol. 20, a reference supplies title and 1798.
+        "Another elastic network paper\nC. Author\n"
+        "[3] Y. Yin et al., Dynamic on-demand defragmentation in flexible bandwidth elastic "
+        "optical networks, Opt. Express 20, 1798-1807 (2012).\n"
+        "16 July 2012 / Vol. 20, No. 15 / OPTICS EXPRESS 15000",
+        # IEEE-style reference with vol. and pp. on one line.
+        "Another elastic network paper\nDynamic on-demand defragmentation in flexible bandwidth "
+        "elastic optical networks, Opt. Express, vol. 20, no. 2, pp. 1798-1807, 2012.\n"
+        "16 July 2012 / Vol. 20, No. 15 / OPTICS EXPRESS 15000",
     ],
 )
 def test_verify_downloaded_pdf_identity_title_only_optica_needs_volume_and_page(

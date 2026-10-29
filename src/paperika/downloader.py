@@ -737,16 +737,15 @@ class Downloader:
         """Old-style Optica DOIs encode volume and first page (10.1364/oe.20.001798 is
         Opt. Express 20, 1798) and those papers often print no DOI, only a running
         footer like "Vol. 20, No. 2 / OPTICS EXPRESS 1798". A title-only match must
-        also find that volume and page, so a follow-up or citing paper that repeats
-        the title cannot pass. True for every other DOI shape (no extra evidence)."""
+        also find that footer with this volume AND this first page in one piece, so a
+        follow-up, a citing paper, or a reference line ("Opt. Express 20, 1798-1807",
+        "vol. 20, no. 2, pp. 1798") cannot pass. True for every other DOI shape."""
         match = OPTICA_VOLUME_PAGE_DOI.match(doi)
         if not match:
             return True
         volume, first_page = match.group(1), str(int(match.group(2)))
-        return bool(
-            re.search(rf"\bvol\.?\s*{volume}\b", text, re.IGNORECASE)
-            and re.search(rf"(?<!\d){first_page}(?!\d)", text)
-        )
+        footer = rf"\bvol\.\s*{volume},\s*no\.\s*\d+\s*/\s*[a-z][a-z .&]*?\s+{first_page}(?!\d)"
+        return re.search(footer, text, re.IGNORECASE) is not None
 
     def _text_contains_doi(self, text: str, doi: str) -> bool:
         normalized_doi = self._normalize_doi_token(doi)
