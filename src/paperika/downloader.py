@@ -86,6 +86,9 @@ GENERIC_TITLE_WORDS = {
 }
 
 DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.IGNORECASE)
+# DOIs a publisher stamps into every PDF that never identify the article itself, e.g.
+# Optica's open-access licence link (https://doi.org/10.1364/OA_License_v1).
+NON_ARTICLE_DOI_PATTERN = re.compile(r"10\.1364/oa_license", re.IGNORECASE)
 
 
 class Downloader:
@@ -814,9 +817,11 @@ class Downloader:
                 candidate = " ".join(title_match.group(1).split())
                 if candidate:
                     observed_title = candidate
-        doi_match = DOI_PATTERN.search(text)
-        if doi_match:
-            observed_doi = doi_match.group(0).lower().rstrip(".,;)]")
+        for doi_match in DOI_PATTERN.finditer(text):
+            candidate_doi = doi_match.group(0).lower().rstrip(".,;)]")
+            if not NON_ARTICLE_DOI_PATTERN.match(candidate_doi):
+                observed_doi = candidate_doi
+                break
         return observed_title, observed_doi
 
     def _extract_pdf_text(self, pdf_path: Path, max_chars: int = 20000) -> str:

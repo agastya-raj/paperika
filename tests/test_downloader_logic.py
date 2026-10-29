@@ -753,6 +753,50 @@ def test_verify_downloaded_pdf_identity_accepts_strong_extracted_text_for_doi_kn
     assert "extracted PDF text" in result.reason
 
 
+def test_extract_pdf_identity_skips_optica_licence_doi(tmp_path: Path):
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    downloader = StubDownloader(config, db)
+    pdf_path = config.download_dir / "licence_only.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n<< /URI (https://doi.org/10.1364/OA_License_v1) >>\n")
+    assert downloader._extract_pdf_identity(pdf_path)[1] is None
+
+    pdf_path.write_bytes(
+        b"%PDF-1.4\n<< /URI (https://doi.org/10.1364/OA_License_v1) >>\n"
+        b"<< /URI (https://doi.org/10.1364/OE.20.001798) >>\n"
+    )
+    assert downloader._extract_pdf_identity(pdf_path)[1] == "10.1364/oe.20.001798"
+
+
+def test_verify_downloaded_pdf_identity_licence_doi_does_not_block_title_match(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # AGA-1461 bake-off: Opt. Express 20, 1798 (2012) prints no article DOI on pages 1-2;
+    # the only DOI in its bytes is Optica's licence DOI, which used to fail the gate.
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    downloader = StubDownloader(config, db)
+    pdf_path = config.download_dir / "oe.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n<< /URI (https://doi.org/10.1364/OA_License_v1) >>\n")
+    parsed = infer_input(
+        "Dynamic on-demand defragmentation in flexible bandwidth elastic optical networks 10.1364/oe.20.001798"
+    )
+    monkeypatch.setattr(
+        downloader,
+        "_extract_pdf_text",
+        lambda path, max_chars=20000: (
+            "Dynamic on-demand defragmentation in flexible\nbandwidth elastic optical networks\n"
+            "Yawei Yin,* Ke Wen, David J. Geisler, Ruiting Liu, and S. J. B. Yoo"
+        ),
+    )
+
+    result = downloader._verify_downloaded_pdf_identity(parsed, pdf_path)
+    assert result.ok is True
+    assert "title" in result.reason
+
+
 def test_download_with_fallback_rejects_pdf_identity_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config = build_config(tmp_path)
     config.ensure_runtime_dirs()

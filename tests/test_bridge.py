@@ -2166,7 +2166,7 @@ def test_claude_full_argv_pinned_and_key_not_in_argv(monkeypatch):
     assert argv == [
         "claude", "-p", "--bare", "--tools", "Bash", "--allowedTools", "Bash",
         "--no-session-persistence",
-        "--model", "claude-sonnet-5-5", "--max-budget-usd", "0.60",
+        "--model", "claude-sonnet-5-5", "--effort", "high", "--max-budget-usd", "0.60",
         "--output-format", "json", "--json-schema", json.dumps(executor.OUTCOME_SCHEMA),
         "--permission-mode", "bypassPermissions", "PROMPT",
     ]
@@ -3390,13 +3390,14 @@ def test_build_argv_claude_overrides_and_defaults(tmp_path, monkeypatch):
     default = executor.build_argv_claude(tmp_path, "P")
     assert default[default.index("--model") + 1] == executor.CLAUDE_MODEL
     assert default[default.index("--max-budget-usd") + 1] == executor.CLAUDE_MAX_BUDGET_USD == "0.60"
-    assert "--effort" not in default
+    assert default[default.index("--effort") + 1] == executor.CLAUDE_EFFORT == "high"
     over = executor.build_argv_claude(
         tmp_path, "P", model="claude-opus-5-5", max_budget_usd=2.5, effort="low")
     assert over[over.index("--model") + 1] == "claude-opus-5-5"
     assert over[over.index("--max-budget-usd") + 1] == "2.50"
     assert over[over.index("--effort") + 1] == "low"
-    assert "--effort" not in executor.build_argv_claude(tmp_path, "P", model="claude-opus-5-5")
+    model_only = executor.build_argv_claude(tmp_path, "P", model="claude-opus-5-5")
+    assert model_only[model_only.index("--effort") + 1] == "high"
 
 
 def test_download_still_uses_pinned_argv_for_codex_and_claude(cfg, monkeypatch):

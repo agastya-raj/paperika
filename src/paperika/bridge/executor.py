@@ -76,6 +76,9 @@ SERVICE_TIER_FAST: list[str] = ["-c", 'service_tier="fast"']
 # pass in the subprocess env; --tools Bash is the only tool (the task is Python
 # scripts over CDP); --json-schema makes the final answer a structured_output.
 CLAUDE_MODEL = "claude-sonnet-5-5"
+# AGA-1461 bake-off (35 DOIs x 3 arms): Sonnet 5.5 at high effort passed 29/35 vs 27/35
+# at the CLI default, missed nothing another arm got, median 38 s, max $0.093 per trial.
+CLAUDE_EFFORT = "high"
 CLAUDE_MAX_BUDGET_USD = "0.60"
 ANTHROPIC_KEY_ENV = "ANTHROPIC_API_KEY"
 # The bridge's own bearer token must never reach an executor (its last_message.txt /
@@ -761,10 +764,10 @@ def build_argv_claude(
     """``claude -p`` argv. The key is NEVER in argv (env only, see run_claude);
     the prompt is the same static template codex gets (task.json stays data).
     ``model`` / ``max_budget_usd`` / ``effort`` are AGA-1461 trial overrides; the
-    defaults keep the pinned CLAUDE_MODEL / CLAUDE_MAX_BUDGET_USD and no ``--effort``
-    flag (claude CLI: ``--effort <low|medium|high|xhigh|max>``)."""
+    defaults keep the pinned CLAUDE_MODEL / CLAUDE_EFFORT / CLAUDE_MAX_BUDGET_USD
+    (claude CLI: ``--effort <low|medium|high|xhigh|max>``)."""
     budget = CLAUDE_MAX_BUDGET_USD if max_budget_usd is None else f"{max_budget_usd:.2f}"
-    effort_args = ["--effort", effort] if effort else []
+    effort_args = ["--effort", effort or CLAUDE_EFFORT]
     return [
         resolve_claude_bin(),
         "-p",
