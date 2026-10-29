@@ -817,6 +817,10 @@ def test_verify_downloaded_pdf_identity_licence_doi_does_not_block_title_match(t
         "Another elastic network paper\nDynamic on-demand defragmentation in flexible bandwidth "
         "elastic optical networks, Opt. Express, vol. 20, no. 2, pp. 1798-1807, 2012.\n"
         "16 July 2012 / Vol. 20, No. 15 / OPTICS EXPRESS 15000",
+        # The same reference wrapped so the page ends a line.
+        "Another elastic network paper\nDynamic on-demand defragmentation in flexible bandwidth "
+        "elastic optical networks, Opt. Express, vol. 20, no. 2, pp. 1798\n"
+        "16 July 2012 / Vol. 20, No. 15 / OPTICS EXPRESS 15000",
     ],
 )
 def test_verify_downloaded_pdf_identity_title_only_optica_needs_volume_and_page(
@@ -837,6 +841,48 @@ def test_verify_downloaded_pdf_identity_title_only_optica_needs_volume_and_page(
     result = downloader._verify_downloaded_pdf_identity(parsed, pdf_path)
     assert result.ok is False
     assert "volume/first page" in result.reason
+
+
+@pytest.mark.parametrize(
+    ("doi", "running_line"),
+    [
+        ("10.1364/oe.20.001798", "16 January 2012 / Vol. 20, No. 2 / OPTICS EXPRESS 1798"),
+        ("10.1364/ao.21.002758", "2758 APPLIED OPTICS / Vol. 21, No. 15 / 1 August 1982"),
+        ("10.1364/ol.33.000156", "156 OPTICS LETTERS / Vol. 33, No. 2 / January 15, 2008"),
+        ("10.1364/josaa.7.000450", "450 J. Opt. Soc. Am. A/Vol. 7, No. 3/March 1990"),
+        ("10.1364/josaa.7.000450", "Vol. 7, No. 3/March 1990/J. Opt. Soc. Am. A 450"),
+    ],
+)
+def test_optica_running_head_layouts_are_accepted(tmp_path: Path, doi: str, running_line: str):
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    downloader = StubDownloader(config, db)
+    page_text = f"Some Title\nA. Author\nAbstract text.\n{running_line}\n"
+    assert downloader._optica_volume_page_on_page(doi, page_text) is True
+
+
+@pytest.mark.parametrize(
+    ("doi", "running_line"),
+    [
+        # Page 2012 requested; another article's footer carries the year 2012.
+        ("10.1364/oe.20.002012", "16 January 2012 / Vol. 20, No. 2 / OPTICS EXPRESS 1798"),
+        # Page 1990 requested; another JOSA A article's header carries March 1990.
+        ("10.1364/josaa.7.001990", "450 J. Opt. Soc. Am. A/Vol. 7, No. 3/March 1990"),
+        # Page 2 / page 20 requested; another article's footer carries No. 2 and Vol. 20.
+        ("10.1364/oe.20.000002", "16 January 2012 / Vol. 20, No. 2 / OPTICS EXPRESS 1798"),
+        ("10.1364/oe.20.000020", "16 January 2012 / Vol. 20, No. 2 / OPTICS EXPRESS 1798"),
+    ],
+)
+def test_optica_running_head_ignores_numbers_inside_the_line(tmp_path: Path, doi: str, running_line: str):
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    downloader = StubDownloader(config, db)
+    page_text = f"Some Title\nA. Author\n{running_line}\n"
+    assert downloader._optica_volume_page_on_page(doi, page_text) is False
 
 
 def test_download_with_fallback_rejects_pdf_identity_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

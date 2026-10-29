@@ -91,6 +91,13 @@ DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.IGNORECASE)
 NON_ARTICLE_DOI_PATTERN = re.compile(r"10\.1364/oa_license", re.IGNORECASE)
 # Old-style Optica journal DOIs: 10.1364/<journal>.<volume>.<first page>.
 OPTICA_VOLUME_PAGE_DOI = re.compile(r"^10\.1364/[a-z]+\.(\d+)\.(\d+)$", re.IGNORECASE)
+# Issue dates inside running heads ("16 January 2012", "January 15, 2008", "March 1990"),
+# removed before the page check so a year at the line's edge is never read as a page.
+RUNNING_HEAD_DATE = re.compile(
+    r"(?:\b\d{1,2}\s+)?\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+    r"(?:\s+\d{1,2},)?\s+\d{4}\b",
+    re.IGNORECASE,
+)
 
 
 class Downloader:
@@ -736,16 +743,25 @@ class Downloader:
     def _optica_volume_page_on_page(self, doi: str, text: str) -> bool:
         """Old-style Optica DOIs encode volume and first page (10.1364/oe.20.001798 is
         Opt. Express 20, 1798) and those papers often print no DOI, only a running
-        footer like "Vol. 20, No. 2 / OPTICS EXPRESS 1798". A title-only match must
-        also find that footer with this volume AND this first page in one piece, so a
-        follow-up, a citing paper, or a reference line ("Opt. Express 20, 1798-1807",
-        "vol. 20, no. 2, pp. 1798") cannot pass. True for every other DOI shape."""
+        header or footer. Layouts differ by journal and era:
+            "16 January 2012 / Vol. 20, No. 2 / OPTICS EXPRESS 1798"
+            "2758 APPLIED OPTICS / Vol. 21, No. 15 / 1 August 1982"
+            "450 J. Opt. Soc. Am. A/Vol. 7, No. 3/March 1990"
+        What they share: "Vol. <v>, No. <n>" followed by a "/" separator, with the
+        page number at the start or end of the same line. A title-only match must find
+        such a line with this volume AND this first page, so a follow-up, a citing
+        paper, or a reference ("Opt. Express 20, 1798-1807", "vol. 20, no. 2,
+        pp. 1798") cannot pass. True for every other DOI shape."""
         match = OPTICA_VOLUME_PAGE_DOI.match(doi)
         if not match:
             return True
         volume, first_page = match.group(1), str(int(match.group(2)))
-        footer = rf"\bvol\.\s*{volume},\s*no\.\s*\d+\s*/\s*[a-z][a-z .&]*?\s+{first_page}(?!\d)"
-        return re.search(footer, text, re.IGNORECASE) is not None
+        running_head = re.compile(rf"\bvol\.\s*{volume},\s*no\.\s*\d+\s*/", re.IGNORECASE)
+        page_at_edge = re.compile(rf"^\s*{first_page}(?!\d)|(?<!\d){first_page}\s*$")
+        return any(
+            running_head.search(line) and page_at_edge.search(RUNNING_HEAD_DATE.sub(" ", line))
+            for line in text.splitlines()
+        )
 
     def _text_contains_doi(self, text: str, doi: str) -> bool:
         normalized_doi = self._normalize_doi_token(doi)
