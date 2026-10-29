@@ -957,6 +957,8 @@ def test_licence_first_pdf_without_volume_page_doi_needs_the_doi_printed(
         ("10.1364/jocn.17.000106", "Vol. 17, No. 9 / September 2025 / J. OPT. COMMUN. NETW. D106"),
         # Codex round 7: "BIOMEDICAL OPTICS EXPRESS" contains "OPTICS EXPRESS".
         ("10.1364/oe.12.002156", "1 April 2021 / Vol. 12, No. 4 / BIOMEDICAL OPTICS EXPRESS 2156"),
+        # Codex round 8: "CHINESE OPTICS LETTERS" contains "OPTICS LETTERS".
+        ("10.1364/ol.3.000027", "27 CHINESE OPTICS LETTERS / Vol. 3, No. 1 / January 10, 2005"),
         # A journal code without a known running-head name cannot be corroborated.
         ("10.1364/xyz.20.001798", "16 January 2012 / Vol. 20, No. 2 / OPTICS EXPRESS 1798"),
     ],

@@ -786,14 +786,21 @@ class Downloader:
         for line in text.splitlines():
             if not running_head.search(line):
                 continue
-            if not page_at_edge.search(RUNNING_HEAD_DATE.sub(" ", line)):
+            undated = RUNNING_HEAD_DATE.sub(" ", line)
+            if not page_at_edge.search(undated):
                 continue
-            words = " " + " ".join(re.findall(r"[a-z0-9]+", line.lower())) + " "
-            # The longest known journal name on the line is the line's journal, so
-            # "BIOMEDICAL OPTICS EXPRESS" is never read as "OPTICS EXPRESS".
-            present = [n for known in OPTICA_RUNNING_HEAD_NAMES.values() for n in known if f" {n} " in words]
-            if present and max(present, key=len) in names:
-                return True
+            # The journal is a whole "/"-separated field ("2758 APPLIED OPTICS",
+            # "OPTICS EXPRESS 1798"): drop the page token at its edge and compare the
+            # rest exactly, so "CHINESE OPTICS LETTERS" or "BIOMEDICAL OPTICS EXPRESS"
+            # can never stand in for "OPTICS LETTERS" or "OPTICS EXPRESS".
+            for segment in undated.split("/"):
+                words = re.findall(r"[a-z0-9]+", segment.lower())
+                if words and words[0] == first_page:
+                    words = words[1:]
+                if words and words[-1] == first_page:
+                    words = words[:-1]
+                if " ".join(words) in names:
+                    return True
         return False
 
     def _text_contains_doi(self, text: str, doi: str) -> bool:
