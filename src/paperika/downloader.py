@@ -90,7 +90,19 @@ DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.IGNORECASE)
 # Optica's open-access licence link (https://doi.org/10.1364/OA_License_v1).
 NON_ARTICLE_DOI_PATTERN = re.compile(r"10\.1364/oa_license", re.IGNORECASE)
 # Old-style Optica journal DOIs: 10.1364/<journal>.<volume>.<first page>.
-OPTICA_VOLUME_PAGE_DOI = re.compile(r"^10\.1364/[a-z]+\.(\d+)\.(\d+)$", re.IGNORECASE)
+OPTICA_VOLUME_PAGE_DOI = re.compile(r"^10\.1364/([a-z]+)\.(\d+)\.(\d+)$", re.IGNORECASE)
+# Running-head journal names per Optica DOI journal code, as lowercase words with
+# punctuation dropped ("J. Opt. Soc. Am. A" -> "j opt soc am a").
+OPTICA_RUNNING_HEAD_NAMES: dict[str, tuple[str, ...]] = {
+    "oe": ("optics express",),
+    "ao": ("applied optics",),
+    "ol": ("optics letters",),
+    "josaa": ("j opt soc am a",),
+    "josab": ("j opt soc am b",),
+    "jocn": ("j opt commun netw", "journal of optical communications and networking"),
+    "boe": ("biomedical optics express",),
+    "ome": ("optical materials express",),
+}
 # Issue dates inside running heads ("16 January 2012", "January 15, 2008", "March 1990"),
 # removed before the page check so a year at the line's edge is never read as a page.
 RUNNING_HEAD_DATE = re.compile(
@@ -749,28 +761,37 @@ class Downloader:
         first = DOI_PATTERN.search(text)
         return bool(first and NON_ARTICLE_DOI_PATTERN.match(first.group(0).lower()))
 
-    def _optica_volume_page_on_page(self, doi: str, text: str) -> bool:
-        """Old-style Optica DOIs encode volume and first page (10.1364/oe.20.001798 is
-        Opt. Express 20, 1798) and those papers often print no DOI, only a running
+    def _optica_running_head_corroborates(self, doi: str, text: str) -> bool:
+        """Old-style Optica DOIs encode journal, volume and first page (10.1364/oe.20.001798
+        is Opt. Express 20, 1798), and those papers often print no DOI, only a running
         header or footer. Layouts differ by journal and era:
             "16 January 2012 / Vol. 20, No. 2 / OPTICS EXPRESS 1798"
             "2758 APPLIED OPTICS / Vol. 21, No. 15 / 1 August 1982"
             "450 J. Opt. Soc. Am. A/Vol. 7, No. 3/March 1990"
-        What they share: "Vol. <v>, No. <n>" followed by a "/" separator, with the
-        page number at the start or end of the same line. A title-only match must find
-        such a line with this volume AND this first page, so a follow-up, a citing
-        paper, or a reference ("Opt. Express 20, 1798-1807", "vol. 20, no. 2,
-        pp. 1798") cannot pass. True for every other DOI shape."""
+        True only when one line has "Vol. <v>, No. <n>" followed by "/", names the DOI's
+        journal, and has the first page as a whole token at the line's start or end once
+        issue dates are removed. Any other DOI shape, or a journal not in
+        OPTICA_RUNNING_HEAD_NAMES, cannot be corroborated (False)."""
         match = OPTICA_VOLUME_PAGE_DOI.match(doi)
         if not match:
-            return True
-        volume, first_page = match.group(1), str(int(match.group(2)))
+            return False
+        names = OPTICA_RUNNING_HEAD_NAMES.get(match.group(1).lower())
+        if not names:
+            return False
+        volume, first_page = match.group(2), str(int(match.group(3)))
         running_head = re.compile(rf"\bvol\.\s*{volume},\s*no\.\s*\d+\s*/", re.IGNORECASE)
-        page_at_edge = re.compile(rf"^\s*{first_page}(?!\d)|(?<!\d){first_page}\s*$")
-        return any(
-            running_head.search(line) and page_at_edge.search(RUNNING_HEAD_DATE.sub(" ", line))
-            for line in text.splitlines()
+        page_at_edge = re.compile(
+            rf"^\s*{first_page}(?![A-Za-z0-9])|(?<![A-Za-z0-9]){first_page}\s*$"
         )
+        for line in text.splitlines():
+            if not running_head.search(line):
+                continue
+            if not page_at_edge.search(RUNNING_HEAD_DATE.sub(" ", line)):
+                continue
+            words = " " + " ".join(re.findall(r"[a-z0-9]+", line.lower())) + " "
+            if any(f" {name} " in words for name in names):
+                return True
+        return False
 
     def _text_contains_doi(self, text: str, doi: str) -> bool:
         normalized_doi = self._normalize_doi_token(doi)
@@ -913,22 +934,16 @@ class Downloader:
                     normalized_observed_doi,
                 )
             if parsed.title and self._text_contains_normalized_title(parsed.title, extracted_text):
-                if self._pdf_leads_with_licence_doi(pdf_path) and not OPTICA_VOLUME_PAGE_DOI.match(
-                    normalized_requested_doi
-                ):
-                    # Before the licence DOI was skipped these PDFs failed outright; a
-                    # bare title match is no evidence (a follow-up or citing paper has
-                    # it too), and this DOI shape has no volume/page to corroborate.
+                if self._pdf_leads_with_licence_doi(
+                    pdf_path
+                ) and not self._optica_running_head_corroborates(normalized_requested_doi, extracted_text):
+                    # Before the licence DOI was skipped these PDFs failed outright. A bare
+                    # title match is no evidence (a follow-up or citing paper has it too),
+                    # so the paper's own running head must carry the DOI's journal,
+                    # volume and first page.
                     return PdfIdentityCheck(
                         False,
-                        "licence-DOI PDF does not print the requested DOI, and the DOI has no volume/page to corroborate a title match",
-                        observed_title,
-                        None,
-                    )
-                if not self._optica_volume_page_on_page(normalized_requested_doi, extracted_text):
-                    return PdfIdentityCheck(
-                        False,
-                        "title matched but the volume/first page encoded in the Optica DOI is not printed in the PDF",
+                        "licence-DOI PDF does not print the requested DOI, and its running head does not carry the DOI's journal/volume/first page",
                         observed_title,
                         None,
                     )

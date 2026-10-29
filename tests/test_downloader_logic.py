@@ -891,7 +891,7 @@ def test_optica_running_head_layouts_are_accepted(tmp_path: Path, doi: str, runn
     db.init()
     downloader = StubDownloader(config, db)
     page_text = f"Some Title\nA. Author\nAbstract text.\n{running_line}\n"
-    assert downloader._optica_volume_page_on_page(doi, page_text) is True
+    assert downloader._optica_running_head_corroborates(doi, page_text) is True
 
 
 @pytest.mark.parametrize(
@@ -913,7 +913,7 @@ def test_optica_running_head_ignores_numbers_inside_the_line(tmp_path: Path, doi
     db.init()
     downloader = StubDownloader(config, db)
     page_text = f"Some Title\nA. Author\n{running_line}\n"
-    assert downloader._optica_volume_page_on_page(doi, page_text) is False
+    assert downloader._optica_running_head_corroborates(doi, page_text) is False
 
 
 @pytest.mark.parametrize("doi", ["10.1364/ofc.2025.m2c.5", "10.1364/jocn.433412"])
@@ -944,6 +944,45 @@ def test_licence_first_pdf_without_volume_page_doi_needs_the_doi_printed(
     # The same PDF that prints the requested DOI still passes.
     monkeypatch.setattr(
         downloader, "_extract_pdf_text", lambda path, max_chars=20000: f"Some title\nhttps://doi.org/{doi}"
+    )
+    assert downloader._verify_downloaded_pdf_identity(parsed, pdf_path).ok is True
+
+
+@pytest.mark.parametrize(
+    ("doi", "running_line"),
+    [
+        # Codex round 6: another journal's head supplies the volume and page.
+        ("10.1364/ao.21.002758", "1 August 1982 / Vol. 21, No. 3 / OPTICS EXPRESS 2758"),
+        # Codex round 6: an article-id page ("D106") must not satisfy page 106.
+        ("10.1364/jocn.17.000106", "Vol. 17, No. 9 / September 2025 / J. OPT. COMMUN. NETW. D106"),
+        # A journal code without a known running-head name cannot be corroborated.
+        ("10.1364/xyz.20.001798", "16 January 2012 / Vol. 20, No. 2 / OPTICS EXPRESS 1798"),
+    ],
+)
+def test_optica_running_head_needs_the_dois_journal_and_whole_page(tmp_path: Path, doi: str, running_line: str):
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    downloader = StubDownloader(config, db)
+    assert downloader._optica_running_head_corroborates(doi, f"Some Title\n{running_line}\n") is False
+
+
+def test_pdf_without_any_doi_keeps_the_title_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # Only licence-first PDFs need running-head evidence; a PDF with no DOI in its bytes
+    # keeps the pre-existing title fallback for a DOI-known request.
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    downloader = StubDownloader(config, db)
+    pdf_path = config.download_dir / "no_doi.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+    parsed = infer_input("Advanced Optical Link Tomography for Optical Network Monitoring 10.1364/ao.21.002758")
+    monkeypatch.setattr(
+        downloader,
+        "_extract_pdf_text",
+        lambda path, max_chars=20000: "Advanced Optical Link Tomography for Optical Network Monitoring\nA. Author",
     )
     assert downloader._verify_downloaded_pdf_identity(parsed, pdf_path).ok is True
 
