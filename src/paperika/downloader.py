@@ -849,11 +849,14 @@ class Downloader:
                 candidate = " ".join(title_match.group(1).split())
                 if candidate:
                     observed_title = candidate
-        for doi_match in DOI_PATTERN.finditer(text):
+        # Only the FIRST DOI in the bytes counts. When it is a licence DOI the PDF
+        # exposes no article DOI: a later DOI in the bytes may be a reference link
+        # (possibly to the very paper requested), so it is never promoted.
+        doi_match = DOI_PATTERN.search(text)
+        if doi_match:
             candidate_doi = doi_match.group(0).lower().rstrip(".,;)]")
             if not NON_ARTICLE_DOI_PATTERN.match(candidate_doi):
                 observed_doi = candidate_doi
-                break
         return observed_title, observed_doi
 
     def _extract_pdf_text(self, pdf_path: Path, max_chars: int = 20000) -> str:

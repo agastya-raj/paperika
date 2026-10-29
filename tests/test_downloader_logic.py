@@ -763,11 +763,42 @@ def test_extract_pdf_identity_skips_optica_licence_doi(tmp_path: Path):
     pdf_path.write_bytes(b"%PDF-1.4\n<< /URI (https://doi.org/10.1364/OA_License_v1) >>\n")
     assert downloader._extract_pdf_identity(pdf_path)[1] is None
 
+    # A later DOI after the licence may be a reference link: never promoted.
     pdf_path.write_bytes(
         b"%PDF-1.4\n<< /URI (https://doi.org/10.1364/OA_License_v1) >>\n"
         b"<< /URI (https://doi.org/10.1364/OE.20.001798) >>\n"
     )
-    assert downloader._extract_pdf_identity(pdf_path)[1] == "10.1364/oe.20.001798"
+    assert downloader._extract_pdf_identity(pdf_path)[1] is None
+
+
+def test_verify_downloaded_pdf_identity_reference_link_after_licence_does_not_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Codex round 4: a different Optica PDF whose bytes hold the licence URI and then a
+    # reference link to the requested DOI must not pass on that DOI.
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    downloader = StubDownloader(config, db)
+    pdf_path = config.download_dir / "citing.pdf"
+    pdf_path.write_bytes(
+        b"%PDF-1.4\n<< /URI (https://doi.org/10.1364/OA_License_v1) >>\n"
+        b"<< /URI (https://doi.org/10.1364/OE.20.001798) >>\n"
+    )
+    parsed = infer_input(
+        "Dynamic on-demand defragmentation in flexible bandwidth elastic optical networks 10.1364/oe.20.001798"
+    )
+    monkeypatch.setattr(
+        downloader,
+        "_extract_pdf_text",
+        lambda path, max_chars=20000: (
+            "Another elastic network paper\nC. Author\n16 July 2012 / Vol. 20, No. 15 / OPTICS EXPRESS 15000"
+        ),
+    )
+
+    result = downloader._verify_downloaded_pdf_identity(parsed, pdf_path)
+    assert result.ok is False
 
 
 def test_verify_downloaded_pdf_identity_licence_doi_does_not_block_title_match(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
