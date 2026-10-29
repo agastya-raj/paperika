@@ -916,6 +916,38 @@ def test_optica_running_head_ignores_numbers_inside_the_line(tmp_path: Path, doi
     assert downloader._optica_volume_page_on_page(doi, page_text) is False
 
 
+@pytest.mark.parametrize("doi", ["10.1364/ofc.2025.m2c.5", "10.1364/jocn.433412"])
+def test_licence_first_pdf_without_volume_page_doi_needs_the_doi_printed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, doi: str
+):
+    # Codex round 5: a licence-first PDF with a quoted or extended title must not pass for
+    # DOI shapes that carry no volume/page (OFC, modern article ids).
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    downloader = StubDownloader(config, db)
+    pdf_path = config.download_dir / "followup.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n<< /URI (https://doi.org/10.1364/OA_License_v1) >>\n")
+    parsed = infer_input(f"Advanced Optical Link Tomography for Optical Network Monitoring {doi}")
+    monkeypatch.setattr(
+        downloader,
+        "_extract_pdf_text",
+        lambda path, max_chars=20000: (
+            "Advanced Optical Link Tomography for Optical Network Monitoring: experimental validation\nA. Author"
+        ),
+    )
+    result = downloader._verify_downloaded_pdf_identity(parsed, pdf_path)
+    assert result.ok is False
+    assert "licence-DOI PDF" in result.reason
+
+    # The same PDF that prints the requested DOI still passes.
+    monkeypatch.setattr(
+        downloader, "_extract_pdf_text", lambda path, max_chars=20000: f"Some title\nhttps://doi.org/{doi}"
+    )
+    assert downloader._verify_downloaded_pdf_identity(parsed, pdf_path).ok is True
+
+
 def test_download_with_fallback_rejects_pdf_identity_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config = build_config(tmp_path)
     config.ensure_runtime_dirs()

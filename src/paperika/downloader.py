@@ -740,6 +740,15 @@ class Downloader:
         normalized = (value or "").strip().lower().rstrip(".,;)]")
         return normalized or None
 
+    def _pdf_leads_with_licence_doi(self, pdf_path: Path) -> bool:
+        """True when the first DOI in the PDF bytes is a licence DOI (see _extract_pdf_identity)."""
+        try:
+            text = pdf_path.read_bytes()[:262144].decode("latin-1", errors="ignore")
+        except Exception:
+            return False
+        first = DOI_PATTERN.search(text)
+        return bool(first and NON_ARTICLE_DOI_PATTERN.match(first.group(0).lower()))
+
     def _optica_volume_page_on_page(self, doi: str, text: str) -> bool:
         """Old-style Optica DOIs encode volume and first page (10.1364/oe.20.001798 is
         Opt. Express 20, 1798) and those papers often print no DOI, only a running
@@ -904,6 +913,18 @@ class Downloader:
                     normalized_observed_doi,
                 )
             if parsed.title and self._text_contains_normalized_title(parsed.title, extracted_text):
+                if self._pdf_leads_with_licence_doi(pdf_path) and not OPTICA_VOLUME_PAGE_DOI.match(
+                    normalized_requested_doi
+                ):
+                    # Before the licence DOI was skipped these PDFs failed outright; a
+                    # bare title match is no evidence (a follow-up or citing paper has
+                    # it too), and this DOI shape has no volume/page to corroborate.
+                    return PdfIdentityCheck(
+                        False,
+                        "licence-DOI PDF does not print the requested DOI, and the DOI has no volume/page to corroborate a title match",
+                        observed_title,
+                        None,
+                    )
                 if not self._optica_volume_page_on_page(normalized_requested_doi, extracted_text):
                     return PdfIdentityCheck(
                         False,
