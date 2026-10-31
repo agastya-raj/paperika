@@ -2151,6 +2151,7 @@ CODEX_ARGV_PIN = [
     "-c", 'model_reasoning_effort="high"',
     "-c", 'service_tier="fast"',
     "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+    "-c", 'sandbox_workspace_write.writable_roots=["/home/agastya/Downloads/papers"]',
     "-C", "/r", "--json", "-o", "/r/last_message.txt",
     "--output-schema", "/r/outcome.schema.json", "PROMPT",
 ]
@@ -3371,6 +3372,13 @@ def test_trial_validation_accepts_every_allowlisted_value(cfg):
         "claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"}
     assert bridge_app.TRIAL_EFFORTS["codex"] == {"medium", "high"}
     assert bridge_app.TRIAL_EFFORTS["claude"] == {"low", "medium", "high"}
+
+
+def test_codex_writable_root_follows_trial_download_dir(tmp_path):
+    argv = executor.build_argv(Path("/r"), "P", "workspace-write", download_dir=tmp_path / "dl")
+    assert f'sandbox_workspace_write.writable_roots=["{tmp_path / "dl"}"]' in argv
+    assert "sandbox_workspace_write.writable_roots=[\"/home/agastya/Downloads/papers\"]" not in argv
+    assert not any("writable_roots" in a for a in executor.build_argv(Path("/r"), "P", "bypass"))
 
 
 def test_build_argv_overrides_and_defaults(tmp_path):

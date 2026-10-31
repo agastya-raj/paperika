@@ -254,10 +254,22 @@ SELFTEST_PROMPT = (
 )
 
 
-def sandbox_flags(sandbox_mode: str) -> list[str]:
-    """Translate a persisted sandbox_mode into codex exec flags (§2.4)."""
+def sandbox_flags(sandbox_mode: str, download_dir: Path | None = None) -> list[str]:
+    """Translate a persisted sandbox_mode into codex exec flags (§2.4).
+
+    workspace-write only lets codex write under ``-C <run_dir>``; the prompt tells it to
+    save the PDF into the download dir, so that dir is added as a writable root
+    (AGA-1456: request 85 verified the PDF, then reported its Downloads destination
+    "read-only"). ``download_dir`` defaults to the production dir; AGA-1461 trials pass
+    their private one, matching ``render_prompt``.
+    """
     if sandbox_mode == "workspace-write":
-        return ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]
+        roots = json.dumps([str(download_dir or PROD_DOWNLOAD_DIR)])
+        return [
+            "-s", "workspace-write",
+            "-c", "sandbox_workspace_write.network_access=true",
+            "-c", f"sandbox_workspace_write.writable_roots={roots}",
+        ]
     if sandbox_mode == "bypass":
         return ["--dangerously-bypass-approvals-and-sandbox"]
     raise ValueError(f"unknown sandbox_mode: {sandbox_mode!r}")
@@ -472,7 +484,7 @@ def classify(
 def build_argv(
     run_dir: Path, prompt: str, sandbox_mode: str, *, with_schema: bool = True,
     wall_seconds: float = EXEC_WALL_SECONDS, model: str | None = None,
-    effort: str | None = None,
+    effort: str | None = None, download_dir: Path | None = None,
 ) -> list[str]:
     """Construct the timeout-wrapped codex exec argv (§2.4).
 
@@ -499,7 +511,7 @@ def build_argv(
         *model_args,
         *effort_args,
         *SERVICE_TIER_FAST,
-        *sandbox_flags(sandbox_mode),
+        *sandbox_flags(sandbox_mode, download_dir),
         "-C",
         str(run_dir),
         "--json",
@@ -572,6 +584,7 @@ async def run_codex(
     wall_seconds: float = EXEC_WALL_SECONDS,
     model: str | None = None,
     effort: str | None = None,
+    download_dir: Path | None = None,
 ) -> ExecResult:
     """Spawn ``timeout <wall_seconds=EXEC_WALL_SECONDS> codex exec ...`` with
     start_new_session=True; on overrun killpg the whole process group (codex +
@@ -584,7 +597,7 @@ async def run_codex(
         write_outcome_schema(run_dir)
     argv = build_argv(
         run_dir, prompt, sandbox_mode, with_schema=write_schema, wall_seconds=wall_seconds,
-        model=model, effort=effort,
+        model=model, effort=effort, download_dir=download_dir,
     )
 
     run_env = dict(os.environ)

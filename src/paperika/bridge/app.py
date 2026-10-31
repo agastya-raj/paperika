@@ -1920,7 +1920,7 @@ async def _trial_locked(
         else:
             exec_result = await run_codex(
                 run_dir, prompt, state.sandbox_mode or "", wall_seconds=wall,
-                model=model, effort=effort,
+                model=model, effort=effort, download_dir=trial_dl,
             )
         ended = _utc_now()
         exec_result.notes = _redact_all(exec_result.notes)
