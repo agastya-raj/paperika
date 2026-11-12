@@ -18,9 +18,7 @@ import os
 from pathlib import Path
 import re
 import secrets
-import shutil
 import signal
-import stat
 import time
 
 from .executor import ANTHROPIC_KEY_ENV, BRIDGE_TOKEN_ENV, ELSEVIER_KEY_ENV, TCD_CACHE_DIR
@@ -108,30 +106,6 @@ def socket_dir_fits(path: Path) -> bool:
     return len(os.fsencode(str(path))) + 1 + SOCKET_NAME_BUDGET <= SOCKET_PATH_MAX
 
 
-@dataclass(eq=False)
-class SocketDir:
-    """A socket dir the bridge created: its path, a descriptor of its parent opened
-    (O_DIRECTORY | O_NOFOLLOW) BEFORE any executor ran, and the created dir's identity.
-    Removal goes through that descriptor and checks the identity, so swapping the
-    parent (or the dir itself) can never redirect it. ``close`` drops the descriptor."""
-    path: Path
-    parent_fd: int | None
-    dev: int
-    ino: int
-
-    @property
-    def name(self) -> str:
-        return self.path.name
-
-    def close(self) -> None:
-        if self.parent_fd is not None:
-            try:
-                os.close(self.parent_fd)
-            except OSError:
-                pass
-            self.parent_fd = None
-
-
 def _open_dir_nofollow(path: Path) -> int | None:
     try:
         return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -139,131 +113,62 @@ def _open_dir_nofollow(path: Path) -> int | None:
         return None
 
 
-def _allocate_in(parent_fd: int, parent: Path, name: str) -> SocketDir | None:
-    """mkdir ``name`` exclusively, relative to ``parent_fd``, mode 0700. None when the
-    name is taken: an existing dir is never reused."""
-    try:
-        os.mkdir(name, 0o700, dir_fd=parent_fd)
-    except FileExistsError:
+def _create_in(parent: Path, names) -> Path | None:
+    """Create the first free name of ``names`` in ``parent``: the parent is opened
+    O_DIRECTORY | O_NOFOLLOW (a symlink or non-directory is refused) and the child
+    created EXCLUSIVELY relative to that descriptor, mode 0700 (a taken name is never
+    reused). The descriptor is closed in this function on every path."""
+    pfd = _open_dir_nofollow(parent)
+    if pfd is None:
         return None
-    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
     try:
-        os.fchmod(fd, 0o700)
-        st = os.fstat(fd)
+        for name in names:
+            if not socket_dir_fits(parent / name):
+                continue
+            try:
+                os.mkdir(name, 0o700, dir_fd=pfd)
+            except FileExistsError:
+                continue
+            return parent / name
+        return None
     finally:
-        os.close(fd)
-    return SocketDir(parent / name, parent_fd, st.st_dev, st.st_ino)
+        os.close(pfd)
 
 
-def make_socket_dir(run_dir: Path) -> SocketDir | None:
-    """Create the run's private (0700) agent-browser socket dir, exclusively and
-    relative to a kept parent descriptor: ``<run_dir>/ab`` (or ``ab-<4 hex>`` on a
-    collision) when a socket in it fits the unix path limit, else a fresh
-    ``SOCKET_FALLBACK_ROOT/<8 hex>``. None (never an exception) when no candidate fits,
-    every attempt collided, or the fallback root is a symlink or not a directory (it
-    sits in executor-writable territory: refused, never followed)."""
+def make_socket_dir(run_dir: Path) -> Path | None:
+    """Create the run's private agent-browser socket dir: ``<run_dir>/ab`` (or
+    ``ab-<4 hex>`` on a collision) when a socket in it fits the unix path limit, else a
+    fresh ``SOCKET_FALLBACK_ROOT/<8 hex>``. None (never an exception) when no candidate
+    fits, every attempt collided, or a parent is a symlink or not a directory. The
+    bridge never removes these dirs (see docs/bridge_contracts.md)."""
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
-        if socket_dir_fits(run_dir / "ab"):
-            pfd = _open_dir_nofollow(run_dir)
-            if pfd is not None:
-                for i in range(SOCKET_DIR_ATTEMPTS):
-                    name = "ab" if i == 0 else f"ab-{secrets.token_hex(2)}"
-                    made = _allocate_in(pfd, run_dir, name) if socket_dir_fits(run_dir / name) else None
-                    if made is not None:
-                        return made
-                os.close(pfd)
+        primary = _create_in(run_dir, (
+            "ab" if i == 0 else f"ab-{secrets.token_hex(2)}" for i in range(SOCKET_DIR_ATTEMPTS)
+        )) if socket_dir_fits(run_dir / "ab") else None
+        if primary is not None:
+            return primary
         if not socket_dir_fits(SOCKET_FALLBACK_ROOT / ("0" * 8)):
             return None
         try:
             SOCKET_FALLBACK_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError:
-            pass  # e.g. a file or a dangling symlink there: refused just below
-        pfd = _open_dir_nofollow(SOCKET_FALLBACK_ROOT)
-        if pfd is None:
-            logger.warning("refusing agent-browser socket dir root %s: not a plain directory",
+            pass  # e.g. a file or a dangling symlink there: refused by the O_NOFOLLOW open
+        made = _create_in(SOCKET_FALLBACK_ROOT,
+                          (secrets.token_hex(4) for _ in range(SOCKET_DIR_ATTEMPTS)))
+        if made is None:
+            logger.warning("no agent-browser socket dir could be created under %s",
                            SOCKET_FALLBACK_ROOT)
-            return None
-        for _ in range(SOCKET_DIR_ATTEMPTS):
-            made = _allocate_in(pfd, SOCKET_FALLBACK_ROOT, secrets.token_hex(4))
-            if made is not None:
-                return made
-        os.close(pfd)
-        return None
+        return made
     except OSError as exc:
-        logger.warning("could not create an agent-browser socket dir under %s: %s",
+        logger.warning("could not create an agent-browser socket dir for %s: %s",
                        run_dir, type(exc).__name__)
         return None
 
 
-def _still_ours(sd: SocketDir) -> bool:
-    """The child name, seen through the kept parent descriptor (never followed), is
-    still the very directory the bridge created."""
-    try:
-        st = os.stat(sd.name, dir_fd=sd.parent_fd, follow_symlinks=False)
-    except OSError:
-        return False
-    return stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == (sd.dev, sd.ino)
-
-
-def remove_socket_dir(sd: SocketDir) -> None:
-    """Remove the dir the bridge created, never by path: relative to the kept parent
-    descriptor, only if the name is still that dir (device + inode), with the
-    symlink-attack-safe rmtree; where that is unavailable, nothing is removed and it
-    is logged. The descriptor is closed on every path."""
-    try:
-        if sd.parent_fd is None:
-            return
-        if not shutil.rmtree.avoids_symlink_attacks:
-            logger.warning("not removing %s: rmtree is not symlink-attack safe here", sd.path)
-            return
-        try:
-            os.stat(sd.name, dir_fd=sd.parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        if not _still_ours(sd):
-            logger.warning("not removing %s: it is no longer the directory the bridge created",
-                           sd.path)
-            return
-        try:
-            parent_now = os.stat(sd.path.parent, follow_symlinks=False)
-            moved = (parent_now.st_dev, parent_now.st_ino) != (
-                os.fstat(sd.parent_fd).st_dev, os.fstat(sd.parent_fd).st_ino)
-        except OSError:
-            moved = True
-        if moved:
-            logger.warning("the parent of %s was moved or replaced; removing only the directory "
-                           "the bridge created, through its kept descriptor", sd.path)
-        shutil.rmtree(sd.name, dir_fd=sd.parent_fd)
-    except OSError as exc:
-        logger.warning("could not remove %s: %s", sd.path, type(exc).__name__)
-    finally:
-        sd.close()
-
-
-def _dir_is_empty(sd: SocketDir) -> bool:
-    """Entry NAMES only (no file is opened), through the kept parent descriptor, and
-    only for the dir the bridge created. Any doubt reads as not empty."""
-    if sd.parent_fd is None:
-        return False
-    try:
-        fd = os.open(sd.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=sd.parent_fd)
-    except OSError:
-        return False
-    try:
-        st = os.fstat(fd)
-        if (st.st_dev, st.st_ino) != (sd.dev, sd.ino):
-            return False
-        return not os.listdir(fd)
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
-
-
-def session_env(session: str, socket_dir: SocketDir) -> dict[str, str]:
+def session_env(session: str, socket_dir: Path) -> dict[str, str]:
     """The executor's TCD-mode env additions: its session and its socket dir."""
-    return {SESSION_ENV: session, SOCKET_DIR_ENV: str(socket_dir.path)}
+    return {SESSION_ENV: session, SOCKET_DIR_ENV: str(socket_dir)}
 
 
 def _cli_env(socket_dir: Path | None = None) -> dict[str, str]:
@@ -357,17 +262,31 @@ RELEASED = "released"            # "tcd-browser: released lease <id>"
 LEFT_TO_EXPIRE = "left_to_expire"  # "tcd-browser: lease <id> left to expire": the gateway
 #   release failed, but the CLI stopped the local daemon and dropped the session state
 NO_SESSION = "no_session"        # "tcd-browser: no active session '<name>'"
-UNCLASSIFIED = "unclassified"    # non-zero exit, timeout, no CLI, or none of the above
-_CLOSE_LINES: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (RELEASED, re.compile(r"^tcd-browser: released lease \S+", re.MULTILINE)),
-    (LEFT_TO_EXPIRE, re.compile(r"^tcd-browser: lease \S+ left to expire", re.MULTILINE)),
-    (NO_SESSION, re.compile(r"^tcd-browser: no active session '", re.MULTILINE)),
-)
+UNCLASSIFIED = "unclassified"    # anything else
+_RELEASED_LINE = re.compile(r"tcd-browser: released lease [0-9a-f]{16}")
+_LEFT_LINE = re.compile(r"tcd-browser: lease [0-9a-f]{16} left to expire")
+
+
+def classify_close(code: int, stderr: str, session: str) -> str:
+    """The close's outcome from an EXACT, whole-output match: exit 0 and a stripped
+    stderr of exactly one line that fully matches one of the three known lines, the
+    no-session one naming exactly the session the bridge passed. Anything else (several
+    lines, extra text, another session, a non-zero exit) is UNCLASSIFIED: lease
+    metadata the executor can write must not be able to forge a line."""
+    text = (stderr or "").strip()
+    if code != 0 or not text or "\n" in text or "\r" in text:
+        return UNCLASSIFIED
+    if _RELEASED_LINE.fullmatch(text):
+        return RELEASED
+    if _LEFT_LINE.fullmatch(text):
+        return LEFT_TO_EXPIRE
+    if text == f"tcd-browser: no active session '{session}'":
+        return NO_SESSION
+    return UNCLASSIFIED
 
 
 async def release(session: str, socket_dir: Path | None = None) -> str:
-    """``tcd-browser ab --session <name> --close``, classified by its stderr line, never
-    by the exit code. Best effort and logged; never raises an Exception. There are only
+    """``tcd-browser ab --session <name> --close``, classified by ``classify_close``. Best effort and logged; never raises an Exception. There are only
     four shared leases for every agent, so the bridge closes after EVERY TCD-mode run."""
     try:
         code, out, err = await _run_cli(
@@ -381,14 +300,13 @@ async def release(session: str, socket_dir: Path | None = None) -> str:
     except Exception as exc:
         logger.warning("tcd-browser release of %s failed: %s", session, type(exc).__name__)
         return UNCLASSIFIED
-    if code == 0:
-        for outcome, line in _CLOSE_LINES:
-            if line.search(err):
-                logger.info("tcd-browser release of %s: %s", session, outcome)
-                return outcome
-    logger.warning("tcd-browser release of %s unclassified (exit %s): %s", session, code,
-                   (err or out).strip()[:200])
-    return UNCLASSIFIED
+    outcome = classify_close(code, err, session)
+    if outcome == UNCLASSIFIED:
+        logger.warning("tcd-browser release of %s unclassified (exit %s): %s", session, code,
+                       (err or out).strip()[:200])
+    else:
+        logger.info("tcd-browser release of %s: %s", session, outcome)
+    return outcome
 
 
 async def session_url(
@@ -426,39 +344,27 @@ class Closed:
     cancelled: asyncio.CancelledError | None = None
 
 
-async def _close(session: str, sd: SocketDir) -> str:
-    """Release, classified by the CLI's line; an unclassified release is tried once
-    more after RELEASE_RETRY_DELAY_SECONDS. The socket dir is removed after
-    ``released`` or ``left to expire`` (the CLI stopped the local daemon either way),
-    and after ``no active session`` only when it holds no entries at all. Otherwise it
-    is left exactly as it is, with one warning. The bridge reads no file in it and
-    signals no process. The parent descriptor is closed on every path."""
-    try:
-        outcome = await release(session, sd.path)
-        if outcome == UNCLASSIFIED:
-            await asyncio.sleep(RELEASE_RETRY_DELAY_SECONDS)
-            outcome = await release(session, sd.path)
-        if outcome == RELEASED:
-            remove_socket_dir(sd)
-        elif outcome == LEFT_TO_EXPIRE:
-            logger.warning("tcd-browser session %s: the gateway kept its lease, held until it "
-                           "idles out (about 10 minutes); the local daemon was stopped", session)
-            remove_socket_dir(sd)
-        elif outcome == NO_SESSION:
-            if _dir_is_empty(sd):
-                remove_socket_dir(sd)
-            else:
-                logger.warning("tcd-browser has no session %s, yet %s holds entries; leaving "
-                               "it as it is", session, sd.path)
-        else:
-            logger.warning("tcd-browser session %s was not released after two tries; "
-                           "leaving %s as it is", session, sd.path)
-        return outcome
-    finally:
-        sd.close()
+async def _close(session: str, socket_dir: Path) -> str:
+    """Release; an UNCLASSIFIED release is tried once more after
+    RELEASE_RETRY_DELAY_SECONDS. The outcome only drives logging, that retry and the
+    selftest rule: the socket dir is never removed, read or listed, and no process is
+    signalled."""
+    outcome = await release(session, socket_dir)
+    if outcome == UNCLASSIFIED:
+        await asyncio.sleep(RELEASE_RETRY_DELAY_SECONDS)
+        outcome = await release(session, socket_dir)
+    if outcome == LEFT_TO_EXPIRE:
+        logger.warning("tcd-browser session %s: the gateway kept its lease, held until it "
+                       "idles out (about 10 minutes); the local daemon was stopped", session)
+    elif outcome == UNCLASSIFIED:
+        logger.warning("tcd-browser session %s was not released after two tries (socket dir "
+                       "%s)", session, socket_dir)
+    return outcome
 
 
-async def close_session(session: str, sd: SocketDir, *, defer_cancel: bool = False) -> Closed:
+async def close_session(
+    session: str, socket_dir: Path, *, defer_cancel: bool = False
+) -> Closed:
     """After every TCD-mode run, shielded from cancellation as a whole (bounded by two
     release timeouts and the retry pause): ``_close``.
 
@@ -466,7 +372,7 @@ async def close_session(session: str, sd: SocketDir, *, defer_cancel: bool = Fal
     re-raised once the close is done, or, with ``defer_cancel`` (the executor already
     returned a result), returned in ``Closed.cancelled`` so the caller can persist that
     result first and re-raise it afterwards."""
-    task = asyncio.ensure_future(_close(session, sd))
+    task = asyncio.ensure_future(_close(session, socket_dir))
     cancelled: asyncio.CancelledError | None = None
     while not task.done():
         try:
