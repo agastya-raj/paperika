@@ -57,7 +57,6 @@ RELEASE_RETRY_DELAY_SECONDS = 2.0
 STATUS_CACHE_TTL_SECONDS = 60
 STATUS_TIMEOUT_SECONDS = 5
 RELEASE_TIMEOUT_SECONDS = 20
-SESSION_URL_TIMEOUT_SECONDS = 20
 REAP_SECONDS = 5
 MONOTONIC = time.monotonic  # module attribute so tests can stub the clock
 
@@ -307,33 +306,6 @@ async def release(session: str, socket_dir: Path | None = None) -> str:
     else:
         logger.info("tcd-browser release of %s: %s", session, outcome)
     return outcome
-
-
-async def session_url(
-    session: str, socket_dir: Path | None = None
-) -> tuple[str | None, str | None]:
-    """The bridge's OWN read of a session's tab: ``tcd-browser ab --session <name>
-    -- get url``. Returns (url, None), or (None, why) on any error or timeout; never
-    raises an Exception. A session that was never opened leases a fresh blank tab
-    here, so it reads as about:blank (the caller's release then closes it)."""
-    try:
-        code, out, err = await _run_cli(
-            ["ab", "--session", session, "--", "get", "url"], timeout=SESSION_URL_TIMEOUT_SECONDS,
-            socket_dir=socket_dir,
-        )
-    except asyncio.TimeoutError:
-        return None, f"get url timed out after {SESSION_URL_TIMEOUT_SECONDS}s"
-    except Exception as exc:
-        return None, f"get url failed: {type(exc).__name__}"
-    if code != 0:
-        return None, f"get url exited {code}: {(err or out).strip()[:200]}"
-    lines = [line.strip() for line in out.splitlines() if line.strip()]
-    if not lines:
-        return None, "get url printed nothing"
-    # agent-browser may wrap output in content-boundary marker lines; the URL is the
-    # line that parses as one.
-    urls = [line for line in lines if re.match(r"^[a-z][a-z0-9+.-]*:", line)]
-    return (urls[-1] if urls else lines[-1]), None
 
 
 @dataclass(slots=True)

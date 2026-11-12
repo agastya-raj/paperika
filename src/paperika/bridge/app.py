@@ -1425,11 +1425,10 @@ async def _tcd_selftest_locked(
         return _json_error(503, "tcd_unavailable",
                            "no agent-browser socket dir fits the unix socket path limit", ok=False)
     try:
-        # The bridge's own read of the tab (before the release, through the same socket
-        # dir) is the pass evidence the model cannot fake.
+        # Pass evidence beyond the model's own report: the screenshot its one chained
+        # command wrote (checked in run_tcd_selftest) and, below, the RELEASED close.
         result = await executor.run_tcd_selftest(
             run_dir, driver=driver, env=tcd_browser.session_env(session, socket_dir),
-            read_session_url=functools.partial(tcd_browser.session_url, session, socket_dir),
             sandbox_mode=state.sandbox_mode, api_key=api_key,
         )
     except BaseException:
@@ -1886,6 +1885,7 @@ async def _run_executor_attempt(
     )
     executor.write_task_json(run_dir, doi=doi, title=title, start_url=start_url)
     if tcd:
+        executor.write_start_url_file(run_dir, start_url)
         prompt = executor.render_tcd_prompt(run_dir)
         session = tcd_browser.session_name(str(request_id), driver)
         tcd_kw: dict[str, Any] = {"env": tcd_browser.session_env(session, sock), "tcd": True}
@@ -2262,10 +2262,15 @@ def _redact_all(text: str | None) -> str:
     return out
 
 
-def _policy_flags(run_dir: Path) -> list[str]:
+def _policy_flags(run_dir: Path, *, start_url: str | None = None) -> list[str]:
     """Scan the run dir's model-authored scripts/logs for credential / cookie /
     CAPTCHA-solver patterns. Returns ``"<pattern>@<relative file>"`` entries (never
-    file content, which could hold a secret). Reported, not enforced."""
+    file content, which could hold a secret). Reported, not enforced.
+
+    ``start_url`` (AGA-1702, TCD runs only) is the address the bridge wrote to
+    ``<run_dir>/start_url.txt``. That one file is skipped while it still holds exactly
+    that address: it is request data, like task.json. A local run passes nothing, so a
+    file of that name is scanned as on main; so is one the model changed or nested."""
     flags: list[str] = []
     try:
         files = sorted(p for p in run_dir.rglob("*") if p.is_file())
@@ -2273,6 +2278,15 @@ def _policy_flags(run_dir: Path) -> list[str]:
         return flags
     for path in files:
         rel = path.relative_to(run_dir)
+        if start_url is not None and rel == Path(executor.START_URL_FILE):
+            expected = start_url.encode("utf-8")
+            try:
+                # Bounded: the executor can replace this file with one of any size.
+                with path.open("rb") as handle:
+                    if handle.read(len(expected) + 1) == expected:
+                        continue
+            except OSError:
+                pass
         if (
             path.name in _POLICY_SCAN_SKIP
             or path.name.endswith(".reason.txt")
@@ -2358,8 +2372,10 @@ async def _trial_locked(
     )
     resolved = False
     try:
-        executor.write_task_json(run_dir, doi=doi, title=title, start_url=f"https://doi.org/{doi}")
+        trial_url = f"https://doi.org/{doi}"
+        executor.write_task_json(run_dir, doi=doi, title=title, start_url=trial_url)
         if tcd:
+            executor.write_start_url_file(run_dir, trial_url)
             prompt = executor.render_tcd_prompt(run_dir, download_dir=trial_dl)
             session = tcd_browser.session_name(f"trial{attempt_id}", driver)
             tcd_kw: dict[str, Any] = {
@@ -2483,7 +2499,7 @@ async def _trial_locked(
             "tokens": tokens,
             "final_url": final_url,
             "notes": _redact_all(exec_result.notes)[:TRIAL_NOTES_MAX],
-            "policy_flags": _policy_flags(run_dir),
+            "policy_flags": _policy_flags(run_dir, start_url=trial_url if tcd else None),
             "salvaged": bool(gate == "pass" and salvaged),
         }
         return JSONResponse(status_code=200, content=body)
