@@ -14,6 +14,10 @@ DEFAULT_DOWNLOAD_DIR = Path.home() / "Downloads" / "papers"
 DEFAULT_SCREENSHOT_DIR = DEFAULT_STATE_DIR / "screenshots"
 DEFAULT_NOTIFICATION_DIR = DEFAULT_STATE_DIR / "events"
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
+# AGA-1702: the browser the bridge's tier-3 executors drive: "local" (the managed
+# Chrome over CDP) or "tcd" (the TCD browser through the tcd-browser CLI, used only
+# while it is ready; otherwise the bridge falls back to local).
+DEFAULT_TIER3_BROWSER = "local"
 
 
 @dataclass(slots=True)
@@ -24,6 +28,7 @@ class PaperikaConfig:
     notification_dir: Path = DEFAULT_NOTIFICATION_DIR
     chrome_cdp_url: str = DEFAULT_CDP_URL
     discovery_shortlist_size: int = 8
+    tier3_browser: str = DEFAULT_TIER3_BROWSER
 
     @classmethod
     def from_env(cls) -> "PaperikaConfig":
@@ -34,6 +39,7 @@ class PaperikaConfig:
             notification_dir=Path(os.getenv("PAPERIKA_NOTIFICATION_DIR", DEFAULT_NOTIFICATION_DIR)),
             chrome_cdp_url=os.getenv("PAPERIKA_CHROME_CDP_URL", DEFAULT_CDP_URL),
             discovery_shortlist_size=int(os.getenv("PAPERIKA_DISCOVERY_SHORTLIST_SIZE", "8")),
+            tier3_browser=os.getenv("PAPERIKA_TIER3_BROWSER", DEFAULT_TIER3_BROWSER),
         )
 
     def ensure_runtime_dirs(self) -> None:

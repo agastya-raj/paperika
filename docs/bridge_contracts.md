@@ -440,3 +440,62 @@ network, no codex `models_cache.json`, which is client-version filtered and omit
 `codex.reasoning_effort` (`executor.CODEX_REASONING_EFFORT`, `"high"`) and `claude.model`
 (`executor.CLAUDE_MODEL`). The daily KC watcher compares them with the Sol tier named in the
 canon; on a bump, change the constant and `POST /selftest/codex`.
+
+## Tier 3 through the TCD browser (AGA-1702)
+
+Tier 3's executors (codex, then the claude fallback) can drive the **TCD browser** — a
+long-lived real Chrome with a shared, signed-in profile on another university host, reached
+only through the `tcd-browser` CLI at `/home/agastya/.local/bin/tcd-browser` — instead of the
+local managed Chrome. Elsevier, tiers 1-2, the identity gate, the outcome taxonomy and the
+request budget are unchanged.
+
+- **Setting:** `PAPERIKA_TIER3_BROWSER` = `local` (default) | `tcd` (`PaperikaConfig.tier3_browser`).
+  `tcd` is used only while it is **ready**: the CLI exists, a cached `tcd-browser status`
+  (60 s cache, 5 s timeout) reports `gateway … ok=True` and `browser shared=up`, and
+  `POST /selftest/tcd` passed within `SELFTEST_MAX_AGE_DAYS` (14). Otherwise the request
+  uses the local Chrome and logs the reason once.
+- **Prompt:** `executor.TCD_PROMPT_TEMPLATE`, static apart from `{run_dir}` like the local one
+  (task data stays in `task.json`). It keeps the goal, data rule, access judgement, PDF
+  finding, per-paper budget, report and `final.png`, and swaps in the CLI mechanics: challenge
+  pages are waited out (10 s, at most three times, never clicked); the PDF href is opened
+  directly rather than fighting an overlay; a download is taken only if it appeared after the
+  executor's own action, copied with `download --latest` into `{run_dir}/tcd_download`, then
+  moved to `<download dir>/<sanitized-doi>.pdf` and checked for `%PDF-`. Hard rules: no login,
+  credentials, CAPTCHA, terms or forms; only doi.org and the paper's publisher; no CLI
+  subcommand besides `ab`, `downloads`, `download --latest`; never the key file or cookies;
+  never other tabs; never close the session.
+- **Spawn:** env `TCD_BROWSER_SESSION=paperika-<request id>-<driver>` (trials
+  `paperika-trial<attempt id>-<driver>`). The codex `workspace-write` sandbox gains exactly one
+  extra writable root, `~/.cache/tcd_browser` (the CLI's session files). Secret stripping is
+  unchanged. Claude gets no new tool.
+- **Lease:** the bridge runs `tcd-browser ab --session <name> --close` (20 s timeout, best
+  effort, logged) after every TCD-mode executor run, whatever its outcome or exception.
+- **Local Chrome:** a TCD-mode tier 3 does not require it and is never followed by the local
+  Chrome recovery; the pre-flight and tier 2 keep their Chrome rules.
+- **Recording and limits:** attempts are `tcd_codex` / `tcd_claude` (trials `trial_tcd_codex`
+  / `trial_tcd_claude`). `limits.RATE_POOLS` makes each share the spacing and daily cap of
+  the local driver's strategy (`codex_bridge`, `claude_bridge`, `trial_codex`,
+  `trial_claude`); all four join the global LLM spacing. No extra attempt is ever added.
+- **`POST /selftest/tcd`** (token, lock; `?driver=codex|claude`, default codex when armed
+  else claude): fresh status check (`503 tcd_unavailable` when down), then one executor opens
+  https://example.org through the CLI and reports `TCD_TITLE=` / `TCD_URL=`; passes only on
+  `Example Domain` and `https://example.org/` (or without the slash). Persists
+  `tcd_last_selftest_ok/at`; the bridge releases the lease.
+- **`/healthz` `tcd` block** (authenticated tier only): `configured_mode`, `cli_present`,
+  `gateway {ok, shared_up, error, probe_age_seconds}` (null without the CLI), `tcd_usable`,
+  `last_selftest_ok/at`, `attempts_today` per TCD strategy, `claude_cost_usd` and
+  `trial_claude_cost_usd` month-to-date.
+- **Trials:** `/admin/trial` takes `browser: "local"|"tcd"` (default local, `422
+  invalid_browser`); `tcd` needs the readiness above (`503 tcd_unavailable`), skips the Chrome
+  pre-flight, uses the trial's private download dir, and the response carries `browser`.
+
+### The codex latch re-arms itself (AGA-1702)
+
+When a `/download` reaches the tier-3 gate with codex off or its selftest stale
+(`codex_usable` false), a selftest has run before (`last_selftest_at` set), no selftest
+(manual or automatic) started in the last 24 h, codex's rate rule allows it and the local
+Chrome is up, the bridge runs the codex selftest itself under the lock, each variant's wall
+capped at 180 s and within the request budget (skipped when tier 3 would be left under
+`FALLBACK_MIN_SECONDS`). `codex_rearm_attempted_at` is written before it runs. A pass persists
+exactly what `POST /selftest/codex` does; a failure records `last_selftest_ok=false` and, for
+`codex_auth`, clears `sandbox_mode`. It never runs from `/healthz`.
