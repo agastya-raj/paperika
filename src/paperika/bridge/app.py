@@ -167,7 +167,6 @@ _POLICY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 # the model's final report, not the model's scripts).
 _POLICY_SCAN_SKIP = {
     "task.json", "outcome.schema.json", "argv.json", "last_message.txt",
-    executor.START_URL_FILE,  # AGA-1702: the request's own address, not a model script
 }
 _POLICY_SCAN_SUFFIXES = {".py", ".js", ".mjs", ".sh", ".log", ".txt", ".json", ".md", ".html"}
 _POLICY_SCAN_MAX_BYTES = 2_000_000
@@ -2263,10 +2262,15 @@ def _redact_all(text: str | None) -> str:
     return out
 
 
-def _policy_flags(run_dir: Path) -> list[str]:
+def _policy_flags(run_dir: Path, *, start_url: str | None = None) -> list[str]:
     """Scan the run dir's model-authored scripts/logs for credential / cookie /
     CAPTCHA-solver patterns. Returns ``"<pattern>@<relative file>"`` entries (never
-    file content, which could hold a secret). Reported, not enforced."""
+    file content, which could hold a secret). Reported, not enforced.
+
+    ``start_url`` (AGA-1702, TCD runs only) is the address the bridge wrote to
+    ``<run_dir>/start_url.txt``. That one file is skipped while it still holds exactly
+    that address: it is request data, like task.json. A local run passes nothing, so a
+    file of that name is scanned as on main; so is one the model changed or nested."""
     flags: list[str] = []
     try:
         files = sorted(p for p in run_dir.rglob("*") if p.is_file())
@@ -2274,6 +2278,12 @@ def _policy_flags(run_dir: Path) -> list[str]:
         return flags
     for path in files:
         rel = path.relative_to(run_dir)
+        if start_url is not None and rel == Path(executor.START_URL_FILE):
+            try:
+                if path.read_bytes() == start_url.encode("utf-8"):
+                    continue
+            except OSError:
+                pass
         if (
             path.name in _POLICY_SCAN_SKIP
             or path.name.endswith(".reason.txt")
@@ -2486,7 +2496,7 @@ async def _trial_locked(
             "tokens": tokens,
             "final_url": final_url,
             "notes": _redact_all(exec_result.notes)[:TRIAL_NOTES_MAX],
-            "policy_flags": _policy_flags(run_dir),
+            "policy_flags": _policy_flags(run_dir, start_url=trial_url if tcd else None),
             "salvaged": bool(gate == "pass" and salvaged),
         }
         return JSONResponse(status_code=200, content=body)

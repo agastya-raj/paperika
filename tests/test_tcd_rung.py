@@ -2291,20 +2291,52 @@ def test_an_ordinary_state_folder_is_written_into_the_tcd_prompts_unquoted():
     assert "'/home/a" not in prompt
 
 
-def test_the_start_address_file_raises_no_policy_flag(cfg, cli, monkeypatch, tmp_path):
-    """The file is the bridge's own copy of the request's address, like task.json: a DOI
-    or address that happens to hold a flagged word says nothing about the model."""
-    (tmp_path / executor.START_URL_FILE).write_text("https://doi.org/10.1234/captcha password")
+def test_the_start_address_file_raises_no_policy_flag_in_a_tcd_trial_only(
+    cfg, cli, monkeypatch, tmp_path
+):
+    """In a TCD run the file is the bridge's own copy of the request's address, like
+    task.json: a DOI that happens to hold a flagged word says nothing about the model.
+    Only that exact file with that exact content is skipped; a local run scans a file of
+    that name as main does."""
+    address = "https://doi.org/10.1234/captcha"
+    (tmp_path / executor.START_URL_FILE).write_text(address)
     (tmp_path / "s.py").write_text("x = 'captcha'\n")
-    assert bridge_app._policy_flags(tmp_path) == ["captcha@s.py"]
+    assert bridge_app._policy_flags(tmp_path, start_url=address) == ["captcha@s.py"]
+    # local semantics (no start_url given): scanned, exactly as on main
+    assert bridge_app._policy_flags(tmp_path) == ["captcha@s.py", "captcha@start_url.txt"]
+    # a copy the model nested, or the file once the model changed it, is scanned
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / executor.START_URL_FILE).write_text(address)
+    assert "captcha@sub/start_url.txt" in bridge_app._policy_flags(tmp_path, start_url=address)
+    (tmp_path / executor.START_URL_FILE).write_text(address + "\ndocument.cookie")
+    flags = bridge_app._policy_flags(tmp_path, start_url=address)
+    assert "document.cookie@start_url.txt" in flags and "captcha@start_url.txt" in flags
+
     _ready_state(cfg)
 
-    async def _fake(run_dir, prompt, sandbox_mode, **kw):
-        assert (run_dir / executor.START_URL_FILE).read_text() == "https://doi.org/10.1234/captcha"
+    async def _tcd_fake(run_dir, prompt, sandbox_mode, **kw):
+        assert (run_dir / executor.START_URL_FILE).read_text() == address
         return executor.ExecResult(kind="gave_up", notes="fake")
 
-    monkeypatch.setattr(bridge_app, "run_codex", _fake)
-    resp = _trial(TestClient(bridge_app.create_app(cfg)), doi="10.1234/captcha")
+    monkeypatch.setattr(bridge_app, "run_codex", _tcd_fake)
+    client = TestClient(bridge_app.create_app(cfg))
+    resp = _trial(client, doi="10.1234/captcha")
     assert resp.status_code == 200, resp.text
     assert resp.json()["policy_flags"] == []
 
+    # a LOCAL trial whose executor itself creates a file of that name is reported as on main
+    con = _conn(cfg)
+    con.execute("UPDATE paper_attempts SET started_at = '2020-01-01T00:00:00+00:00'")
+    con.commit()
+    con.close()
+
+    async def _local_fake(run_dir, prompt, sandbox_mode, **kw):
+        # even with the very bytes a TCD run would hold: here the model wrote it
+        assert not (run_dir / executor.START_URL_FILE).exists()
+        (run_dir / executor.START_URL_FILE).write_text(address)
+        return executor.ExecResult(kind="gave_up", notes="fake")
+
+    monkeypatch.setattr(bridge_app, "run_codex", _local_fake)
+    resp = _trial(client, browser="local", doi="10.1234/captcha")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["policy_flags"] == ["captcha@start_url.txt"]
