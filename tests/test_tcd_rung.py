@@ -68,6 +68,14 @@ if argv[-2:] == ["get", "url"]:
     sys.stdout.write(os.environ.get("STUB_TCD_URL", "https://example.org/") + "\n")
     sys.exit(int(os.environ.get("STUB_TCD_URL_RC", "0")))
 if argv[-1:] == ["--close"]:
+    fails = int(os.environ.get("STUB_TCD_CLOSE_FAILS", "0"))
+    if fails:
+        count_file = os.environ["STUB_TCD_CLOSE_COUNT"]
+        n = (int(open(count_file).read()) if os.path.exists(count_file) else 0) + 1
+        with open(count_file, "w") as fh:
+            fh.write(str(n))
+        if n <= fails:
+            sys.exit(1)
     time.sleep(float(os.environ.get("STUB_TCD_CLOSE_SLEEP", "0")))
     if log:
         with open(log, "a") as fh:
@@ -159,6 +167,8 @@ def cli(tmp_path, monkeypatch):
     monkeypatch.setattr(tcd_browser, "TCD_BROWSER_BIN", str(stub))
     monkeypatch.setenv("STUB_TCD_LOG", str(log))
     monkeypatch.setenv("STUB_TCD_STATUS", STATUS_OK)
+    monkeypatch.setenv("STUB_TCD_CLOSE_COUNT", str(tmp_path / "close_count"))
+    monkeypatch.setattr(tcd_browser, "RELEASE_RETRY_DELAY_SECONDS", 0.05)
 
     def _calls() -> list[dict]:
         if not log.exists():
@@ -1372,6 +1382,7 @@ def test_a_cancelled_tcd_attempt_is_killed_before_its_lease_is_released(cfg, cli
         bridge, driver="codex", request_id=rid, run_dir=run_dir, doi=DOI, title=TITLE,
         start_url=start_url, sandbox_mode="workspace-write", defer_failure=False,
         deadline=bridge_app.MONOTONIC() + 1000, tcd=True,
+        socket_dir=tcd_browser.make_socket_dir(run_dir),
     )
     pid = asyncio.run(_cancel_once_started(attempt, pidfile))
     closes = [c for c in cli() if c["argv"][-1:] == ["--close"]]
@@ -1662,6 +1673,7 @@ def test_production_auth_error_is_persisted_before_a_cancel_during_the_close(cfg
         bridge, driver="codex", request_id=rid, run_dir=run_dir, doi=DOI, title=TITLE,
         start_url=start_url, sandbox_mode="workspace-write", defer_failure=False,
         deadline=bridge_app.MONOTONIC() + 1000, tcd=True,
+        socket_dir=tcd_browser.make_socket_dir(run_dir),
     )
     asyncio.run(_cancel_during_close(attempt, cli))
     assert [c["argv"] for c in cli()][-1] == ["close-finished"]  # the close was not cut short
@@ -1708,75 +1720,6 @@ def test_an_interrupted_executor_still_ends_interrupted(cfg, cli, tmp_path, monk
     asyncio.run(_cancel_once_started(trial, pidfile))
     assert [(s, o) for s, o, _ in _ledger(cfg)] == [("trial_tcd_codex", "interrupted")]
     assert len(_releases(cli())) == 1
-
-
-# ------------------------ pass 2, fix 2: a failed close never orphans a daemon ---
-
-_STUB_DAEMON = r"""
-import time
-time.sleep(60)
-"""
-
-
-def _spawn_stand_in(tmp_path: Path, name: str):
-    """A harmless sleeper whose command line carries ``name``; reaped in a thread so a
-    signalled one disappears instead of lingering as our zombie."""
-    import subprocess
-    import sys
-    import threading
-    script = tmp_path / "bin" / name
-    script.parent.mkdir(parents=True, exist_ok=True)
-    script.write_text(_STUB_DAEMON)
-    proc = subprocess.Popen([sys.executable, str(script)], start_new_session=True)
-    threading.Thread(target=proc.wait, daemon=True).start()
-    return proc
-
-
-def test_a_failed_release_with_a_live_daemon_stops_it_and_removes_the_dir(cli, tmp_path, monkeypatch, caplog):
-    monkeypatch.setenv("STUB_TCD_RC", "1")  # the release fails
-    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
-    daemon = _spawn_stand_in(tmp_path, "agent-browser-linux-x64")
-    try:
-        (socket_dir / "tcd-paperika-9-cod-abcdef12.pid").write_text(str(daemon.pid))
-        (socket_dir / "tcd-paperika-9-cod-abcdef12.sock").write_text("")
-        with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
-            assert asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir)) is None
-        assert not _alive(daemon.pid)
-        assert not socket_dir.exists()
-        assert any("stopping a leftover agent-browser daemon" in r.getMessage() for r in caplog.records)
-    finally:
-        if _alive(daemon.pid):
-            daemon.kill()
-
-
-def test_a_pid_file_naming_an_unrelated_process_is_never_signalled(cli, tmp_path, monkeypatch):
-    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
-    other = _spawn_stand_in(tmp_path, "plain-sleeper")
-    try:
-        (socket_dir / "tcd-paperika-9-cod-abcdef12.pid").write_text(str(other.pid))
-        asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir))
-        assert _alive(other.pid)  # not ours: untouched
-        assert not socket_dir.exists()  # and no agent-browser daemon is left in it
-    finally:
-        other.kill()
-
-
-def test_a_daemon_that_cannot_be_stopped_keeps_its_dir(cli, tmp_path, monkeypatch, caplog):
-    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
-    daemon = _spawn_stand_in(tmp_path, "agent-browser-linux-x64")
-
-    async def _never(pid, seconds):
-        return False
-    monkeypatch.setattr(tcd_browser, "_wait_dead", _never)
-    try:
-        (socket_dir / "tcd-x.pid").write_text(str(daemon.pid))
-        with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
-            asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir))
-        assert socket_dir.exists()
-        assert any("could not be stopped" in r.getMessage() and str(socket_dir) in r.getMessage()
-                   for r in caplog.records)
-    finally:
-        daemon.kill()
 
 
 # ---------------------- pass 2, fix 3: the selftest row is outside the spacing ---
@@ -1856,7 +1799,6 @@ def test_a_preexisting_socket_dir_is_never_reused(tmp_path, monkeypatch):
 def test_no_socket_dir_fits_means_no_socket_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(tcd_browser, "SOCKET_PATH_MAX", 20)
     assert tcd_browser.make_socket_dir(tmp_path / "r") is None
-    assert tcd_browser.socket_dir_possible(tmp_path / "r") is False
 
 
 def test_no_fit_production_runs_local_with_the_reason(cfg, cli, monkeypatch, caplog):
@@ -1868,7 +1810,7 @@ def test_no_fit_production_runs_local_with_the_reason(cfg, cli, monkeypatch, cap
         _download(TestClient(bridge_app.create_app(cfg)))
     assert _strategies(cfg)[-1] == "codex_bridge" and "tcd" not in codex[0]
     logged = [r.getMessage() for r in caplog.records if "tier 3 browser" in r.getMessage()]
-    assert len(logged) == 1 and "no agent-browser socket dir fits" in logged[0]
+    assert len(logged) == 1 and "no agent-browser socket dir could be created" in logged[0]
 
 
 def test_no_fit_trial_is_refused_without_a_row(cfg, cli, monkeypatch):
@@ -1888,3 +1830,194 @@ def test_no_fit_selftest_is_refused_without_a_run(cfg, cli, monkeypatch):
     assert resp.status_code == 503 and resp.json()["error_code"] == "tcd_unavailable"
     assert seen == [] and _releases(cli()) == []
     assert "tcd_codex_last_selftest_ok" not in _read_state(cfg)
+
+
+# --------------- pass 3, fixes 1-2: the close reads nothing the executor wrote ---
+
+
+def _populate(socket_dir: Path) -> dict[str, bytes]:
+    files = {"tcd-paperika-9-cod-abcdef12.pid": b"4242\n",
+             "tcd-paperika-9-cod-abcdef12.sock": b"",
+             "tcd-paperika-9-cod-abcdef12.config": b"{}"}
+    for name, data in files.items():
+        (socket_dir / name).write_bytes(data)
+    return files
+
+
+def test_a_failed_then_successful_release_removes_the_dir(cli, tmp_path, monkeypatch):
+    monkeypatch.setenv("STUB_TCD_CLOSE_FAILS", "1")
+    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
+    _populate(socket_dir)
+    assert asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir)) is None
+    assert len(_releases(cli())) == 2  # failed, then tried once more
+    assert not socket_dir.exists()
+
+
+def test_two_failed_releases_leave_the_dir_exactly_as_it_is(cli, tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("STUB_TCD_CLOSE_FAILS", "2")
+    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
+    files = _populate(socket_dir)
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
+        asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir))
+    assert len(_releases(cli())) == 2
+    assert {p.name: p.read_bytes() for p in socket_dir.iterdir()} == files  # untouched
+    warned = [r.getMessage() for r in caplog.records if "not released after two tries" in r.getMessage()]
+    assert len(warned) == 1 and "paperika-9-codex" in warned[0] and str(socket_dir) in warned[0]
+
+
+def _close_with_traps(socket_dir: Path, *, fails: int, monkeypatch) -> bool:
+    """Close with a FIFO named like a pid file and a huge-number pid file present.
+    Runs in a thread: a blocking read of the FIFO would stall it (and the event loop)
+    for good, so returning promptly is the proof nothing reads it."""
+    import threading
+    os.mkfifo(socket_dir / "x.pid")
+    (socket_dir / "y.pid").write_text("9" * 40)
+    monkeypatch.setenv("STUB_TCD_CLOSE_FAILS", str(fails))
+    done = threading.Event()
+
+    def _run():
+        asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir))
+        done.set()
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    finished = done.wait(15)
+    if not finished:  # unblock a reader stuck on the FIFO so the thread can end
+        fd = os.open(socket_dir / "x.pid", os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+    return finished
+
+
+def test_the_close_never_reads_a_fifo_or_a_huge_pid_file_after_a_failed_release(cli, tmp_path, monkeypatch):
+    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
+    assert _close_with_traps(socket_dir, fails=2, monkeypatch=monkeypatch)
+    assert (socket_dir / "x.pid").exists() and (socket_dir / "y.pid").read_text() == "9" * 40
+
+
+def test_the_close_removes_a_fifo_and_a_huge_pid_file_after_a_successful_release(cli, tmp_path, monkeypatch):
+    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
+    assert _close_with_traps(socket_dir, fails=0, monkeypatch=monkeypatch)
+    assert not socket_dir.exists()
+
+
+def test_the_close_code_reads_and_signals_nothing():
+    import inspect
+    src = inspect.getsource(tcd_browser._close) + inspect.getsource(tcd_browser.close_session)
+    for forbidden in ("read_text", "read_bytes", "open(", "glob", "iterdir", "listdir",
+                      "scandir", "os.kill", "killpg"):
+        assert forbidden not in src
+    for gone in ("stop_leftover_daemons", "_pid_alive", "_cmdline", "_wait_dead"):
+        assert not hasattr(tcd_browser, gone)
+
+
+# ------------------------- pass 3, fix 3: the selection creates the dir, once ---
+
+
+def test_a_socket_dir_that_cannot_be_created_means_a_local_run_not_a_500(cfg, cli, monkeypatch, caplog):
+    """The reproduced boundary: <run_dir>/ab exists and fits exactly, ab-<hex> does not
+    fit, nor does the fallback. Creation fails, so the request runs local."""
+    _ready_state(_tcd_cfg(cfg))
+    run_dir = cfg.db_path.parent / "codex_runs" / "1"  # the first request's run dir
+    (run_dir / "ab").mkdir(parents=True)
+    monkeypatch.setattr(tcd_browser, "SOCKET_PATH_MAX",
+                        len(os.fsencode(str(run_dir / "ab"))) + 1 + tcd_browser.SOCKET_NAME_BUDGET)
+    monkeypatch.setattr(tcd_browser, "SOCKET_FALLBACK_ROOT", cfg.db_path.parent / ("f" * 120))
+    codex: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(codex, kind="gave_up"))
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.app"):
+        resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert _last_request_id(cfg) == 1
+    assert resp.status_code == 502 and resp.json()["error_code"] == "codex_gave_up"
+    assert _ledger(cfg)[-1] == ("codex_bridge", "executor_gave_up", 1)  # local, resolved
+    assert "tcd" not in codex[0]
+    assert sorted(p.name for p in run_dir.iterdir() if p.name.startswith("ab")) == ["ab"]
+    logged = [r.getMessage() for r in caplog.records if "tier 3 browser" in r.getMessage()]
+    assert len(logged) == 1 and "socket dir" in logged[0]
+
+
+def test_a_budget_exit_after_the_selection_leaves_no_socket_dir(cfg, cli, monkeypatch):
+    _ready_state(_tcd_cfg(cfg))
+    clock = {"t": 0.0}
+    monkeypatch.setattr(bridge_app, "MONOTONIC", lambda: clock["t"])
+
+    async def _slow_direct(**kwargs):
+        clock["t"] += 900  # leaves tier 3 under FALLBACK_MIN_SECONDS
+        return direct_fetch.DirectFetchResult(kind="no_pdf", notes="slow")
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _slow_direct)
+    made: list = []
+    real = tcd_browser.make_socket_dir
+
+    def _recording(run_dir):
+        d = real(run_dir)
+        made.append(d)
+        return d
+    monkeypatch.setattr(tcd_browser, "make_socket_dir", _recording)
+    resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert resp.status_code == 429 and resp.json()["error_code"] == "cooldown"
+    assert len(made) == 1 and made[0] is not None and not made[0].exists()
+    assert "tcd_codex" not in _strategies(cfg)
+
+
+def test_no_socket_dir_for_the_claude_fallback_means_no_fallback(cfg, cli, monkeypatch, caplog):
+    _claude_ready_too(cfg)
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
+    calls = {"n": 0}
+    real = tcd_browser.make_socket_dir
+
+    def _second_fails(run_dir):
+        calls["n"] += 1
+        return real(run_dir) if calls["n"] == 1 else None
+    monkeypatch.setattr(tcd_browser, "make_socket_dir", _second_fails)
+    cseen: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([], kind="executor_died"))
+    monkeypatch.setattr(bridge_app, "run_claude", _fake_claude(cseen))
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.app"):
+        resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert resp.status_code == 502 and resp.json()["error_code"] == "executor_died"
+    assert cseen == [] and _strategies(cfg)[-1] == "tcd_codex"
+    assert any("no agent-browser socket dir for the claude fallback" in r.getMessage()
+               for r in caplog.records)
+
+
+# ------------------------------------- pass 3, fix 4: local trials as on main ---
+
+
+def test_a_local_trial_cancelled_in_chrome_recovery_ends_interrupted_as_on_main(cfg, monkeypatch, chrome_calls):
+    _ready_state(cfg)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([], kind="gave_up"))
+    entered = {"flag": False}
+
+    async def _slow_recover():
+        entered["flag"] = True
+        await asyncio.sleep(5)
+        return chrome.RecoveryResult(True, "noop")
+    monkeypatch.setattr(chrome, "recover", _slow_recover)
+    bridge = bridge_app.build_bridge(cfg)
+
+    async def main():
+        task = asyncio.ensure_future(bridge_app._trial_locked(
+            bridge, doi=DOI, title=TITLE, driver="codex", model="gpt-6.1-sol", effort=None,
+            max_budget_usd=None))
+        for _ in range(200):
+            if entered["flag"]:
+                break
+            await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(main())
+    assert [(s, o) for s, o, _ in _ledger(cfg)] == [("trial_codex", "interrupted")]
+
+
+def test_a_symlinked_fallback_root_is_refused(tmp_path, monkeypatch):
+    """The fallback root is executor-writable territory: a planted symlink is never
+    followed, so no dir is created where it points."""
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    link = tmp_path / "fb-link"
+    link.symlink_to(target)
+    monkeypatch.setattr(tcd_browser, "SOCKET_FALLBACK_ROOT", link)
+    long_run = tmp_path / ("x" * 90)  # the primary cannot fit
+    monkeypatch.setattr(tcd_browser, "SOCKET_PATH_MAX",
+                        len(os.fsencode(str(link / "abcdefgh"))) + 1 + tcd_browser.SOCKET_NAME_BUDGET)
+    assert tcd_browser.make_socket_dir(long_run) is None
+    assert list(target.iterdir()) == []

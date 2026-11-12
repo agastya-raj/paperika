@@ -478,17 +478,20 @@ request budget are unchanged.
   or, when a socket in it would pass the 107-BYTE unix path limit (measured with
   `os.fsencode`; budget: the daemon's 34-byte `tcd-<session[:16]>-<lease[:8]>.sock` + 4 bytes
   margin; trial run dirs are too long), a short `~/.cache/tcd_browser/paperika-ab/<8 hex>`.
-  If neither fits, there is no TCD run: production uses the local Chrome (reason logged), a
-  trial or selftest answers `503 tcd_unavailable`. Every trusted bridge call for that session
-  (the tab read, the release) passes the same dir. The codex `workspace-write` sandbox gains exactly one extra writable root,
+  Production creates it ONCE, in the tier-3 selection, and hands it on (a claude fallback gets
+  a fresh one, or no fallback); if creation fails for any reason the request runs local with
+  the reason logged, and a request that then never reaches an executor removes it. A trial or
+  selftest that cannot have one answers `503 tcd_unavailable` before any ledger row. A fallback
+  root that is a symlink or not a directory (it sits in executor-writable territory) is refused.
+  Every trusted bridge call for that session (the tab read, the release) passes the same dir. The codex `workspace-write` sandbox gains exactly one extra writable root,
   `~/.cache/tcd_browser` (the CLI's session files, and the short socket-dir fallback). Secret
   stripping is unchanged. Claude gets no new tool.
 - **Lease:** the bridge runs `tcd-browser ab --session <name> --close` (20 s timeout, best
   effort, logged) after every TCD-mode executor run, whatever its outcome or exception.
-  After the release, successful or not, every `*.pid` in the socket dir whose pid is alive
-  AND whose command line names agent-browser is stopped (SIGTERM, 3 s, SIGKILL, 2 s; logged);
-  a pid whose command line does not match is never signalled. The dir is removed only when no
-  such daemon is left; otherwise it stays, with a warning naming it.
+  A failed release is tried once more after 2 s. The socket dir is removed only after a
+  successful release; after two failures it is left exactly as it is (the daemon's own control
+  files survive for a later close) and one warning names the session and the path. The bridge
+  reads no file in the socket dir (the executor can write there) and signals no process.
   Cancellation: a cancelled TCD-mode executor's process group is killed and reaped (10 s)
   before the cancellation propagates, so it cannot re-open the session after the release. The
   whole close (`tcd_browser.close_session`) is shielded. When the executor already returned a

@@ -20,7 +20,6 @@ import re
 import secrets
 import shutil
 import signal
-import subprocess
 import time
 
 from .executor import ANTHROPIC_KEY_ENV, BRIDGE_TOKEN_ENV, ELSEVIER_KEY_ENV, TCD_CACHE_DIR
@@ -53,10 +52,8 @@ SOCKET_NAME_BYTES = len("tcd-") + 16 + 1 + 8 + len(".sock")
 SOCKET_NAME_BUDGET = SOCKET_NAME_BYTES + 4
 SOCKET_FALLBACK_ROOT = TCD_CACHE_DIR / "paperika-ab"
 SOCKET_DIR_ATTEMPTS = 5  # exclusive-create retries on a name collision
-# A daemon left behind by a failed close: SIGTERM, wait, then SIGKILL, wait.
-DAEMON_TERM_WAIT_SECONDS = 3.0
-DAEMON_KILL_WAIT_SECONDS = 2.0
-AGENT_BROWSER_MARK = "agent-browser"
+# A failed release is tried once more after this pause (see close_session).
+RELEASE_RETRY_DELAY_SECONDS = 2.0
 
 STATUS_CACHE_TTL_SECONDS = 60
 STATUS_TIMEOUT_SECONDS = 5
@@ -110,12 +107,6 @@ def socket_dir_fits(path: Path) -> bool:
     return len(os.fsencode(str(path))) + 1 + SOCKET_NAME_BUDGET <= SOCKET_PATH_MAX
 
 
-def socket_dir_possible(run_dir: Path) -> bool:
-    """Whether ``make_socket_dir(run_dir)`` has a candidate that fits (the primary in
-    the run dir, or the fixed-length fallback)."""
-    return socket_dir_fits(run_dir / "ab") or socket_dir_fits(SOCKET_FALLBACK_ROOT / ("0" * 8))
-
-
 def _create_private(path: Path) -> bool:
     """Create ``path`` exclusively, mode 0700. False when it already exists: a
     leftover directory (perhaps holding a daemon's files) is never reused."""
@@ -143,6 +134,14 @@ def make_socket_dir(run_dir: Path) -> Path | None:
             if socket_dir_fits(path) and _create_private(path):
                 return path
     if not socket_dir_fits(SOCKET_FALLBACK_ROOT / ("0" * 8)):
+        return None
+    # The fallback root sits inside TCD_CACHE_DIR, which the codex sandbox can write:
+    # a symlink (or a non-directory) planted there is refused, never followed.
+    if SOCKET_FALLBACK_ROOT.is_symlink() or (
+        SOCKET_FALLBACK_ROOT.exists() and not SOCKET_FALLBACK_ROOT.is_dir()
+    ):
+        logger.warning("refusing agent-browser socket dir root %s: not a plain directory",
+                       SOCKET_FALLBACK_ROOT)
         return None
     SOCKET_FALLBACK_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     for _ in range(SOCKET_DIR_ATTEMPTS):
@@ -299,98 +298,28 @@ async def session_url(
     return (urls[-1] if urls else lines[-1]), None
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    stat = Path(f"/proc/{pid}/stat")
-    if Path("/proc").is_dir():  # Linux: a zombie is dead
-        try:
-            return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
-        except (OSError, IndexError):
-            return False
-    return True
-
-
-def _cmdline(pid: int) -> str | None:
-    """The process's command line (Linux /proc, else ``ps``), or None."""
-    if Path("/proc").is_dir():
-        try:
-            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-        except OSError:
-            return None
-        return raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip() or None
-    try:
-        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                             capture_output=True, text=True, timeout=5, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return out.stdout.strip() or None
-
-
-async def _wait_dead(pid: int, seconds: float) -> bool:
-    deadline = time.monotonic() + seconds
-    while _pid_alive(pid):
-        if time.monotonic() >= deadline:
-            return False
-        await asyncio.sleep(0.1)
-    return True
-
-
-async def stop_leftover_daemons(socket_dir: Path) -> list[int]:
-    """After a release (successful or not): for every ``*.pid`` in the run's socket
-    dir whose pid is alive AND whose command line names agent-browser, SIGTERM it,
-    wait, then SIGKILL it; logged. A pid whose command line does not match is never
-    signalled (the daemon is gone and the pid was reused). Returns the pids that are
-    still alive afterwards."""
-    remaining: list[int] = []
-    for pid_file in sorted(socket_dir.glob("*.pid")):
-        try:
-            pid = int(pid_file.read_text().strip())
-        except (OSError, ValueError):
-            continue
-        if pid <= 1 or pid == os.getpid() or not _pid_alive(pid):
-            continue
-        cmd = _cmdline(pid)
-        if not cmd or AGENT_BROWSER_MARK not in cmd:
-            logger.warning("%s names pid %d, which is not an agent-browser process; not signalled",
-                           pid_file, pid)
-            continue
-        logger.warning("stopping a leftover agent-browser daemon, pid %d (%s)", pid, pid_file.name)
-        try:
-            os.kill(pid, signal.SIGTERM)
-            stopped = await _wait_dead(pid, DAEMON_TERM_WAIT_SECONDS)
-            if not stopped:
-                os.kill(pid, signal.SIGKILL)
-                stopped = await _wait_dead(pid, DAEMON_KILL_WAIT_SECONDS)
-        except ProcessLookupError:
-            stopped = True
-        except PermissionError:
-            stopped = False
-        if not stopped:
-            remaining.append(pid)
-    return remaining
-
-
 async def _close(session: str, socket_dir: Path) -> None:
-    await release(session, socket_dir)
-    remaining = await stop_leftover_daemons(socket_dir)
-    if remaining:
-        logger.warning("agent-browser pid(s) %s could not be stopped; leaving %s in place",
-                       remaining, socket_dir)
-    else:
-        remove_socket_dir(socket_dir)
+    """Release through the CLI (same socket dir, so it reaches and stops the run's
+    daemon); a failed release is tried once more after RELEASE_RETRY_DELAY_SECONDS.
+    The socket dir is removed only after a successful release. After two failures it
+    is left exactly as it is, so the daemon's own control files survive for a later
+    close. The bridge reads no file in the socket dir (the executor can write there)
+    and signals no process."""
+    for attempt in (1, 2):
+        if await release(session, socket_dir):
+            remove_socket_dir(socket_dir)
+            return
+        if attempt == 1:
+            await asyncio.sleep(RELEASE_RETRY_DELAY_SECONDS)
+    logger.warning("tcd-browser session %s was not released after two tries; leaving %s as it is",
+                   session, socket_dir)
 
 
 async def close_session(
     session: str, socket_dir: Path, *, defer_cancel: bool = False
 ) -> asyncio.CancelledError | None:
-    """After every TCD-mode run, shielded from cancellation as a whole: the release
-    (same socket dir, so it reaches and stops the run's daemon), then any daemon still
-    named by a pid file is stopped, then the socket dir is removed if none is left.
+    """After every TCD-mode run, shielded from cancellation as a whole (bounded by two
+    release timeouts and the retry pause): ``_close``.
 
     A cancellation that arrives meanwhile does not interrupt any of it. It is
     re-raised once the close is done, or, with ``defer_cancel`` (the executor already
