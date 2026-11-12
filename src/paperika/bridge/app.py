@@ -1425,11 +1425,10 @@ async def _tcd_selftest_locked(
         return _json_error(503, "tcd_unavailable",
                            "no agent-browser socket dir fits the unix socket path limit", ok=False)
     try:
-        # The bridge's own read of the tab (before the release, through the same socket
-        # dir) is the pass evidence the model cannot fake.
+        # Pass evidence beyond the model's own report: the screenshot its one chained
+        # command wrote (checked in run_tcd_selftest) and, below, the RELEASED close.
         result = await executor.run_tcd_selftest(
             run_dir, driver=driver, env=tcd_browser.session_env(session, socket_dir),
-            read_session_url=functools.partial(tcd_browser.session_url, session, socket_dir),
             sandbox_mode=state.sandbox_mode, api_key=api_key,
         )
     except BaseException:

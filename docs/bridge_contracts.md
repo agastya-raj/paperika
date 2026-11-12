@@ -462,8 +462,17 @@ request budget are unchanged.
   - no TCD-ready driver can run: the local Chrome exactly as before, the reason logged once.
 - **Prompt:** `executor.TCD_PROMPT_TEMPLATE`, static apart from `{run_dir}` like the local one
   (task data stays in `task.json`). It keeps the goal, data rule, access judgement, PDF
-  finding, per-paper budget, report and `final.png`, and swaps in the CLI mechanics: challenge
-  pages are waited out (10 s, at most three times, never clicked); the PDF href is opened
+  finding, per-paper budget, report and `final.png`, and swaps in the CLI mechanics as measured
+  on the bridge host: the executors run every shell command in its own PID namespace, so EACH
+  SHELL COMMAND STARTS ON A FRESH, BLANK TAB; only the browser's cookies and its downloads
+  folder persist. Dependent steps are chained in ONE command (`;` / `&&`); snapshot refs are
+  usable only inside the command that printed them; the method is by address (a "look"
+  command prints the URL, title and candidate PDF links as text and href; a "fetch" command
+  notes the newest `downloads` entry, opens the chosen PDF href, polls `downloads` and copies
+  the new file out); a needed click goes in one command with its open and its follow-up read;
+  the final screenshot is taken in the same command as the page it shows; every URL is
+  single-quoted in the shell. Challenge pages are waited out (10 s, at most three times,
+  never clicked); the PDF href is opened
   directly rather than fighting an overlay; a download is taken only if it appeared after the
   executor's own action, copied with `download --latest` into `{run_dir}/tcd_download`, then
   moved to `<download dir>/<sanitized-doi>.pdf` and checked for `%PDF-`. Hard rules: no login,
@@ -489,7 +498,7 @@ request budget are unchanged.
   dir, trials and selftests leave their short `~/.cache/tcd_browser/paperika-ab/<8 hex>`.
   After a normal close a dir holds two small files (`.config`, `.target`); an early exit
   leaves it empty. They may be deleted by hand when no run is active. Every trusted bridge
-  call for that session (the tab read, the release) passes the same dir. The codex `workspace-write` sandbox gains exactly one extra writable root,
+  call for that session (the release) passes the same dir. The codex `workspace-write` sandbox gains exactly one extra writable root,
   `~/.cache/tcd_browser` (the CLI's session files, and the short socket-dir fallback). Secret
   stripping is unchanged. Claude gets no new tool.
 - **Lease:** the bridge runs `tcd-browser ab --session <name> --close` (20 s timeout, best
@@ -519,15 +528,18 @@ request budget are unchanged.
   the local driver's strategy (`codex_bridge`, `claude_bridge`, `trial_codex`,
   `trial_claude`); all four join the global LLM spacing. No extra attempt is ever added.
 - **`POST /selftest/tcd`** (token, lock; `?driver=codex|claude`, default codex when armed
-  else claude): fresh status check (`503 tcd_unavailable` when down), then one executor opens
-  https://example.org through the CLI and reports, through `OUTCOME_SCHEMA` (both drivers),
-  `gave_up` with notes `TCD_TITLE=` / `TCD_URL=`. The result is recorded for the driver that
-  ran only (`tcd_<driver>_last_selftest_ok/at`). It passes only when (a) the run completed
-  normally (that `gave_up`; never timeout, `executor_died`, auth, quota or budget), (b) the
-  pair is exactly `Example Domain` and `https://example.org/` (or without the slash), and
-  (c) the bridge's own `tcd-browser ab --session <name> -- get url` (20 s, made after the run
-  and before the release) reads the expected URL: the two strings are public constants, (c)
-  is evidence a model cannot supply. The bridge releases the lease.
+  else claude): fresh status check (`503 tcd_unavailable` when down), then one executor runs
+  ONE shell command chaining `open https://example.org; get title; get url; screenshot
+  {run_dir}/selftest.png` and reports, through `OUTCOME_SCHEMA` (both drivers), `gave_up`
+  with notes `TCD_TITLE=` / `TCD_URL=`. The result is recorded for the driver that ran only
+  (`tcd_<driver>_last_selftest_ok/at`). It passes only when (a) the run completed normally
+  (that `gave_up`; never timeout, `executor_died`, auth, quota or budget), (b) the pair is
+  exactly `Example Domain` and `https://example.org/` (or without the slash), (c)
+  `{run_dir}/selftest.png` (deleted before the run so a stale one cannot count) is a regular
+  file, opened without following a link or blocking on a FIFO, written inside the run window
+  (2 s grace), of 2 KB to 10 MB, starting with the PNG signature (the bridge reads only its
+  size and first 8 bytes), and (d) the bridge's own close was `released lease`. The bridge
+  never reads the executor's tab: a new command could only see a blank one.
 - **`/healthz` `tcd` block** (authenticated tier only): `configured_mode`, `cli_present`,
   `gateway {ok, shared_up, error, probe_age_seconds}` (probed only when the configured mode is
   `tcd` and the CLI exists; null otherwise), `tcd_usable` (true when the browser answers and
