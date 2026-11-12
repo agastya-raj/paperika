@@ -849,6 +849,7 @@ def _configured_tier3_browser(config: PaperikaConfig) -> str:
 
 async def _tier3_could_run(
     bridge: Bridge, state: BridgeState, *, chrome_ok: bool, claude_ready: bool,
+    remaining: Callable[[], float],
 ) -> dict[str, bool]:
     """Per rate key: could this driver run tier 3 once its rate rule allows it? It
     must be armed (codex) / keyed (claude), and have a browser: the local Chrome, or
@@ -860,7 +861,22 @@ async def _tier3_could_run(
     for strat, driver in (("codex_bridge", "codex"), ("claude_bridge", "claude")):
         if out[strat] and not chrome_ok:
             out[strat] = tcd_mode and await _tcd_not_ready_reason(state, driver) is None
+    if not out["codex_bridge"] and _codex_rearm_possible(bridge, state, chrome_ok, remaining):
+        out["codex_bridge"] = True  # unarmed now, but the re-arm after the wait would arm it
     return out
+
+
+def _codex_rearm_possible(
+    bridge: Bridge, state: BridgeState, chrome_ok: bool, remaining: Callable[[], float],
+) -> bool:
+    """The gates ``_maybe_rearm_codex`` applies, except the rate decision (the caller
+    has it): a due re-arm, the local Chrome it drives, room for the selftest plus the
+    paper attempt, and a useful selftest wall in ``remaining``."""
+    if not (chrome_ok and _codex_rearm_due(state)):
+        return False
+    with bridge.db.transaction() as conn:
+        room = limits.pool_room_today(conn, "codex_bridge")
+    return room >= 2 and _rearm_wall_seconds(remaining()) >= CODEX_REARM_MIN_WALL_SECONDS
 
 
 async def _select_tier3_browser(
@@ -955,6 +971,14 @@ def _codex_rearm_due(state: BridgeState) -> bool:
     return True
 
 
+def _rearm_wall_seconds(remaining: float) -> float:
+    """The wall the re-arm selftest would get with ``remaining`` seconds of budget left."""
+    return min(
+        float(CODEX_REARM_WALL_SECONDS),
+        remaining - CLEANUP_RESERVE_SECONDS - FALLBACK_MIN_SECONDS - executor.KILL_GRACE_SECONDS,
+    )
+
+
 async def _maybe_rearm_codex(
     bridge: Bridge, state: BridgeState, *, deadline: float, chrome_ok: bool, codex_rate_ok: bool,
     ensure_request: Callable[[], tuple[int, Path]],
@@ -980,10 +1004,7 @@ async def _maybe_rearm_codex(
         )
         return state
     remaining = deadline - MONOTONIC()
-    wall = min(
-        float(CODEX_REARM_WALL_SECONDS),
-        remaining - CLEANUP_RESERVE_SECONDS - FALLBACK_MIN_SECONDS - executor.KILL_GRACE_SECONDS,
-    )
+    wall = _rearm_wall_seconds(remaining)
     if wall < CODEX_REARM_MIN_WALL_SECONDS:
         logger.info("codex latch re-arm skipped: request budget too short (%.0fs left)", remaining)
         return state
@@ -1683,7 +1704,10 @@ async def _download_locked(
         for strat in ("codex_bridge", "claude_bridge"):
             if strat in rate:
                 rate[strat] = limits.check_rate(conn, strat)
-    could_run = await _tier3_could_run(bridge, state, chrome_ok=chrome_ok, claude_ready=claude_ready)
+    could_run = await _tier3_could_run(
+        bridge, state, chrome_ok=chrome_ok, claude_ready=claude_ready,
+        remaining=lambda: deadline - MONOTONIC(),
+    )
     if not any(rate[s].allowed for s in could_run if could_run[s]):
         with bridge.db.transaction() as conn:
             # check_rate reports a cooldown before the daily cap: a capped driver
@@ -1695,6 +1719,9 @@ async def _download_locked(
             and rate[s].error_code == "cooldown"
             and rate[s].retry_after_seconds is not None
             and rate[s].retry_after_seconds <= TIER3_COOLDOWN_WAIT_MAX
+            # a codex that only a re-arm would arm needs the re-arm's budget AFTER the wait
+            and (s != "codex_bridge" or state.sandbox_mode or _rearm_wall_seconds(
+                deadline - MONOTONIC() - rate[s].retry_after_seconds) >= CODEX_REARM_MIN_WALL_SECONDS)
         ]
         if waits:
             wait = min(waits)

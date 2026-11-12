@@ -1358,7 +1358,9 @@ def test_rearm_skipped_when_it_cannot_help(cfg, monkeypatch, chrome_calls):
     chrome_calls["ok"] = False
     _download(client)
     chrome_calls["ok"] = True
-    # codex rate-blocked: codex could not run in this request anyway
+    # codex rate-blocked: codex could not run in this request anyway. (AGA-1702: a
+    # 151 s cooldown is now waited out, so switch the wait off to test this gate.)
+    monkeypatch.setattr(bridge_app, "TIER3_COOLDOWN_WAIT_MAX", 0)
     _clear_attempts(cfg)
     _insert_attempt(cfg, "codex_bridge", _now() - timedelta(seconds=30))
     _download(client)
@@ -2449,3 +2451,64 @@ def test_no_wait_when_nothing_could_run_with_chrome_down_and_tcd_off(cfg, cli, m
     resp = _download(TestClient(bridge_app.create_app(cfg)))
     assert slept == []
     assert resp.status_code == 503 and resp.json()["error_code"] == "chrome_down"  # today's answer
+
+
+# ------- AGA-1702: the tier-3 wait also counts a Codex whose re-arm is due -------
+
+
+def _latched_codex_cooling(cfg, *, selftest_age_days=2.0, left_seconds=100):
+    """Codex latched off after an auth failure, its last selftest `selftest_age_days`
+    ago, and its 180 s spacing with `left_seconds` to go."""
+    _write_state(cfg, sandbox_mode=None, last_selftest_ok=False,
+                 last_selftest_at=_days_ago(selftest_age_days))
+    bridge_app.build_bridge(cfg)
+    _insert_attempt(cfg, "codex_bridge", _now() - timedelta(seconds=180 - left_seconds))
+
+
+def test_wait_counts_a_codex_whose_rearm_is_due(cfg, monkeypatch):
+    _latched_codex_cooling(cfg)
+    slept = _tcd_wait_setup(cfg, monkeypatch)
+    selftests: list = []
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _fake_selftest(selftests))
+    codex: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(codex, kind="paywalled_no_access"))
+    resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert len(slept) == 1 and 99 <= slept[0] <= 102
+    assert len(selftests) == 1 and len(codex) == 1
+    assert resp.status_code != 503 and resp.json()["error_code"] == "paywalled_no_access"
+    assert [s for s, _, _ in _ledger(cfg)][-2:] == ["codex_selftest", "codex_bridge"]
+
+
+def test_no_wait_when_the_rearm_is_not_due(cfg, monkeypatch):
+    _latched_codex_cooling(cfg, selftest_age_days=2 / 24)  # selftest 2 h ago
+    slept = _tcd_wait_setup(cfg, monkeypatch)
+    resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert slept == []
+    assert resp.status_code == 503 and resp.json()["error_code"] == "selftest_required"
+
+
+def test_no_wait_when_the_pool_has_no_room_for_the_rearm(cfg, monkeypatch):
+    """The re-arm needs room for the selftest AND the paper attempt (>= 2)."""
+    monkeypatch.setitem(limits.RATE_RULES, "codex_bridge", (180, 2))
+    _latched_codex_cooling(cfg)  # one launch today: room 1
+    slept = _tcd_wait_setup(cfg, monkeypatch)
+    resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert slept == []
+    assert resp.status_code == 503 and resp.json()["error_code"] == "selftest_required"
+
+
+def test_no_wait_when_the_budget_after_the_wait_cannot_fit_the_rearm(cfg, monkeypatch):
+    """340 s left after the 100 s wait passes the wait's own 300 s check but leaves the
+    selftest under CODEX_REARM_MIN_WALL_SECONDS: the wait would be wasted."""
+    _latched_codex_cooling(cfg)
+    slept = _tcd_wait_setup(cfg, monkeypatch)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(bridge_app, "MONOTONIC", lambda: clock["t"])
+
+    async def _slow_direct(**kwargs):
+        clock["t"] += 700
+        return direct_fetch.DirectFetchResult(kind="no_pdf", notes="slow")
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _slow_direct)
+    resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert slept == []
+    assert resp.status_code == 503 and resp.json()["error_code"] == "selftest_required"
