@@ -58,6 +58,12 @@ RATE_POOLS: dict[str, str] = {
 }
 # The re-arm's ledger strategy; never a paper attempt (no PDF, no screenshot).
 CODEX_SELFTEST_STRATEGY = "codex_selftest"
+# Spacing is about PAPER attempts; selftests have never been part of it (the manual
+# ones write no row at all). A codex_selftest row therefore spends the pooled DAILY
+# CAP but is left out of every spacing computation: check_rate's pooled spacing and
+# the global LLM spacing (check_llm_spacing) used by trials. The paper attempt that
+# follows a re-arm, and later requests, are not cooled down by it.
+SPACING_EXEMPT: frozenset[str] = frozenset({CODEX_SELFTEST_STRATEGY})
 
 # AGA-1461: every LLM-driven strategy, production and trial. ``check_llm_spacing``
 # applies ONE shared clock across them so a trial and a production run never overlap
@@ -65,7 +71,8 @@ CODEX_SELFTEST_STRATEGY = "codex_selftest"
 # sees trial rows.
 LLM_STRATEGIES: tuple[str, ...] = (
     "codex_bridge", "claude_bridge", "trial_codex", "trial_claude",
-    *RATE_POOLS,  # AGA-1702: the TCD-mode twins of all four, and the codex re-arm
+    # AGA-1702: the TCD-mode twins of all four (the re-arm row is spacing-exempt).
+    *(s for s in RATE_POOLS if s not in SPACING_EXEMPT),
 )
 LLM_SPACING_SECONDS = 180
 TRIAL_STRATEGIES: tuple[str, ...] = ("trial_codex", "trial_claude")
@@ -196,7 +203,8 @@ def check_rate(
     if daily_cap is None:
         daily_cap = default_cap
 
-    starts = [most_recent_attempt_start(conn, strategy=m) for m in members]
+    starts = [most_recent_attempt_start(conn, strategy=m) for m in members
+              if m not in SPACING_EXEMPT]
     last = max((s for s in starts if s is not None), default=None)
     if last is not None:
         elapsed = (now - last).total_seconds()

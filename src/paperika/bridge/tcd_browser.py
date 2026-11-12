@@ -20,6 +20,7 @@ import re
 import secrets
 import shutil
 import signal
+import subprocess
 import time
 
 from .executor import ANTHROPIC_KEY_ENV, BRIDGE_TOKEN_ENV, ELSEVIER_KEY_ENV, TCD_CACHE_DIR
@@ -42,13 +43,20 @@ SESSION_ENV = "TCD_BROWSER_SESSION"
 # (codex's -C workspace), or, when that path would be too long for a unix socket,
 # under SOCKET_FALLBACK_ROOT inside TCD_CACHE_DIR (the one root TCD mode adds).
 SOCKET_DIR_ENV = "AGENT_BROWSER_SOCKET_DIR"
-# Linux sun_path holds 108 bytes including the terminating NUL.
+# Linux sun_path holds 108 BYTES including the terminating NUL.
 SOCKET_PATH_MAX = 107
-# The CLI names a session's agent-browser session "tcd-<session[:16]>-<lease id[:8]>"
-# (at most 29 characters); its socket is "<that>.sock". Plus 8 bytes of margin for
-# agent-browser's own naming.
-SOCKET_NAME_BUDGET = len("tcd-") + 16 + 1 + 8 + len(".sock") + 8
+# Measured on the bridge host: with AGENT_BROWSER_SOCKET_DIR set, the daemon writes
+# "tcd-<session[:16]>-<lease id[:8]>" + .config/.pid/.sock/.stream/.target/.version
+# there; the socket name is 34 bytes (the CLI keeps session names ASCII). Plus a
+# small margin.
+SOCKET_NAME_BYTES = len("tcd-") + 16 + 1 + 8 + len(".sock")
+SOCKET_NAME_BUDGET = SOCKET_NAME_BYTES + 4
 SOCKET_FALLBACK_ROOT = TCD_CACHE_DIR / "paperika-ab"
+SOCKET_DIR_ATTEMPTS = 5  # exclusive-create retries on a name collision
+# A daemon left behind by a failed close: SIGTERM, wait, then SIGKILL, wait.
+DAEMON_TERM_WAIT_SECONDS = 3.0
+DAEMON_KILL_WAIT_SECONDS = 2.0
+AGENT_BROWSER_MARK = "agent-browser"
 
 STATUS_CACHE_TTL_SECONDS = 60
 STATUS_TIMEOUT_SECONDS = 5
@@ -98,22 +106,50 @@ def parse_status(text: str) -> tuple[bool, bool]:
 
 
 def socket_dir_fits(path: Path) -> bool:
-    """Whether a daemon socket inside ``path`` stays within SOCKET_PATH_MAX."""
-    return len(str(path)) + 1 + SOCKET_NAME_BUDGET <= SOCKET_PATH_MAX
+    """Whether a daemon socket inside ``path`` stays within SOCKET_PATH_MAX BYTES."""
+    return len(os.fsencode(str(path))) + 1 + SOCKET_NAME_BUDGET <= SOCKET_PATH_MAX
 
 
-def make_socket_dir(run_dir: Path) -> Path:
-    """Create the run's private (0700) agent-browser socket dir: ``<run_dir>/ab`` when a
-    socket in it fits the unix path limit, else a fresh short dir under
-    SOCKET_FALLBACK_ROOT. ``close_session`` removes it after the release."""
-    path = run_dir / "ab"
-    if not socket_dir_fits(path):
-        path = SOCKET_FALLBACK_ROOT / secrets.token_hex(4)
-        if not socket_dir_fits(path):
-            logger.warning("agent-browser socket dir %s may exceed the unix socket path limit", path)
-    path.mkdir(parents=True, exist_ok=True)
+def socket_dir_possible(run_dir: Path) -> bool:
+    """Whether ``make_socket_dir(run_dir)`` has a candidate that fits (the primary in
+    the run dir, or the fixed-length fallback)."""
+    return socket_dir_fits(run_dir / "ab") or socket_dir_fits(SOCKET_FALLBACK_ROOT / ("0" * 8))
+
+
+def _create_private(path: Path) -> bool:
+    """Create ``path`` exclusively, mode 0700. False when it already exists: a
+    leftover directory (perhaps holding a daemon's files) is never reused."""
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        return False
     os.chmod(path, 0o700)
-    return path
+    return True
+
+
+def make_socket_dir(run_dir: Path) -> Path | None:
+    """Create the run's private (0700) agent-browser socket dir, exclusively:
+    ``<run_dir>/ab`` (or ``ab-<4 hex>`` on a collision) when a socket in it fits the
+    unix path limit, else a fresh ``SOCKET_FALLBACK_ROOT/<8 hex>``. None when no
+    candidate fits or every attempt collided: TCD mode cannot run. ``close_session``
+    removes it once no daemon is left in it."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    primary = run_dir / "ab"
+    if socket_dir_fits(primary):
+        if _create_private(primary):
+            return primary
+        for _ in range(SOCKET_DIR_ATTEMPTS - 1):
+            path = run_dir / f"ab-{secrets.token_hex(2)}"
+            if socket_dir_fits(path) and _create_private(path):
+                return path
+    if not socket_dir_fits(SOCKET_FALLBACK_ROOT / ("0" * 8)):
+        return None
+    SOCKET_FALLBACK_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for _ in range(SOCKET_DIR_ATTEMPTS):
+        path = SOCKET_FALLBACK_ROOT / secrets.token_hex(4)
+        if _create_private(path):
+            return path
+    return None
 
 
 def remove_socket_dir(path: Path) -> None:
@@ -236,22 +272,6 @@ async def release(session: str, socket_dir: Path | None = None) -> bool:
     return False
 
 
-async def release_shielded(session: str, socket_dir: Path | None = None) -> bool:
-    """``release`` shielded from cancellation: the close always runs to its end
-    (bounded by RELEASE_TIMEOUT_SECONDS) even when the request task is cancelled
-    meanwhile; that cancellation is re-raised once the close is done."""
-    task = asyncio.ensure_future(release(session, socket_dir))
-    cancelled: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as exc:
-            cancelled = exc
-    if cancelled is not None:
-        raise cancelled
-    return task.result()
-
-
 async def session_url(
     session: str, socket_dir: Path | None = None
 ) -> tuple[str | None, str | None]:
@@ -279,11 +299,111 @@ async def session_url(
     return (urls[-1] if urls else lines[-1]), None
 
 
-async def close_session(session: str, socket_dir: Path) -> None:
-    """After every TCD-mode run: the shielded release (same socket dir, so it reaches
-    and stops the run's daemon), then the run's socket dir is removed, even when the
-    release re-raises a cancellation."""
+def _pid_alive(pid: int) -> bool:
     try:
-        await release_shielded(session, socket_dir)
-    finally:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    stat = Path(f"/proc/{pid}/stat")
+    if Path("/proc").is_dir():  # Linux: a zombie is dead
+        try:
+            return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+        except (OSError, IndexError):
+            return False
+    return True
+
+
+def _cmdline(pid: int) -> str | None:
+    """The process's command line (Linux /proc, else ``ps``), or None."""
+    if Path("/proc").is_dir():
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return None
+        return raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip() or None
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
+async def _wait_dead(pid: int, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while _pid_alive(pid):
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.1)
+    return True
+
+
+async def stop_leftover_daemons(socket_dir: Path) -> list[int]:
+    """After a release (successful or not): for every ``*.pid`` in the run's socket
+    dir whose pid is alive AND whose command line names agent-browser, SIGTERM it,
+    wait, then SIGKILL it; logged. A pid whose command line does not match is never
+    signalled (the daemon is gone and the pid was reused). Returns the pids that are
+    still alive afterwards."""
+    remaining: list[int] = []
+    for pid_file in sorted(socket_dir.glob("*.pid")):
+        try:
+            pid = int(pid_file.read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if pid <= 1 or pid == os.getpid() or not _pid_alive(pid):
+            continue
+        cmd = _cmdline(pid)
+        if not cmd or AGENT_BROWSER_MARK not in cmd:
+            logger.warning("%s names pid %d, which is not an agent-browser process; not signalled",
+                           pid_file, pid)
+            continue
+        logger.warning("stopping a leftover agent-browser daemon, pid %d (%s)", pid, pid_file.name)
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped = await _wait_dead(pid, DAEMON_TERM_WAIT_SECONDS)
+            if not stopped:
+                os.kill(pid, signal.SIGKILL)
+                stopped = await _wait_dead(pid, DAEMON_KILL_WAIT_SECONDS)
+        except ProcessLookupError:
+            stopped = True
+        except PermissionError:
+            stopped = False
+        if not stopped:
+            remaining.append(pid)
+    return remaining
+
+
+async def _close(session: str, socket_dir: Path) -> None:
+    await release(session, socket_dir)
+    remaining = await stop_leftover_daemons(socket_dir)
+    if remaining:
+        logger.warning("agent-browser pid(s) %s could not be stopped; leaving %s in place",
+                       remaining, socket_dir)
+    else:
         remove_socket_dir(socket_dir)
+
+
+async def close_session(
+    session: str, socket_dir: Path, *, defer_cancel: bool = False
+) -> asyncio.CancelledError | None:
+    """After every TCD-mode run, shielded from cancellation as a whole: the release
+    (same socket dir, so it reaches and stops the run's daemon), then any daemon still
+    named by a pid file is stopped, then the socket dir is removed if none is left.
+
+    A cancellation that arrives meanwhile does not interrupt any of it. It is
+    re-raised once the close is done, or, with ``defer_cancel`` (the executor already
+    returned a result), RETURNED so the caller can persist that result first and
+    re-raise it afterwards."""
+    task = asyncio.ensure_future(_close(session, socket_dir))
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    task.result()
+    if cancelled is not None and not defer_cancel:
+        raise cancelled
+    return cancelled

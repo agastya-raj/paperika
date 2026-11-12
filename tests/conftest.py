@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import shutil
+import tempfile
+
 import pytest
 
 from paperika.bridge import tcd_browser
@@ -19,7 +23,12 @@ def _no_real_tcd_browser_cli(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_socket_dirs_in_the_real_home(tmp_path, monkeypatch):
+def _no_socket_dirs_in_the_real_home(monkeypatch):
     """AGA-1702: the short agent-browser socket-dir fallback lives under the real
-    ~/.cache/tcd_browser in production; tests keep it in their own tmp dir."""
-    monkeypatch.setattr(tcd_browser, "SOCKET_FALLBACK_ROOT", tmp_path / "ab-fallback")
+    ~/.cache/tcd_browser in production. Tests use their own private dir, as SHORT as
+    the production one (pytest's tmp_path is often too long for a unix socket), and
+    remove it afterwards."""
+    root = Path(tempfile.mkdtemp(prefix="pab", dir="/tmp"))
+    monkeypatch.setattr(tcd_browser, "SOCKET_FALLBACK_ROOT", root / "ab")
+    yield
+    shutil.rmtree(root, ignore_errors=True)

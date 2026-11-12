@@ -1380,16 +1380,17 @@ def test_a_cancelled_tcd_attempt_is_killed_before_its_lease_is_released(cfg, cli
     assert not _alive(pid)
 
 
-def test_a_cancellation_during_release_does_not_abort_the_close(cli, monkeypatch):
+def test_a_cancellation_during_release_does_not_abort_the_close(cli, tmp_path, monkeypatch):
     monkeypatch.setenv("STUB_TCD_CLOSE_SLEEP", "1")
+    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
 
     async def main(fn):
-        task = asyncio.ensure_future(fn("paperika-5-codex"))
+        task = asyncio.ensure_future(fn("paperika-5-codex", socket_dir))
         await asyncio.sleep(0.4)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-    asyncio.run(main(tcd_browser.release_shielded))
+    asyncio.run(main(tcd_browser.close_session))
     assert [c["argv"] for c in cli()] == [["ab", "--session", "paperika-5-codex", "--close"],
                                           ["close-finished"]]
     # control: the unshielded call is interrupted (its CLI process is killed on cancel)
@@ -1409,13 +1410,13 @@ def test_a_cancelled_bridge_cli_call_is_killed(cli, tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("site", ["download", "trial", "selftest"])
-def test_every_tcd_site_uses_the_shielded_release_and_kill_on_cancel(cfg, cli, monkeypatch, site):
+def test_every_tcd_site_uses_the_shielded_close_and_kill_on_cancel(cfg, cli, monkeypatch, site):
     released: list = []
 
     async def _record(session, socket_dir=None):
         released.append(session)
         return True
-    monkeypatch.setattr(tcd_browser, "release_shielded", _record)
+    monkeypatch.setattr(tcd_browser, "release", _record)  # called only from the shielded close
     seen: list = []
     if site == "download":
         _ready_state(_tcd_cfg(cfg))
@@ -1627,3 +1628,263 @@ def test_the_socket_dir_is_removed_even_when_the_release_is_cancelled(cli, tmp_p
     asyncio.run(main())
     assert [c["argv"] for c in cli()][-1] == ["close-finished"]
     assert not socket_dir.exists()
+
+
+# ------------------------- pass 2, fix 1: a known outcome survives a late cancel ---
+
+
+async def _cancel_during_close(coro, cli) -> None:
+    """Start ``coro``; cancel it once the stub CLI shows the close has begun; it must
+    end cancelled."""
+    task = asyncio.ensure_future(coro)
+    for _ in range(200):
+        if any(c["argv"][-1:] == ["--close"] for c in cli()):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("the close never started")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_production_auth_error_is_persisted_before_a_cancel_during_the_close(cfg, cli, monkeypatch):
+    _ready_state(_tcd_cfg(cfg))
+    monkeypatch.setenv("STUB_TCD_CLOSE_SLEEP", "1")
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([], kind="auth_error"))
+    bridge = bridge_app.build_bridge(cfg)
+    start_url = f"https://doi.org/{DOI}"
+    rid = bridge.db.create_request(raw_input=DOI, inferred_title=TITLE, inferred_doi=DOI,
+                                   inferred_url=start_url, paper_id=None)
+    run_dir = cfg.db_path.parent / "codex_runs" / str(rid)
+    run_dir.mkdir(parents=True)
+    attempt = bridge_app._run_executor_attempt(
+        bridge, driver="codex", request_id=rid, run_dir=run_dir, doi=DOI, title=TITLE,
+        start_url=start_url, sandbox_mode="workspace-write", defer_failure=False,
+        deadline=bridge_app.MONOTONIC() + 1000, tcd=True,
+    )
+    asyncio.run(_cancel_during_close(attempt, cli))
+    assert [c["argv"] for c in cli()][-1] == ["close-finished"]  # the close was not cut short
+    assert _ledger(cfg) == [("tcd_codex", "auth_error", rid)]  # resolved, not left running
+    state = _read_state(cfg)
+    assert state["sandbox_mode"] is None and state["last_selftest_ok"] is False  # latch cleared
+
+
+def test_a_failed_tcd_selftest_is_recorded_before_a_cancel_during_the_close(cfg, cli, monkeypatch):
+    _write_state(cfg, sandbox_mode="workspace-write", tcd_codex_last_selftest_ok=True,
+                 tcd_codex_last_selftest_at=_now().isoformat())
+    monkeypatch.setenv("STUB_TCD_CLOSE_SLEEP", "1")
+    monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex([], text="TCD_TITLE=nope"))
+    bridge = bridge_app.build_bridge(cfg)
+    run = bridge_app._tcd_selftest_locked(
+        bridge, driver="codex", state=bridge.state_store.load(), api_key=None)
+    asyncio.run(_cancel_during_close(run, cli))
+    # the previous fresh pass is gone: the failure was persisted first
+    assert _read_state(cfg)["tcd_codex_last_selftest_ok"] is False
+
+
+def test_a_trial_outcome_is_recorded_before_a_cancel_during_the_close(cfg, cli, monkeypatch):
+    _ready_state(cfg)
+    monkeypatch.setenv("STUB_TCD_CLOSE_SLEEP", "1")
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([], kind="auth_error"))
+    bridge = bridge_app.build_bridge(cfg)
+    trial = bridge_app._trial_locked(
+        bridge, doi=DOI, title=TITLE, driver="codex", model="gpt-6.1-sol", effort=None,
+        max_budget_usd=None, browser="tcd")
+    asyncio.run(_cancel_during_close(trial, cli))
+    assert [(s, o) for s, o, _ in _ledger(cfg)] == [("trial_tcd_codex", "auth_error")]  # not 'interrupted'
+    assert _read_state(cfg)["sandbox_mode"] is None
+
+
+def test_an_interrupted_executor_still_ends_interrupted(cfg, cli, tmp_path, monkeypatch):
+    """No result: the trial row is closed 'interrupted' as before."""
+    _ready_state(cfg)
+    pidfile = _install_sleepers(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge_app, "run_codex", _REAL_RUN_CODEX)
+    bridge = bridge_app.build_bridge(cfg)
+    trial = bridge_app._trial_locked(
+        bridge, doi=DOI, title=TITLE, driver="codex", model="gpt-6.1-sol", effort=None,
+        max_budget_usd=None, browser="tcd")
+    asyncio.run(_cancel_once_started(trial, pidfile))
+    assert [(s, o) for s, o, _ in _ledger(cfg)] == [("trial_tcd_codex", "interrupted")]
+    assert len(_releases(cli())) == 1
+
+
+# ------------------------ pass 2, fix 2: a failed close never orphans a daemon ---
+
+_STUB_DAEMON = r"""
+import time
+time.sleep(60)
+"""
+
+
+def _spawn_stand_in(tmp_path: Path, name: str):
+    """A harmless sleeper whose command line carries ``name``; reaped in a thread so a
+    signalled one disappears instead of lingering as our zombie."""
+    import subprocess
+    import sys
+    import threading
+    script = tmp_path / "bin" / name
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(_STUB_DAEMON)
+    proc = subprocess.Popen([sys.executable, str(script)], start_new_session=True)
+    threading.Thread(target=proc.wait, daemon=True).start()
+    return proc
+
+
+def test_a_failed_release_with_a_live_daemon_stops_it_and_removes_the_dir(cli, tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("STUB_TCD_RC", "1")  # the release fails
+    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
+    daemon = _spawn_stand_in(tmp_path, "agent-browser-linux-x64")
+    try:
+        (socket_dir / "tcd-paperika-9-cod-abcdef12.pid").write_text(str(daemon.pid))
+        (socket_dir / "tcd-paperika-9-cod-abcdef12.sock").write_text("")
+        with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
+            assert asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir)) is None
+        assert not _alive(daemon.pid)
+        assert not socket_dir.exists()
+        assert any("stopping a leftover agent-browser daemon" in r.getMessage() for r in caplog.records)
+    finally:
+        if _alive(daemon.pid):
+            daemon.kill()
+
+
+def test_a_pid_file_naming_an_unrelated_process_is_never_signalled(cli, tmp_path, monkeypatch):
+    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
+    other = _spawn_stand_in(tmp_path, "plain-sleeper")
+    try:
+        (socket_dir / "tcd-paperika-9-cod-abcdef12.pid").write_text(str(other.pid))
+        asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir))
+        assert _alive(other.pid)  # not ours: untouched
+        assert not socket_dir.exists()  # and no agent-browser daemon is left in it
+    finally:
+        other.kill()
+
+
+def test_a_daemon_that_cannot_be_stopped_keeps_its_dir(cli, tmp_path, monkeypatch, caplog):
+    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
+    daemon = _spawn_stand_in(tmp_path, "agent-browser-linux-x64")
+
+    async def _never(pid, seconds):
+        return False
+    monkeypatch.setattr(tcd_browser, "_wait_dead", _never)
+    try:
+        (socket_dir / "tcd-x.pid").write_text(str(daemon.pid))
+        with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
+            asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir))
+        assert socket_dir.exists()
+        assert any("could not be stopped" in r.getMessage() and str(socket_dir) in r.getMessage()
+                   for r in caplog.records)
+    finally:
+        daemon.kill()
+
+
+# ---------------------- pass 2, fix 3: the selftest row is outside the spacing ---
+
+
+def test_a_selftest_row_spends_the_cap_but_starts_no_cooldown(cfg, conn):
+    room = limits.pool_room_today(conn, "codex_bridge")
+    _insert_attempt(cfg, "codex_selftest", _now() - timedelta(seconds=1))
+    assert limits.pool_room_today(conn, "codex_bridge") == room - 1  # the day's count rises
+    assert limits.check_rate(conn, "codex_bridge").allowed  # no cooldown for the paper attempt
+    assert limits.check_rate(conn, "tcd_codex").allowed
+    assert limits.check_llm_spacing(conn).allowed  # nor for a trial
+    assert "codex_selftest" not in limits.LLM_STRATEGIES
+
+
+def test_selftest_rows_still_reach_the_daily_cap(cfg, conn):
+    cap = limits.RATE_RULES["codex_bridge"][1]
+    started = _now() - timedelta(seconds=limits.RATE_RULES["codex_bridge"][0] + 5)
+    if started.date() != _now().date():
+        pytest.skip("too close to UTC midnight")
+    for _ in range(cap - 1):
+        _insert_attempt(cfg, "codex_bridge", started)
+    _insert_attempt(cfg, "codex_selftest", _now())
+    assert limits.check_rate(conn, "codex_bridge").error_code == "daily_cap"
+
+
+def test_a_later_request_is_not_cooled_down_by_a_rearm_row(cfg, monkeypatch):
+    _seed_sandbox = dict(sandbox_mode="workspace-write", last_selftest_ok=True,
+                         last_selftest_at=_now().isoformat())
+    _write_state(cfg, **_seed_sandbox)
+    bridge_app.build_bridge(cfg)
+    _insert_attempt(cfg, "codex_selftest", _now() - timedelta(seconds=5))
+    codex: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(codex))
+    _download(TestClient(bridge_app.create_app(cfg)))
+    assert len(codex) == 1 and _strategies(cfg)[-1] == "codex_bridge"
+
+
+# ---------------- pass 2, fix 4: byte-measured, exclusive, or no TCD run at all ---
+
+
+def test_the_socket_budget_is_measured_in_bytes():
+    ascii_dir = Path("/" + "a" * 59)
+    multibyte = Path("/" + "é" * 30 + "a" * 29)  # 60 characters, 90 bytes
+    assert len(str(multibyte)) == len(str(ascii_dir))
+    assert tcd_browser.socket_dir_fits(ascii_dir) is True
+    assert tcd_browser.socket_dir_fits(multibyte) is False
+    assert tcd_browser.SOCKET_NAME_BYTES == 34
+
+
+def test_a_preexisting_socket_dir_is_never_reused(tmp_path, monkeypatch):
+    names = iter(["aaaaaaaa", "bbbbbbbb", "cc11", "dd22"])
+    monkeypatch.setattr(tcd_browser.secrets, "token_hex", lambda n: next(names))
+    # primary collision: run_dir/ab exists, a new primary name is picked (a short base:
+    # pytest's tmp_path can be too long for the primary to fit)
+    import shutil
+    import tempfile
+    base = Path(tempfile.mkdtemp(prefix="pr", dir="/tmp"))
+    try:
+        run = tcd_browser.make_socket_dir(base / "r")
+        assert run == base / "r" / "ab"
+        again = tcd_browser.make_socket_dir(base / "r")
+        assert again.parent == base / "r" and again.name.startswith("ab-") and again != run
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    # fallback collision: a leftover <8 hex> dir is skipped, never reused
+    long_run = tmp_path / ("x" * 90)
+    leftover = tcd_browser.SOCKET_FALLBACK_ROOT / "aaaaaaaa"
+    leftover.mkdir(parents=True)
+    (leftover / "old.pid").write_text("1")
+    names = iter(["aaaaaaaa", "bbbbbbbb"])
+    made = tcd_browser.make_socket_dir(long_run)
+    assert made == tcd_browser.SOCKET_FALLBACK_ROOT / "bbbbbbbb"
+    assert (leftover / "old.pid").exists() and (made.stat().st_mode & 0o777) == 0o700
+
+
+def test_no_socket_dir_fits_means_no_socket_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(tcd_browser, "SOCKET_PATH_MAX", 20)
+    assert tcd_browser.make_socket_dir(tmp_path / "r") is None
+    assert tcd_browser.socket_dir_possible(tmp_path / "r") is False
+
+
+def test_no_fit_production_runs_local_with_the_reason(cfg, cli, monkeypatch, caplog):
+    _ready_state(_tcd_cfg(cfg))
+    monkeypatch.setattr(tcd_browser, "SOCKET_PATH_MAX", 20)
+    codex: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(codex))
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.app"):
+        _download(TestClient(bridge_app.create_app(cfg)))
+    assert _strategies(cfg)[-1] == "codex_bridge" and "tcd" not in codex[0]
+    logged = [r.getMessage() for r in caplog.records if "tier 3 browser" in r.getMessage()]
+    assert len(logged) == 1 and "no agent-browser socket dir fits" in logged[0]
+
+
+def test_no_fit_trial_is_refused_without_a_row(cfg, cli, monkeypatch):
+    _ready_state(cfg)
+    monkeypatch.setattr(tcd_browser, "SOCKET_PATH_MAX", 20)
+    resp = _trial(TestClient(bridge_app.create_app(cfg)))
+    assert resp.status_code == 503 and resp.json()["error_code"] == "tcd_unavailable"
+    assert "socket dir" in resp.json()["detail"] and _strategies(cfg) == []
+
+
+def test_no_fit_selftest_is_refused_without_a_run(cfg, cli, monkeypatch):
+    _write_state(cfg, sandbox_mode="workspace-write")
+    monkeypatch.setattr(tcd_browser, "SOCKET_PATH_MAX", 20)
+    seen: list = []
+    monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex(seen, text=_tcd_report()))
+    resp = _selftest(cfg)
+    assert resp.status_code == 503 and resp.json()["error_code"] == "tcd_unavailable"
+    assert seen == [] and _releases(cli()) == []
+    assert "tcd_codex_last_selftest_ok" not in _read_state(cfg)

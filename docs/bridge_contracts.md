@@ -474,19 +474,28 @@ request budget are unchanged.
   `paperika-trial<attempt id>-<driver>`) and `AGENT_BROWSER_SOCKET_DIR=<socket dir>`. The CLI's
   `ab` drives an agent-browser daemon whose unix socket otherwise lands in `~/.agent-browser`,
   which the codex sandbox cannot write; the bridge creates a private (0700) socket dir per run,
-  `<run_dir>/ab`, or, when a socket in it would pass the 107-byte unix path limit (budget: the
-  CLI's agent-browser session name, at most 29 characters, + `.sock` + 8 bytes margin; trial
-  run dirs are too long), a short `~/.cache/tcd_browser/paperika-ab/<8 hex>`. Every trusted
-  bridge call for that session (the tab read, the release) passes the same dir; it is removed
-  after the release. The codex `workspace-write` sandbox gains exactly one extra writable root,
+  exclusively (an existing dir is never reused; a collision picks a new name), `<run_dir>/ab`,
+  or, when a socket in it would pass the 107-BYTE unix path limit (measured with
+  `os.fsencode`; budget: the daemon's 34-byte `tcd-<session[:16]>-<lease[:8]>.sock` + 4 bytes
+  margin; trial run dirs are too long), a short `~/.cache/tcd_browser/paperika-ab/<8 hex>`.
+  If neither fits, there is no TCD run: production uses the local Chrome (reason logged), a
+  trial or selftest answers `503 tcd_unavailable`. Every trusted bridge call for that session
+  (the tab read, the release) passes the same dir. The codex `workspace-write` sandbox gains exactly one extra writable root,
   `~/.cache/tcd_browser` (the CLI's session files, and the short socket-dir fallback). Secret
   stripping is unchanged. Claude gets no new tool.
 - **Lease:** the bridge runs `tcd-browser ab --session <name> --close` (20 s timeout, best
   effort, logged) after every TCD-mode executor run, whatever its outcome or exception.
+  After the release, successful or not, every `*.pid` in the socket dir whose pid is alive
+  AND whose command line names agent-browser is stopped (SIGTERM, 3 s, SIGKILL, 2 s; logged);
+  a pid whose command line does not match is never signalled. The dir is removed only when no
+  such daemon is left; otherwise it stays, with a warning naming it.
   Cancellation: a cancelled TCD-mode executor's process group is killed and reaped (10 s)
-  before the cancellation propagates, so it cannot re-open the session after the release; the
-  release itself is shielded (`tcd_browser.release_shielded`), finishes, then re-raises. The
-  bridge's own CLI calls are killed on cancellation too. Local-mode cancellation is unchanged.
+  before the cancellation propagates, so it cannot re-open the session after the release. The
+  whole close (`tcd_browser.close_session`) is shielded. When the executor already returned a
+  result, a cancellation that arrives during the close is held until that result is persisted
+  (the attempt row, the latch, the driver's selftest fields), then re-raised; when the executor
+  itself was cancelled, the close finishes and the cancellation is re-raised. The bridge's own
+  CLI calls are killed on cancellation too. Local-mode cancellation is unchanged.
 - **Local Chrome:** a TCD-mode tier 3 does not require it and is never followed by the local
   Chrome recovery; the pre-flight and tier 2 keep their Chrome rules.
 - **Recording and limits:** attempts are `tcd_codex` / `tcd_claude` (trials `trial_tcd_codex`
@@ -526,7 +535,9 @@ the local Chrome is up, the bridge runs the selftest's `workspace-write` variant
 when tier 3 would be left under `FALLBACK_MIN_SECONDS`). It never runs the bypass variant and
 never persists `bypass`: a host that needs bypass still needs the manual `POST
 /selftest/codex`, which is unchanged. The launch is a ledger row on the current request,
-strategy `codex_selftest`, pooled with `codex_bridge` (same daily cap and spacing), resolved
+strategy `codex_selftest`, pooled with `codex_bridge`: it spends the same DAILY CAP but is
+left out of every spacing computation (`check_rate`'s pooled spacing and the global LLM
+spacing; spacing is about paper attempts, `limits.SPACING_EXEMPT`), resolved
 `selftest_ok` / `selftest_failed` (`interrupted` on a cancel); it never carries a screenshot,
 is never wall evidence, and the startup sweep closes it without salvaging through it.
 `codex_rearm_attempted_at` is written before it runs. A pass sets `sandbox_mode=workspace-write`
