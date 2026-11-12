@@ -89,6 +89,9 @@ DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.IGNORECASE)
 # DOIs a publisher stamps into every PDF that never identify the article itself, e.g.
 # Optica's open-access licence link (https://doi.org/10.1364/OA_License_v1).
 NON_ARTICLE_DOI_PATTERN = re.compile(r"10\.1364/oa_license", re.IGNORECASE)
+URI_STRING_OPEN = re.compile(r"/URI\s*\(")
+SQUASHED_TITLE_MIN_CHARS = 25
+PAGE_HEAD_CHARS = 1000
 # Old-style Optica journal DOIs: 10.1364/<journal>.<volume>.<first page>.
 OPTICA_VOLUME_PAGE_DOI = re.compile(r"^10\.1364/([a-z]+)\.(\d+)\.(\d+)$", re.IGNORECASE)
 # Running-head journal names per Optica DOI journal code, as lowercase words with
@@ -761,6 +764,26 @@ class Downloader:
         first = DOI_PATTERN.search(text)
         return bool(first and NON_ARTICLE_DOI_PATTERN.match(first.group(0).lower()))
 
+    def _pdf_leads_with_hyperlink_doi(self, pdf_path: Path) -> bool:
+        """True when the first DOI in the PDF bytes lies inside a link action string
+        (/URI (...)) and is not a licence DOI: a hyperlink, typically a reference-list
+        entry, is not the paper's own identity (see _extract_pdf_identity)."""
+        try:
+            text = pdf_path.read_bytes()[:262144].decode("latin-1", errors="ignore")
+        except Exception:
+            return False
+        first = DOI_PATTERN.search(text)
+        if not first or NON_ARTICLE_DOI_PATTERN.match(first.group(0).lower()):
+            return False
+        return self._doi_inside_link_string(text, first.start())
+
+    @staticmethod
+    def _doi_inside_link_string(text: str, position: int) -> bool:
+        opens = list(URI_STRING_OPEN.finditer(text, 0, position))
+        if not opens:
+            return False
+        return ")" not in text[opens[-1].end() : position]
+
     def _optica_running_head_corroborates(self, doi: str, text: str) -> bool:
         """Old-style Optica DOIs encode journal, volume and first page (10.1364/oe.20.001798
         is Opt. Express 20, 1798), and those papers often print no DOI, only a running
@@ -840,7 +863,14 @@ class Downloader:
         normalized_observed = normalize_title(observed_text) or ""
         if not normalized_requested or not normalized_observed:
             return False
-        return normalized_requested in normalized_observed
+        if normalized_requested in normalized_observed:
+            return True
+        # A hyphen lost at a line break ("highspeed") or other spacing damage: compare with
+        # every non-alphanumeric character removed, for titles long enough to be distinctive.
+        squashed_requested = "".join(ch for ch in normalized_requested if ch.isalnum())
+        if len(squashed_requested) < SQUASHED_TITLE_MIN_CHARS:
+            return False
+        return squashed_requested in "".join(ch for ch in normalized_observed if ch.isalnum())
 
     def _title_match_strength(self, requested_title: str | None, observed_title: str | None) -> int:
         requested_tokens = self._distinctive_title_tokens(requested_title)
@@ -892,10 +922,13 @@ class Downloader:
         # Only the FIRST DOI in the bytes counts. When it is a licence DOI the PDF
         # exposes no article DOI: a later DOI in the bytes may be a reference link
         # (possibly to the very paper requested), so it is never promoted.
+        # The same holds for a DOI inside a link action string (a reference hyperlink).
         doi_match = DOI_PATTERN.search(text)
         if doi_match:
             candidate_doi = doi_match.group(0).lower().rstrip(".,;)]")
-            if not NON_ARTICLE_DOI_PATTERN.match(candidate_doi):
+            if not NON_ARTICLE_DOI_PATTERN.match(candidate_doi) and not self._doi_inside_link_string(
+                text, doi_match.start()
+            ):
                 observed_doi = candidate_doi
         return observed_title, observed_doi
 
@@ -917,6 +950,22 @@ class Downloader:
             return pdf_path.read_bytes()[:max_chars].decode("latin-1", errors="ignore")
         except Exception:
             return ""
+
+    def _extract_pdf_head(self, pdf_path: Path, max_chars: int = PAGE_HEAD_CHARS) -> str:
+        """The first max_chars characters of page 1 only ("" when pdftotext is unavailable)."""
+        if not shutil.which("pdftotext"):
+            return ""
+        try:
+            result = subprocess.run(
+                ["pdftotext", "-f", "1", "-l", "1", str(pdf_path), "-"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except Exception:
+            return ""
+        return (result.stdout or "")[:max_chars]
 
     def _verify_downloaded_pdf_identity(self, parsed: ParsedInput, pdf_path: Path) -> PdfIdentityCheck:
         observed_title, observed_doi = self._extract_pdf_identity(pdf_path)
@@ -942,6 +991,25 @@ class Downloader:
                     f"expected DOI {parsed.doi} but observed {normalized_observed_doi}",
                     observed_title,
                     normalized_observed_doi,
+                )
+            if self._pdf_leads_with_hyperlink_doi(pdf_path):
+                # The leading DOI is a hyperlink, not the paper's own. A citing paper's
+                # reference list carries the requested title too, so only the head of page 1
+                # (where the paper's own title sits) can vouch for it.
+                if parsed.title and self._text_contains_normalized_title(
+                    parsed.title, self._extract_pdf_head(pdf_path)
+                ):
+                    return PdfIdentityCheck(
+                        True,
+                        "Matched requested title at the head of page 1; the PDF's leading DOI is a hyperlink, not its own",
+                        observed_title or parsed.title,
+                        None,
+                    )
+                return PdfIdentityCheck(
+                    False,
+                    "the PDF's leading DOI is a hyperlink, not its own, and the requested title is not at the head of page 1",
+                    observed_title,
+                    None,
                 )
             if parsed.title and self._text_contains_normalized_title(parsed.title, extracted_text):
                 if self._pdf_leads_with_licence_doi(
