@@ -847,6 +847,22 @@ def _configured_tier3_browser(config: PaperikaConfig) -> str:
     return (config.tier3_browser or "").strip().lower()
 
 
+async def _tier3_could_run(
+    bridge: Bridge, state: BridgeState, *, chrome_ok: bool, claude_ready: bool,
+) -> dict[str, bool]:
+    """Per rate key: could this driver run tier 3 once its rate rule allows it? It
+    must be armed (codex) / keyed (claude), and have a browser: the local Chrome, or
+    (tier3_browser = tcd) its own TCD readiness. Read-only: no socket dir, request row
+    or lease (``_tcd_not_ready_reason`` is the same rule ``_select_tier3_browser``
+    applies, over the cached status probe)."""
+    tcd_mode = _configured_tier3_browser(bridge.config) == "tcd"
+    out = {"codex_bridge": bool(state.sandbox_mode), "claude_bridge": claude_ready}
+    for strat, driver in (("codex_bridge", "codex"), ("claude_bridge", "claude")):
+        if out[strat] and not chrome_ok:
+            out[strat] = tcd_mode and await _tcd_not_ready_reason(state, driver) is None
+    return out
+
+
 async def _select_tier3_browser(
     bridge: Bridge, state: BridgeState, *, codex_can: bool, claude_can: bool,
     ensure_request: Callable[[], tuple[int, Path]],
@@ -1667,11 +1683,15 @@ async def _download_locked(
         for strat in ("codex_bridge", "claude_bridge"):
             if strat in rate:
                 rate[strat] = limits.check_rate(conn, strat)
-    usable = {"codex_bridge": bool(state.sandbox_mode), "claude_bridge": claude_ready}
-    if not any(usable[s] and rate[s].allowed for s in rate if s in usable):
+    could_run = await _tier3_could_run(bridge, state, chrome_ok=chrome_ok, claude_ready=claude_ready)
+    if not any(rate[s].allowed for s in could_run if could_run[s]):
+        with bridge.db.transaction() as conn:
+            # check_rate reports a cooldown before the daily cap: a capped driver
+            # must not be the one the wait is spent on.
+            capped = {s for s in could_run if limits.pool_at_daily_cap(conn, s)}
         waits = [
-            rate[s].retry_after_seconds for s in rate
-            if usable.get(s)
+            rate[s].retry_after_seconds for s in could_run
+            if could_run[s] and s not in capped
             and rate[s].error_code == "cooldown"
             and rate[s].retry_after_seconds is not None
             and rate[s].retry_after_seconds <= TIER3_COOLDOWN_WAIT_MAX

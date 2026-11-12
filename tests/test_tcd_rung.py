@@ -2404,3 +2404,48 @@ def test_tcd_tier3_waits_out_a_short_cooldown_and_the_row_is_tcd_codex(cfg, cli,
     assert len(slept) == 1 and 98 <= slept[0] <= 102
     assert resp.status_code != 429 and resp.json()["error_code"] == "paywalled_no_access"
     assert len(seen) == 1 and _strategies(cfg)[-1] == "tcd_codex"
+
+
+def _tcd_wait_setup(cfg, monkeypatch):
+    slept: list[float] = []
+
+    async def _sleep(seconds):
+        slept.append(seconds)
+        con = _conn(cfg)
+        for row in con.execute("SELECT id, started_at FROM paper_attempts").fetchall():
+            new = limits.iso(datetime.fromisoformat(row["started_at"]) - timedelta(seconds=seconds + 1))
+            con.execute("UPDATE paper_attempts SET started_at=?, created_at=? WHERE id=?",
+                        (new, new, row["id"]))
+        con.commit()
+        con.close()
+
+    monkeypatch.setattr(bridge_app, "SLEEP", _sleep)
+    return slept
+
+
+def test_tcd_wait_skips_a_driver_that_cannot_use_the_browser(cfg, cli, monkeypatch, chrome_calls):
+    """Chrome down, TCD mode: codex TCD-ready with ~100 s left; claude keyed but with no
+    TCD selftest and 10 s left. The wait is codex's ~100 s (claude could not run)."""
+    _ready_state(_tcd_cfg(cfg))
+    chrome_calls["ok"] = False
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
+    bridge_app.build_bridge(cfg)
+    _insert_attempt(cfg, "tcd_codex", _now() - timedelta(seconds=80))
+    _insert_attempt(cfg, "claude_bridge", _now() - timedelta(seconds=170))
+    slept = _tcd_wait_setup(cfg, monkeypatch)
+    seen: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(seen, kind="paywalled_no_access"))
+    resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert len(slept) == 1 and 99 <= slept[0] <= 102
+    assert resp.status_code != 429 and len(seen) == 1 and _strategies(cfg)[-1] == "tcd_codex"
+
+
+def test_no_wait_when_nothing_could_run_with_chrome_down_and_tcd_off(cfg, cli, monkeypatch, chrome_calls):
+    _ready_state(cfg)  # local mode
+    chrome_calls["ok"] = False
+    bridge_app.build_bridge(cfg)
+    _insert_attempt(cfg, "codex_bridge", _now() - timedelta(seconds=80))
+    slept = _tcd_wait_setup(cfg, monkeypatch)
+    resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert slept == []
+    assert resp.status_code == 503 and resp.json()["error_code"] == "chrome_down"  # today's answer

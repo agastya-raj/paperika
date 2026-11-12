@@ -1684,6 +1684,45 @@ def test_tier3_ignores_the_cooldown_of_an_unusable_driver(cfg, monkeypatch):
     assert (codex["n"], claude["n"]) == (0, 1)
 
 
+def test_tier3_does_not_spend_the_wait_on_a_capped_driver(cfg, monkeypatch):
+    """codex is at its daily cap with a 10 s cooldown; claude has capacity and ~100 s
+    left. check_rate reports codex's cooldown first, but waiting for codex would end
+    in daily_cap: the wait is claude's ~100 s and claude runs."""
+    slept, codex, claude = _tier3_setup(cfg, monkeypatch)
+    bridge_app.build_bridge(cfg)
+    monkeypatch.setitem(limits.RATE_RULES, "codex_bridge", (180, 2))
+    _seed_driver(cfg, "codex_bridge", 170)
+    _seed_driver(cfg, "codex_bridge", 175)
+    _seed_driver(cfg, "claude_bridge", 80)
+    resp = _post_t3(cfg, "capA")
+    assert len(slept) == 1 and 99 <= slept[0] <= 102
+    assert (codex["n"], claude["n"]) == (0, 1)
+    assert resp.status_code != 429 and [s for s, _ in _strategies(cfg)][-1] == "claude_bridge"
+
+
+def test_tier3_capped_claude_does_not_spend_the_wait_either(cfg, monkeypatch):
+    slept, codex, claude = _tier3_setup(cfg, monkeypatch)
+    bridge_app.build_bridge(cfg)
+    monkeypatch.setitem(limits.RATE_RULES, "claude_bridge", (180, 1))
+    _seed_driver(cfg, "claude_bridge", 170)
+    _seed_driver(cfg, "codex_bridge", 80)
+    _post_t3(cfg, "capB")
+    assert len(slept) == 1 and 99 <= slept[0] <= 102
+    assert (codex["n"], claude["n"]) == (1, 0)
+
+
+def test_tier3_both_capped_with_cooldowns_never_waits(cfg, monkeypatch):
+    slept, codex, claude = _tier3_setup(cfg, monkeypatch)
+    bridge_app.build_bridge(cfg)
+    monkeypatch.setitem(limits.RATE_RULES, "codex_bridge", (180, 1))
+    monkeypatch.setitem(limits.RATE_RULES, "claude_bridge", (180, 1))
+    _seed_driver(cfg, "codex_bridge", 170)
+    _seed_driver(cfg, "claude_bridge", 80)
+    resp = _post_t3(cfg, "capC")
+    assert slept == [] and (codex["n"], claude["n"]) == (0, 0)
+    assert resp.status_code == 429 and resp.json()["error_code"] == "cooldown"  # today's answer
+
+
 def test_walled_tiers_with_both_drivers_cooling_get_a_tier3_attempt(cfg, monkeypatch):
     """Request 184's shape: both deterministic tiers walled, both drivers in cooldown.
     After the wait a tier-3 attempt row exists; the answer is not bot_wall_unclassified."""

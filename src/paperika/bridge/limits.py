@@ -233,6 +233,14 @@ def pool_room_today(
     return cap - sum(attempts_today(conn, m, now=now) for m in pool_members(strategy))
 
 
+def pool_at_daily_cap(
+    conn: sqlite3.Connection, strategy: str, *, now: datetime | None = None
+) -> bool:
+    """True when ``strategy``'s pooled daily cap is used up. ``check_rate`` reports a
+    cooldown before it looks at the cap, so it cannot answer this on its own."""
+    return pool_room_today(conn, strategy, now=now) <= 0
+
+
 def check_llm_spacing(
     conn: sqlite3.Connection, *, now: datetime | None = None,
     min_spacing_seconds: int = LLM_SPACING_SECONDS,
