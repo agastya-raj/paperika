@@ -2279,9 +2279,12 @@ def _policy_flags(run_dir: Path, *, start_url: str | None = None) -> list[str]:
     for path in files:
         rel = path.relative_to(run_dir)
         if start_url is not None and rel == Path(executor.START_URL_FILE):
+            expected = start_url.encode("utf-8")
             try:
-                if path.read_bytes() == start_url.encode("utf-8"):
-                    continue
+                # Bounded: the executor can replace this file with one of any size.
+                with path.open("rb") as handle:
+                    if handle.read(len(expected) + 1) == expected:
+                        continue
             except OSError:
                 pass
         if (

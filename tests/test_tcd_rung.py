@@ -2312,6 +2312,39 @@ def test_the_start_address_file_raises_no_policy_flag_in_a_tcd_trial_only(
     flags = bridge_app._policy_flags(tmp_path, start_url=address)
     assert "document.cookie@start_url.txt" in flags and "captcha@start_url.txt" in flags
 
+    # the comparison is bounded: a file the executor grew is never read whole for it
+    big = address.encode() + b"x" * (bridge_app._POLICY_SCAN_MAX_BYTES + 1)
+    (tmp_path / executor.START_URL_FILE).write_bytes(big)
+    reads: list[int] = []
+    real_open = Path.open
+
+    class _Spy:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def read(self, n=-1):
+            reads.append(n)
+            return self._handle.read(n)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._handle.close()
+
+    def _spying_open(self, mode="r", *a, **kw):
+        handle = real_open(self, mode, *a, **kw)
+        if mode == "rb" and self == tmp_path / executor.START_URL_FILE:
+            return _Spy(handle)
+        return handle
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", _spying_open)
+        patch.setattr(Path, "read_bytes", lambda self: pytest.fail("unbounded read"))
+        flags = bridge_app._policy_flags(tmp_path, start_url=address)
+    assert reads == [len(address.encode()) + 1]
+    assert not any(f.endswith("@start_url.txt") for f in flags)  # over the scan's own size cap
+
     _ready_state(cfg)
 
     async def _tcd_fake(run_dir, prompt, sandbox_mode, **kw):
