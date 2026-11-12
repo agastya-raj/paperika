@@ -16,3 +16,10 @@ def _no_real_tcd_browser_cli(tmp_path, monkeypatch):
     tcd_browser.reset_status_cache()
     yield
     tcd_browser.reset_status_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_socket_dirs_in_the_real_home(tmp_path, monkeypatch):
+    """AGA-1702: the short agent-browser socket-dir fallback lives under the real
+    ~/.cache/tcd_browser in production; tests keep it in their own tmp dir."""
+    monkeypatch.setattr(tcd_browser, "SOCKET_FALLBACK_ROOT", tmp_path / "ab-fallback")

@@ -183,9 +183,12 @@ class BridgeState(BaseModel):
     claude_last_selftest_at: str | None = None
     # AGA-1462: latched on a 401 from the Elsevier API, cleared on the next 200.
     elsevier_key_invalid: bool = False
-    # AGA-1702: POST /selftest/tcd result (tier-3 TCD mode needs a fresh pass).
-    tcd_last_selftest_ok: bool | None = None
-    tcd_last_selftest_at: str | None = None
+    # AGA-1702: POST /selftest/tcd results PER DRIVER: a driver runs tier 3 in TCD
+    # mode only while its own result is a fresh pass.
+    tcd_codex_last_selftest_ok: bool | None = None
+    tcd_codex_last_selftest_at: str | None = None
+    tcd_claude_last_selftest_ok: bool | None = None
+    tcd_claude_last_selftest_at: str | None = None
     # AGA-1702: when /download last ran the codex selftest itself to re-arm a
     # latched-off or stale codex (at most once per CODEX_REARM_INTERVAL).
     codex_rearm_attempted_at: str | None = None
@@ -791,29 +794,31 @@ def _claude_ready(state: BridgeState) -> bool:
 # --- AGA-1702: the TCD browser as tier 3's browser ------------------------
 
 TIER3_BROWSERS = ("local", "tcd")
+TCD_DRIVERS = ("codex", "claude")
 
 
-def _tcd_selftest_fresh(state: BridgeState) -> bool:
-    """A TCD selftest passed within the same window codex's freshness uses."""
-    if not state.tcd_last_selftest_ok:
-        return False
-    last_at = _parse_iso(state.tcd_last_selftest_at)
-    if last_at is None:
-        return False
-    return timedelta(0) <= _utc_now() - last_at <= timedelta(days=SELFTEST_MAX_AGE_DAYS)
+def _tcd_driver_reason(state: BridgeState, driver: str) -> str | None:
+    """None when ``driver``'s OWN TCD selftest passed within the window codex's
+    freshness uses, else why not. A driver runs tier 3 in TCD mode only on its own
+    pass: a claude pass never puts codex in TCD mode, nor the reverse."""
+    ok = getattr(state, f"tcd_{driver}_last_selftest_ok")
+    if ok is None:
+        return "no TCD selftest has run (POST /selftest/tcd)"
+    if ok is False:
+        return "the last TCD selftest failed"
+    last_at = _parse_iso(getattr(state, f"tcd_{driver}_last_selftest_at"))
+    if last_at is None or not (
+        timedelta(0) <= _utc_now() - last_at <= timedelta(days=SELFTEST_MAX_AGE_DAYS)
+    ):
+        return f"the TCD selftest is older than {SELFTEST_MAX_AGE_DAYS} days"
+    return None
 
 
-async def _tcd_not_ready_reason(state: BridgeState) -> str | None:
-    """None when the TCD browser is ready for tier 3, else why it is not. Cheap
-    checks first; the status probe is cached (tcd_browser.STATUS_CACHE_TTL_SECONDS)."""
+async def _tcd_browser_reason() -> str | None:
+    """None when the CLI exists and the cached status probe reports the gateway ok
+    and the shared browser up, else why not."""
     if not tcd_browser.cli_present():
         return "tcd-browser CLI not found"
-    if state.tcd_last_selftest_ok is None:
-        return "no TCD selftest has run (POST /selftest/tcd)"
-    if state.tcd_last_selftest_ok is False:
-        return "the last TCD selftest failed"
-    if not _tcd_selftest_fresh(state):
-        return f"the TCD selftest is older than {SELFTEST_MAX_AGE_DAYS} days"
     status = await tcd_browser.probe_status()
     if status.error:
         return f"status probe: {status.error}"
@@ -824,27 +829,71 @@ async def _tcd_not_ready_reason(state: BridgeState) -> str | None:
     return None
 
 
+async def _tcd_not_ready_reason(state: BridgeState, driver: str) -> str | None:
+    """Readiness of ONE driver in TCD mode (trials): CLI, its own fresh selftest, then
+    the cached status probe."""
+    if not tcd_browser.cli_present():
+        return "tcd-browser CLI not found"
+    reason = _tcd_driver_reason(state, driver)
+    if reason is not None:
+        return f"{driver}: {reason}"
+    return await _tcd_browser_reason()
+
+
 def _configured_tier3_browser(config: PaperikaConfig) -> str:
     return (config.tier3_browser or "").strip().lower()
 
 
-async def _select_tier3_browser(bridge: Bridge, state: BridgeState) -> bool:
-    """Whether THIS request's tier 3 runs in TCD mode. Called once per request at the
-    tier-3 gate; a configured-but-not-ready TCD falls back to the local Chrome with
-    the reason logged once."""
+async def _select_tier3_browser(
+    bridge: Bridge, state: BridgeState, *, codex_can: bool, claude_can: bool,
+) -> tuple[bool, bool, bool]:
+    """THIS request's tier-3 browser, decided once at the tier-3 gate. Returns
+    ``(tcd, codex_tcd, claude_tcd)``: whether tier 3 runs in TCD mode, and which
+    drivers are TCD-ready (own fresh TCD selftest AND the browser answering), reported
+    even when tier 3 falls back to local so the caller does not blame a local Chrome
+    a TCD-ready driver would not need. ``codex_can`` / ``claude_can``: the driver
+    could run this request at all (armed / key, rate rule).
+
+    TCD mode is used when a TCD-ready driver can run: codex first when it is TCD-ready
+    and can run, with claude as its fallback only if claude is TCD-ready too; else
+    claude alone in TCD mode. A request never mixes a TCD run with a local one.
+    Otherwise the local Chrome, exactly as before, with the reason logged once."""
+    local = (False, False, False)
     mode = _configured_tier3_browser(bridge.config)
     if mode == "local":
-        return False
+        return local
     if mode != "tcd":
         logger.warning("tier 3 browser: unknown tier3_browser %r; using the local Chrome", mode)
-        return False
-    reason = await _tcd_not_ready_reason(state)
-    if reason is not None:
+        return local
+
+    def _fallback(reason: str) -> tuple[bool, bool, bool]:
         logger.warning(
             "tier 3 browser: tcd configured but not ready (%s); using the local Chrome", reason
         )
-        return False
-    return True
+        return local
+
+    if not tcd_browser.cli_present():
+        return _fallback("tcd-browser CLI not found")
+    reasons = {d: _tcd_driver_reason(state, d) for d in TCD_DRIVERS}
+    if all(reasons.values()):
+        why = "; ".join(f"{d}: {reasons[d]}" for d in TCD_DRIVERS)
+        return _fallback(f"no driver is TCD-ready ({why})")
+    browser = await _tcd_browser_reason()
+    if browser is not None:
+        return _fallback(browser)
+    codex_tcd, claude_tcd = reasons["codex"] is None, reasons["claude"] is None
+    if not ((codex_tcd and codex_can) or (claude_tcd and claude_can)):
+        why = "; ".join(
+            f"{d}: {reasons[d] or 'TCD-ready but cannot run this request'}" for d in TCD_DRIVERS
+        )
+        _fallback(f"no TCD-ready driver can run ({why})")
+        return False, codex_tcd, claude_tcd
+    if codex_tcd and codex_can and claude_can and not claude_tcd:
+        logger.warning(
+            "tier 3 browser: tcd for codex; claude is not TCD-ready (%s), so no claude "
+            "fallback in this request", reasons["claude"],
+        )
+    return True, codex_tcd, claude_tcd
 
 
 # --- AGA-1702: the codex readiness latch re-arms itself ---------------------
@@ -1037,12 +1086,20 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 "error": tcd_status.error,
                 "probe_age_seconds": int(tcd_status.age_seconds() or 0),
             },
+            # True when the browser answers and at least one driver is TCD-ready.
             "tcd_usable": (
                 None if not tcd_mode
-                else bool(tcd_status and tcd_status.ok and _tcd_selftest_fresh(state))
+                else bool(tcd_status and tcd_status.ok
+                          and any(_tcd_driver_reason(state, d) is None for d in TCD_DRIVERS))
             ),
-            "last_selftest_ok": state.tcd_last_selftest_ok,
-            "last_selftest_at": state.tcd_last_selftest_at,
+            "drivers": {
+                d: {
+                    "last_selftest_ok": getattr(state, f"tcd_{d}_last_selftest_ok"),
+                    "last_selftest_at": getattr(state, f"tcd_{d}_last_selftest_at"),
+                    "selftest_fresh": _tcd_driver_reason(state, d) is None,
+                }
+                for d in TCD_DRIVERS
+            },
             "attempts_today": tcd_attempts,
             "claude_cost_usd": tcd_claude_cost,
             "trial_claude_cost_usd": tcd_trial_cost,
@@ -1188,19 +1245,23 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 return _json_error(503, "tcd_unavailable", f"tcd-browser status: {why}", ok=False)
             session = tcd_browser.session_name(f"selftest{int(time.time())}", driver)
             run_dir = bridge.config.db_path.parent / "codex_runs" / "selftest_tcd"
+            socket_dir = tcd_browser.make_socket_dir(run_dir)
             try:
-                # The bridge's own read of the tab (before the release) is the pass
-                # evidence the model cannot fake.
+                # The bridge's own read of the tab (before the release, through the same
+                # socket dir) is the pass evidence the model cannot fake.
                 result = await executor.run_tcd_selftest(
-                    run_dir, driver=driver, env={tcd_browser.SESSION_ENV: session},
-                    read_session_url=functools.partial(tcd_browser.session_url, session),
+                    run_dir, driver=driver, env=tcd_browser.session_env(session, socket_dir),
+                    read_session_url=functools.partial(
+                        tcd_browser.session_url, session, socket_dir),
                     sandbox_mode=state.sandbox_mode, api_key=api_key,
                 )
             finally:
-                await tcd_browser.release_shielded(session)
-            bridge.state_store.update(
-                tcd_last_selftest_ok=result.ok, tcd_last_selftest_at=_utc_now().isoformat()
-            )
+                await tcd_browser.close_session(session, socket_dir)
+            # Only the driver that ran: its pass never makes the other TCD-ready.
+            bridge.state_store.update(**{
+                f"tcd_{driver}_last_selftest_ok": result.ok,
+                f"tcd_{driver}_last_selftest_at": _utc_now().isoformat(),
+            })
             if result.ok:
                 return JSONResponse(
                     status_code=200,
@@ -1568,10 +1629,20 @@ async def _download_locked(
         bridge, state, deadline=deadline, chrome_ok=chrome_ok,
         codex_rate_ok=rate["codex_bridge"].allowed, ensure_request=ensure_request,
     )
-    tcd = await _select_tier3_browser(bridge, state)
+    codex_can = rate["codex_bridge"].allowed and bool(state.sandbox_mode)
+    claude_can = claude_ready and rate["claude_bridge"].allowed
+    tcd, codex_tcd, claude_tcd = await _select_tier3_browser(
+        bridge, state, codex_can=codex_can, claude_can=claude_can,
+    )
     browser_ok = tcd or chrome_ok
-    codex_ready = rate["codex_bridge"].allowed and bool(state.sandbox_mode) and browser_ok
-    claude_go = claude_ready and rate["claude_bridge"].allowed and browser_ok
+    if tcd:
+        # Per-driver readiness: only a TCD-ready driver runs, and never a local one
+        # beside it (no claude fallback when only codex is TCD-ready).
+        codex_ready = codex_can and codex_tcd
+        claude_go = claude_can and claude_tcd
+    else:
+        codex_ready = codex_can and chrome_ok
+        claude_go = claude_can and chrome_ok
     codex_wall = float(executor.EXEC_WALL_SECONDS)
     if codex_ready or claude_go:
         # AGA-1462: the deadline caps codex's wall exactly like claude's. Too little
@@ -1614,7 +1685,7 @@ async def _download_locked(
         return finalize_if_created(
             _json_error(503, "selftest_required", "run POST /selftest/codex first")
         )
-    if not browser_ok:
+    if not (browser_ok or codex_tcd):  # a TCD-ready codex never needed the local Chrome
         return finalize_if_created(_json_error(503, "chrome_down", "Chrome CDP unreachable"))
     # codex sandbox + chrome are fine but its strategy is rate-blocked.
     decision = rate["codex_bridge"]
@@ -1767,7 +1838,8 @@ async def _run_executor_attempt(
     if tcd:
         prompt = executor.render_tcd_prompt(run_dir)
         session = tcd_browser.session_name(str(request_id), driver)
-        tcd_kw: dict[str, Any] = {"env": {tcd_browser.SESSION_ENV: session}, "tcd": True}
+        socket_dir = tcd_browser.make_socket_dir(run_dir)
+        tcd_kw: dict[str, Any] = {"env": tcd_browser.session_env(session, socket_dir), "tcd": True}
     else:
         prompt = executor.PROMPT_TEMPLATE.format(run_dir=str(run_dir))
         tcd_kw = {}
@@ -1790,7 +1862,7 @@ async def _run_executor_attempt(
             # Success, failure, timeout, kill, exception or cancellation: the lease goes
             # back. A cancelled TCD run's process group is already dead (run_* kill on
             # cancel), and the close itself is shielded from the cancellation.
-            await tcd_browser.release_shielded(session)
+            await tcd_browser.close_session(session, socket_dir)
     screenshot = str(run_dir / "final.png") if (run_dir / "final.png").exists() else None
     if exec_result.cost_usd is not None:
         with bridge.db.transaction() as conn:
@@ -2187,7 +2259,7 @@ async def _trial_locked(
         if not _claude_ready(state) or not api_key:
             return _json_error(503, "claude_auth", "claude driver is not available")
     if tcd:
-        reason = await _tcd_not_ready_reason(state)
+        reason = await _tcd_not_ready_reason(state, driver)
         if reason is not None:
             return _json_error(503, "tcd_unavailable", f"the TCD browser is not ready: {reason}")
 
@@ -2224,7 +2296,10 @@ async def _trial_locked(
         if tcd:
             prompt = executor.render_tcd_prompt(run_dir, download_dir=trial_dl)
             session = tcd_browser.session_name(f"trial{attempt_id}", driver)
-            tcd_kw: dict[str, Any] = {"env": {tcd_browser.SESSION_ENV: session}, "tcd": True}
+            socket_dir = tcd_browser.make_socket_dir(run_dir)
+            tcd_kw: dict[str, Any] = {
+                "env": tcd_browser.session_env(session, socket_dir), "tcd": True,
+            }
         else:
             prompt = executor.render_prompt(run_dir, download_dir=trial_dl)
             tcd_kw = {}
@@ -2243,7 +2318,7 @@ async def _trial_locked(
             ended = _utc_now()
         finally:
             if tcd:
-                await tcd_browser.release_shielded(session)
+                await tcd_browser.close_session(session, socket_dir)
         exec_result.notes = _redact_all(exec_result.notes)
         final_url = _redact_all(exec_result.final_url) or None
         kind = exec_result.kind

@@ -450,10 +450,16 @@ local managed Chrome. Elsevier, tiers 1-2, the identity gate, the outcome taxono
 request budget are unchanged.
 
 - **Setting:** `PAPERIKA_TIER3_BROWSER` = `local` (default) | `tcd` (`PaperikaConfig.tier3_browser`).
-  `tcd` is used only while it is **ready**: the CLI exists, a cached `tcd-browser status`
-  (60 s cache, 5 s timeout) reports `gateway … ok=True` and `browser shared=up`, and
-  `POST /selftest/tcd` passed within `SELFTEST_MAX_AGE_DAYS` (14). Otherwise the request
-  uses the local Chrome and logs the reason once.
+  Readiness is **per driver**: a driver is TCD-ready when the CLI exists, a cached
+  `tcd-browser status` (60 s cache, 5 s timeout) reports `gateway … ok=True` and
+  `browser shared=up`, and that driver's OWN `POST /selftest/tcd` passed within
+  `SELFTEST_MAX_AGE_DAYS` (14). With the setting on `tcd`, tier 3:
+  - codex armed and TCD-ready: today's chain in TCD mode; claude takes over on the usual
+    fallback kinds only if claude is TCD-ready too, else there is no fallback in that request
+    (a request never mixes a TCD run with a local one);
+  - codex not TCD-ready (or unable to run) but claude TCD-ready and able to run: claude alone
+    in TCD mode, codex skipped;
+  - no TCD-ready driver can run: the local Chrome exactly as before, the reason logged once.
 - **Prompt:** `executor.TCD_PROMPT_TEMPLATE`, static apart from `{run_dir}` like the local one
   (task data stays in `task.json`). It keeps the goal, data rule, access judgement, PDF
   finding, per-paper budget, report and `final.png`, and swaps in the CLI mechanics: challenge
@@ -465,9 +471,16 @@ request budget are unchanged.
   subcommand besides `ab`, `downloads`, `download --latest`; never the key file or cookies;
   never other tabs; never close the session.
 - **Spawn:** env `TCD_BROWSER_SESSION=paperika-<request id>-<driver>` (trials
-  `paperika-trial<attempt id>-<driver>`). The codex `workspace-write` sandbox gains exactly one
-  extra writable root, `~/.cache/tcd_browser` (the CLI's session files). Secret stripping is
-  unchanged. Claude gets no new tool.
+  `paperika-trial<attempt id>-<driver>`) and `AGENT_BROWSER_SOCKET_DIR=<socket dir>`. The CLI's
+  `ab` drives an agent-browser daemon whose unix socket otherwise lands in `~/.agent-browser`,
+  which the codex sandbox cannot write; the bridge creates a private (0700) socket dir per run,
+  `<run_dir>/ab`, or, when a socket in it would pass the 107-byte unix path limit (budget: the
+  CLI's agent-browser session name, at most 29 characters, + `.sock` + 8 bytes margin; trial
+  run dirs are too long), a short `~/.cache/tcd_browser/paperika-ab/<8 hex>`. Every trusted
+  bridge call for that session (the tab read, the release) passes the same dir; it is removed
+  after the release. The codex `workspace-write` sandbox gains exactly one extra writable root,
+  `~/.cache/tcd_browser` (the CLI's session files, and the short socket-dir fallback). Secret
+  stripping is unchanged. Claude gets no new tool.
 - **Lease:** the bridge runs `tcd-browser ab --session <name> --close` (20 s timeout, best
   effort, logged) after every TCD-mode executor run, whatever its outcome or exception.
   Cancellation: a cancelled TCD-mode executor's process group is killed and reaped (10 s)
@@ -483,20 +496,23 @@ request budget are unchanged.
 - **`POST /selftest/tcd`** (token, lock; `?driver=codex|claude`, default codex when armed
   else claude): fresh status check (`503 tcd_unavailable` when down), then one executor opens
   https://example.org through the CLI and reports, through `OUTCOME_SCHEMA` (both drivers),
-  `gave_up` with notes `TCD_TITLE=` / `TCD_URL=`. It passes only when (a) the run completed
+  `gave_up` with notes `TCD_TITLE=` / `TCD_URL=`. The result is recorded for the driver that
+  ran only (`tcd_<driver>_last_selftest_ok/at`). It passes only when (a) the run completed
   normally (that `gave_up`; never timeout, `executor_died`, auth, quota or budget), (b) the
   pair is exactly `Example Domain` and `https://example.org/` (or without the slash), and
   (c) the bridge's own `tcd-browser ab --session <name> -- get url` (20 s, made after the run
   and before the release) reads the expected URL: the two strings are public constants, (c)
-  is evidence a model cannot supply. Persists `tcd_last_selftest_ok/at`; the bridge releases
-  the lease.
+  is evidence a model cannot supply. The bridge releases the lease.
 - **`/healthz` `tcd` block** (authenticated tier only): `configured_mode`, `cli_present`,
   `gateway {ok, shared_up, error, probe_age_seconds}` (probed only when the configured mode is
-  `tcd` and the CLI exists; null otherwise), `tcd_usable` (null in local mode),
-  `last_selftest_ok/at`, `attempts_today` per TCD strategy, `claude_cost_usd` and
+  `tcd` and the CLI exists; null otherwise), `tcd_usable` (true when the browser answers and
+  at least one driver is TCD-ready; null in local mode), `drivers.{codex,claude}`
+  `{last_selftest_ok, last_selftest_at, selftest_fresh}`, `attempts_today` per TCD strategy,
+  `claude_cost_usd` and
   `trial_claude_cost_usd` month-to-date.
 - **Trials:** `/admin/trial` takes `browser: "local"|"tcd"` (default local, `422
-  invalid_browser`); `tcd` needs the readiness above (`503 tcd_unavailable`), skips the Chrome
+  invalid_browser`); `tcd` needs that trial's own driver to be TCD-ready (`503
+  tcd_unavailable`), skips the Chrome
   pre-flight, uses the trial's private download dir, and the response carries `browser`.
 
 ### The codex latch re-arms itself (AGA-1702)

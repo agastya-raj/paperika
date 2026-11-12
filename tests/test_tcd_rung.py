@@ -41,6 +41,7 @@ entry = {
     "argv": argv,
     "session": os.environ.get("TCD_BROWSER_SESSION"),
     "token_seen": "PAPERIKA_BRIDGE_TOKEN" in os.environ,
+    "socket_dir": os.environ.get("AGENT_BROWSER_SOCKET_DIR"),
 }
 victim = os.environ.get("STUB_VICTIM_PIDFILE")
 if victim and argv[-1:] == ["--close"]:
@@ -188,10 +189,10 @@ def _read_state(cfg: PaperikaConfig) -> dict:
 
 
 def _ready_state(cfg: PaperikaConfig, **over) -> None:
-    """codex armed + fresh, and a fresh passing TCD selftest."""
+    """codex armed + fresh, and a fresh passing CODEX TCD selftest (claude not TCD-ready)."""
     now = _now().isoformat()
     fields = dict(sandbox_mode="workspace-write", last_selftest_ok=True, last_selftest_at=now,
-                  tcd_last_selftest_ok=True, tcd_last_selftest_at=now)
+                  tcd_codex_last_selftest_ok=True, tcd_codex_last_selftest_at=now)
     fields.update(over)
     _write_state(cfg, **fields)
 
@@ -308,7 +309,13 @@ def test_tcd_mode_when_ready(cfg, cli, monkeypatch, caplog):
     assert _strategies(cfg) == ["direct_fetch", "scripted_browser", "tcd_codex"]
     run_dir = cfg.db_path.parent / "codex_runs" / str(rid)
     assert seen[0]["prompt"] == executor.render_tcd_prompt(run_dir)
-    assert seen[0]["env"] == {"TCD_BROWSER_SESSION": f"paperika-{rid}-codex"}
+    socket_dir = Path(seen[0]["env"]["AGENT_BROWSER_SOCKET_DIR"])
+    assert seen[0]["env"] == {"TCD_BROWSER_SESSION": f"paperika-{rid}-codex",
+                              "AGENT_BROWSER_SOCKET_DIR": str(socket_dir)}
+    if tcd_browser.socket_dir_fits(run_dir / "ab"):
+        assert socket_dir == run_dir / "ab"
+    else:  # a long tmp path takes the short fallback, as production trials do
+        assert socket_dir.parent == tcd_browser.SOCKET_FALLBACK_ROOT
     assert seen[0]["tcd"] is True
     assert not [r for r in caplog.records if "tier 3 browser" in r.getMessage()]
 
@@ -335,13 +342,13 @@ def test_not_ready_falls_back_to_local_and_logs_the_reason_once(
     if setup == "no_cli":
         monkeypatch.setattr(tcd_browser, "TCD_BROWSER_BIN", str(cfg.db_path.parent / "absent"))
     elif setup == "never_selftested":
-        _ready_state(cfg, tcd_last_selftest_ok=None, tcd_last_selftest_at=None)
+        _ready_state(cfg, tcd_codex_last_selftest_ok=None, tcd_codex_last_selftest_at=None)
     elif setup == "selftest_failed":
-        _ready_state(cfg, tcd_last_selftest_ok=False)
+        _ready_state(cfg, tcd_codex_last_selftest_ok=False)
     elif setup == "selftest_stale":
-        _ready_state(cfg, tcd_last_selftest_at=_days_ago(15))
+        _ready_state(cfg, tcd_codex_last_selftest_at=_days_ago(15))
     elif setup == "selftest_future":
-        _ready_state(cfg, tcd_last_selftest_at=_days_ago(-2))
+        _ready_state(cfg, tcd_codex_last_selftest_at=_days_ago(-2))
     elif setup == "gateway_down":
         monkeypatch.setenv("STUB_TCD_STATUS", STATUS_OK.replace("ok=True", "ok=False"))
     elif setup == "shared_down":
@@ -541,7 +548,9 @@ def test_lease_released_when_the_executor_raises(cfg, cli, monkeypatch):
 
 
 def test_claude_fallback_in_tcd_mode_has_its_own_session_and_both_are_released(cfg, cli, monkeypatch):
-    _ready_state(_tcd_cfg(cfg))
+    """Case 1: codex armed and TCD-ready, claude TCD-ready too: today's chain, in TCD mode."""
+    _ready_state(_tcd_cfg(cfg), tcd_claude_last_selftest_ok=True,
+                 tcd_claude_last_selftest_at=_now().isoformat())
     monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
     cseen: list = []
     monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([], kind="executor_died"))
@@ -550,7 +559,7 @@ def test_claude_fallback_in_tcd_mode_has_its_own_session_and_both_are_released(c
     rid = _last_request_id(cfg)
     assert resp.json()["error_code"] == "paywalled_no_access"
     assert _strategies(cfg)[-2:] == ["tcd_codex", "tcd_claude"]
-    assert cseen[0]["env"] == {"TCD_BROWSER_SESSION": f"paperika-{rid}-claude"}
+    assert cseen[0]["env"]["TCD_BROWSER_SESSION"] == f"paperika-{rid}-claude"
     assert cseen[0]["tcd"] is True  # kill-on-cancel only; claude gets no new tool
     assert _releases(cli()) == [f"paperika-{rid}-codex", f"paperika-{rid}-claude"]
 
@@ -711,7 +720,8 @@ def test_selftest_tcd_passes_on_all_three_conditions(cfg, cli, monkeypatch):
     assert resp.status_code == 200, resp.text
     assert resp.json()["ok"] is True and resp.json()["driver"] == "codex"
     state = _read_state(cfg)
-    assert state["tcd_last_selftest_ok"] is True and state["tcd_last_selftest_at"]
+    assert state["tcd_codex_last_selftest_ok"] is True and state["tcd_codex_last_selftest_at"]
+    assert state.get("tcd_claude_last_selftest_ok") is None  # only the driver that ran
     session = seen[0]["env"]["TCD_BROWSER_SESSION"]
     assert seen[0]["prompt"] == executor.TCD_SELFTEST_PROMPT and seen[0]["tcd"] is True
     assert seen[0]["sandbox_mode"] == "workspace-write"
@@ -741,7 +751,7 @@ def test_selftest_tcd_fails_without_a_normal_run_and_the_exact_pair(cfg, cli, mo
     monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex(seen, text=text, kind=kind))
     resp = _selftest(cfg)
     assert resp.status_code == 502 and resp.json()["error_code"] == "executor_failed"
-    assert _read_state(cfg)["tcd_last_selftest_ok"] is False
+    assert _read_state(cfg)["tcd_codex_last_selftest_ok"] is False
     assert _releases(cli()) == [seen[0]["env"]["TCD_BROWSER_SESSION"]]
 
 
@@ -763,7 +773,7 @@ def test_selftest_tcd_fails_when_the_bridge_read_disagrees(cfg, cli, monkeypatch
     monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex(seen, text=_tcd_report()))
     resp = _selftest(cfg)
     assert resp.status_code == 502 and why in resp.json()["detail"]
-    assert _read_state(cfg)["tcd_last_selftest_ok"] is False
+    assert _read_state(cfg)["tcd_codex_last_selftest_ok"] is False
     session = seen[0]["env"]["TCD_BROWSER_SESSION"]
     assert _get_urls(cli()) == [session] and _releases(cli()) == [session]
 
@@ -815,7 +825,7 @@ def test_selftest_tcd_refusals_run_no_executor(cfg, cli, monkeypatch):
     monkeypatch.setattr(tcd_browser, "TCD_BROWSER_BIN", "/nonexistent/tcd-browser")
     assert client.post("/selftest/tcd", headers=_auth()).json()["error_code"] == "tcd_unavailable"
     assert seen == [] and _releases(cli()) == []
-    assert "tcd_last_selftest_ok" not in _read_state(cfg)
+    assert "tcd_codex_last_selftest_ok" not in _read_state(cfg)
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -848,7 +858,10 @@ def test_healthz_tcd_block_in_local_mode_never_probes(cfg, cli):
     tcd = body["tcd"]
     assert tcd["configured_mode"] == "local" and tcd["cli_present"] is True
     assert tcd["gateway"] is None and tcd["tcd_usable"] is None
-    assert tcd["last_selftest_ok"] is True and tcd["last_selftest_at"]
+    assert tcd["drivers"]["codex"]["last_selftest_ok"] is True and tcd["drivers"]["codex"]["last_selftest_at"]
+    assert tcd["drivers"]["codex"]["selftest_fresh"] is True
+    assert tcd["drivers"]["claude"] == {"last_selftest_ok": None, "last_selftest_at": None,
+                                        "selftest_fresh": False}
     assert tcd["attempts_today"] == {"tcd_codex": 1, "tcd_claude": 0,
                                      "trial_tcd_codex": 0, "trial_tcd_claude": 0}
     assert "tcd_codex" not in body["limits"]["attempts_today"]  # existing dict unchanged
@@ -871,14 +884,15 @@ def test_healthz_tcd_block_in_tcd_mode(cfg, cli):
 
 
 def test_healthz_tcd_block_when_unusable(cfg):
-    _ready_state(_tcd_cfg(cfg), tcd_last_selftest_ok=False)
+    _ready_state(_tcd_cfg(cfg), tcd_codex_last_selftest_ok=False)
     body = TestClient(bridge_app.create_app(cfg)).get("/healthz", headers=_auth()).json()
     assert body["tcd"]["cli_present"] is False and body["tcd"]["gateway"] is None
-    assert body["tcd"]["tcd_usable"] is False and body["tcd"]["last_selftest_ok"] is False
+    assert body["tcd"]["tcd_usable"] is False
+    assert body["tcd"]["drivers"]["codex"]["last_selftest_ok"] is False
 
 
 def test_healthz_tcd_unusable_with_a_stale_selftest(cfg, cli):
-    _ready_state(_tcd_cfg(cfg), tcd_last_selftest_at=_days_ago(15))
+    _ready_state(_tcd_cfg(cfg), tcd_codex_last_selftest_at=_days_ago(15))
     body = TestClient(bridge_app.create_app(cfg)).get("/healthz", headers=_auth()).json()
     assert body["tcd"]["gateway"]["ok"] is True and body["tcd"]["tcd_usable"] is False
 
@@ -920,13 +934,13 @@ def test_trial_in_tcd_mode(cfg, cli, monkeypatch, chrome_calls):
     assert seen[0]["prompt"] == executor.render_tcd_prompt(run_dir, download_dir=trial_dl)
     assert executor.PROD_DOWNLOAD_DIR not in seen[0]["prompt"]
     assert seen[0]["download_dir"] == trial_dl and seen[0]["tcd"] is True
-    assert seen[0]["env"] == {"TCD_BROWSER_SESSION": f"paperika-trial{att['id']}-codex"}
+    assert seen[0]["env"]["TCD_BROWSER_SESSION"] == f"paperika-trial{att['id']}-codex"
     assert _releases(cli()) == [f"paperika-trial{att['id']}-codex"]
     assert chrome_calls["recover"] == 0
 
 
 def test_trial_tcd_claude_and_local_trial_unchanged(cfg, cli, monkeypatch):
-    _ready_state(cfg)
+    _ready_state(cfg, tcd_claude_last_selftest_ok=True, tcd_claude_last_selftest_at=_now().isoformat())
     monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
     cseen: list = []
     monkeypatch.setattr(bridge_app, "run_claude", _fake_claude(cseen))
@@ -953,7 +967,7 @@ def test_trial_tcd_refusals_write_no_row(cfg, cli, monkeypatch):
     _ready_state(cfg)
     resp = _trial(client, browser="remote")
     assert resp.status_code == 422 and resp.json()["error_code"] == "invalid_browser"
-    _ready_state(cfg, tcd_last_selftest_ok=False)
+    _ready_state(cfg, tcd_codex_last_selftest_ok=False)
     resp = _trial(client)
     assert resp.status_code == 503 and resp.json()["error_code"] == "tcd_unavailable"
     assert "the last TCD selftest failed" in resp.json()["detail"]
@@ -1398,7 +1412,7 @@ def test_a_cancelled_bridge_cli_call_is_killed(cli, tmp_path, monkeypatch):
 def test_every_tcd_site_uses_the_shielded_release_and_kill_on_cancel(cfg, cli, monkeypatch, site):
     released: list = []
 
-    async def _record(session):
+    async def _record(session, socket_dir=None):
         released.append(session)
         return True
     monkeypatch.setattr(tcd_browser, "release_shielded", _record)
@@ -1418,3 +1432,198 @@ def test_every_tcd_site_uses_the_shielded_release_and_kill_on_cancel(cfg, cli, m
     assert released == [seen[0]["env"]["TCD_BROWSER_SESSION"]]
     assert seen[0]["tcd"] is True  # run_codex(tcd=True) => kill on cancel
     assert _releases(cli()) == []  # nothing released around the shield
+
+
+# ------------------------------------------ decision (a): readiness per driver ---
+
+
+def _claude_ready_too(cfg, **over) -> None:
+    _ready_state(_tcd_cfg(cfg), tcd_claude_last_selftest_ok=True,
+                 tcd_claude_last_selftest_at=_now().isoformat(), **over)
+
+
+def test_no_mixing_codex_tcd_has_no_local_claude_fallback(cfg, cli, monkeypatch, caplog):
+    """Codex TCD-ready, claude ready but NOT TCD-ready: codex runs in TCD mode and its
+    death is not followed by a local claude run."""
+    _ready_state(_tcd_cfg(cfg))
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
+    cseen: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([], kind="executor_died"))
+    monkeypatch.setattr(bridge_app, "run_claude", _fake_claude(cseen))
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.app"):
+        resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert resp.json()["error_code"] == "executor_died"
+    assert cseen == [] and _strategies(cfg)[-1] == "tcd_codex"
+    logged = [r.getMessage() for r in caplog.records if "tier 3 browser" in r.getMessage()]
+    assert len(logged) == 1 and "no claude fallback" in logged[0]
+
+
+def test_claude_tcd_ready_codex_not_runs_claude_in_tcd_directly(cfg, cli, monkeypatch):
+    """Codex armed but not TCD-ready, claude TCD-ready: codex is skipped."""
+    _ready_state(_tcd_cfg(cfg), tcd_codex_last_selftest_ok=None, tcd_codex_last_selftest_at=None,
+                 tcd_claude_last_selftest_ok=True, tcd_claude_last_selftest_at=_now().isoformat())
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
+    codex: list = []
+    cseen: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(codex))
+    monkeypatch.setattr(bridge_app, "run_claude", _fake_claude(cseen))
+    resp = _download(TestClient(bridge_app.create_app(cfg)))
+    rid = _last_request_id(cfg)
+    assert resp.json()["error_code"] == "paywalled_no_access"
+    assert codex == [] and _strategies(cfg)[-1] == "tcd_claude"
+    assert cseen[0]["env"]["TCD_BROWSER_SESSION"] == f"paperika-{rid}-claude" and cseen[0]["tcd"] is True
+    assert _releases(cli()) == [f"paperika-{rid}-claude"]
+
+
+def test_codex_tcd_ready_but_unarmed_lets_claude_run_tcd(cfg, cli, monkeypatch):
+    _claude_ready_too(cfg, sandbox_mode=None)
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
+    monkeypatch.setattr(bridge_app, "run_claude", _fake_claude([]))
+    _download(TestClient(bridge_app.create_app(cfg)))
+    assert _strategies(cfg)[-1] == "tcd_claude"
+
+
+def test_claude_tcd_ready_but_rate_blocked_falls_back_to_local(cfg, cli, monkeypatch, caplog):
+    _ready_state(_tcd_cfg(cfg), tcd_codex_last_selftest_ok=None, tcd_codex_last_selftest_at=None,
+                 tcd_claude_last_selftest_ok=True, tcd_claude_last_selftest_at=_now().isoformat())
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
+    bridge_app.build_bridge(cfg)
+    _insert_attempt(cfg, "claude_bridge", _now() - timedelta(seconds=30))
+    codex: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(codex))
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.app"):
+        _download(TestClient(bridge_app.create_app(cfg)))
+    assert _strategies(cfg)[-1] == "codex_bridge" and "env" not in codex[0]
+    logged = [r.getMessage() for r in caplog.records if "tier 3 browser" in r.getMessage()]
+    assert len(logged) == 1 and "claude: TCD-ready but cannot run this request" in logged[0]
+
+
+def test_a_claude_only_tcd_pass_never_puts_codex_in_tcd_mode(cfg, cli, monkeypatch):
+    _write_state(cfg, sandbox_mode="workspace-write", last_selftest_ok=True,
+                 last_selftest_at=_now().isoformat())
+    _tcd_cfg(cfg)
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
+
+    async def _claude(run_dir, prompt, api_key, **kw):
+        return executor.ExecResult(kind="gave_up", notes=_tcd_report())
+    monkeypatch.setattr(executor, "run_claude", _claude)
+    assert _selftest(cfg, driver="claude").status_code == 200
+    state = _read_state(cfg)
+    assert state["tcd_claude_last_selftest_ok"] is True
+    assert state.get("tcd_codex_last_selftest_ok") is None
+    # claude now unavailable to /download: codex must run LOCALLY, not in TCD mode
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: None)
+    codex: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(codex))
+    _download(TestClient(bridge_app.create_app(cfg)))
+    assert _strategies(cfg)[-1] == "codex_bridge" and "tcd" not in codex[0]
+
+
+def test_the_default_codex_selftest_updates_only_codex(cfg, cli, monkeypatch):
+    claude_at = _days_ago(1)
+    _write_state(cfg, sandbox_mode="workspace-write", tcd_claude_last_selftest_ok=True,
+                 tcd_claude_last_selftest_at=claude_at)
+    monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex([], text="wrong"))
+    assert _selftest(cfg).status_code == 502
+    state = _read_state(cfg)
+    assert state["tcd_codex_last_selftest_ok"] is False
+    assert state["tcd_claude_last_selftest_ok"] is True and state["tcd_claude_last_selftest_at"] == claude_at
+
+
+def test_healthz_tcd_usable_with_one_ready_driver(cfg, cli):
+    _ready_state(_tcd_cfg(cfg), tcd_codex_last_selftest_ok=False,
+                 tcd_claude_last_selftest_ok=True, tcd_claude_last_selftest_at=_now().isoformat())
+    tcd = TestClient(bridge_app.create_app(cfg)).get("/healthz", headers=_auth()).json()["tcd"]
+    assert tcd["tcd_usable"] is True
+    assert tcd["drivers"]["codex"]["selftest_fresh"] is False
+    assert tcd["drivers"]["claude"]["selftest_fresh"] is True
+
+
+def test_a_trial_needs_its_own_drivers_tcd_readiness(cfg, cli, monkeypatch):
+    _ready_state(cfg, tcd_codex_last_selftest_ok=None, tcd_codex_last_selftest_at=None,
+                 tcd_claude_last_selftest_ok=True, tcd_claude_last_selftest_at=_now().isoformat())
+    resp = _trial(TestClient(bridge_app.create_app(cfg)), driver="codex")
+    assert resp.status_code == 503 and resp.json()["error_code"] == "tcd_unavailable"
+    assert "codex: no TCD selftest has run" in resp.json()["detail"]
+    assert _strategies(cfg) == []
+
+
+# ---------------------------------------- decision B: the agent-browser socket dir ---
+
+
+@pytest.mark.parametrize("path,fits", [
+    ("/home/agastya/.local/state/paperika/codex_runs/123456/ab", True),     # production
+    ("/home/agastya/.local/state/paperika/codex_runs/selftest_tcd/ab", True),  # selftest
+    ("/home/agastya/.local/state/paperika/trials/20261112T154326Z_3f3eb591/ab", False),  # trial
+    ("/home/agastya/.cache/tcd_browser/paperika-ab/a1b2c3d4", True),       # the fallback
+])
+def test_socket_dir_budget(path, fits):
+    assert tcd_browser.socket_dir_fits(Path(path)) is fits
+    budget = len(path) + 1 + len("tcd-") + 16 + 1 + 8 + len(".sock")
+    assert budget <= tcd_browser.SOCKET_PATH_MAX or not fits
+
+
+def test_make_socket_dir_is_private_and_short(tmp_path, monkeypatch):
+    short = tmp_path / "r"
+    monkeypatch.setattr(tcd_browser, "SOCKET_PATH_MAX", len(str(short / "ab")) + 1 + tcd_browser.SOCKET_NAME_BUDGET)
+    d = tcd_browser.make_socket_dir(short)
+    assert d == short / "ab" and (d.stat().st_mode & 0o777) == 0o700
+    long_dir = tmp_path / ("x" * 40)
+    monkeypatch.setattr(tcd_browser, "SOCKET_FALLBACK_ROOT", tmp_path / "fb")
+    monkeypatch.setattr(tcd_browser, "SOCKET_PATH_MAX", len(str(tmp_path / "fb" / "abcdefgh")) + 1 + tcd_browser.SOCKET_NAME_BUDGET)
+    f = tcd_browser.make_socket_dir(long_dir)
+    assert f.parent == tmp_path / "fb" and len(f.name) == 8 and (f.stat().st_mode & 0o777) == 0o700
+    assert not (long_dir / "ab").exists()
+    tcd_browser.remove_socket_dir(f)
+    assert not f.exists()
+
+
+def test_the_socket_dir_reaches_the_executor_and_the_release_then_is_removed(cfg, cli, monkeypatch):
+    _ready_state(_tcd_cfg(cfg))
+    seen: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(seen))
+    _download(TestClient(bridge_app.create_app(cfg)))
+    socket_dir = seen[0]["env"]["AGENT_BROWSER_SOCKET_DIR"]
+    closes = [c for c in cli() if c["argv"][-1:] == ["--close"]]
+    assert [c["socket_dir"] for c in closes] == [socket_dir]
+    assert not Path(socket_dir).exists()
+    # the status probe is not a session call: no socket dir
+    assert all(c["socket_dir"] is None for c in cli() if c["argv"] == ["status"])
+
+
+def test_the_selftest_read_and_release_share_the_socket_dir(cfg, cli, monkeypatch):
+    _write_state(cfg, sandbox_mode="workspace-write")
+    seen: list = []
+    monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex(seen, text=_tcd_report()))
+    assert _selftest(cfg).status_code == 200
+    socket_dir = seen[0]["env"]["AGENT_BROWSER_SOCKET_DIR"]
+    session_calls = [c for c in cli() if c["argv"][:1] == ["ab"]]
+    assert [c["socket_dir"] for c in session_calls] == [socket_dir, socket_dir]  # get url, close
+    assert not Path(socket_dir).exists()
+
+
+def test_a_trial_gets_a_short_socket_dir_and_removes_it(cfg, cli, monkeypatch):
+    _ready_state(cfg)
+    seen: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(seen))
+    assert _trial(TestClient(bridge_app.create_app(cfg))).status_code == 200
+    socket_dir = Path(seen[0]["env"]["AGENT_BROWSER_SOCKET_DIR"])
+    assert tcd_browser.socket_dir_fits(socket_dir) or socket_dir.parent == tcd_browser.SOCKET_FALLBACK_ROOT
+    closes = [c for c in cli() if c["argv"][-1:] == ["--close"]]
+    assert [c["socket_dir"] for c in closes] == [str(socket_dir)]
+    assert not socket_dir.exists()
+
+
+def test_the_socket_dir_is_removed_even_when_the_release_is_cancelled(cli, tmp_path, monkeypatch):
+    monkeypatch.setenv("STUB_TCD_CLOSE_SLEEP", "1")
+    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
+
+    async def main():
+        task = asyncio.ensure_future(tcd_browser.close_session("paperika-7-codex", socket_dir))
+        await asyncio.sleep(0.4)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(main())
+    assert [c["argv"] for c in cli()][-1] == ["close-finished"]
+    assert not socket_dir.exists()
