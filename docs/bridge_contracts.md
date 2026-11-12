@@ -481,17 +481,27 @@ request budget are unchanged.
   Production creates it ONCE, in the tier-3 selection, and hands it on (a claude fallback gets
   a fresh one, or no fallback); if creation fails for any reason the request runs local with
   the reason logged, and a request that then never reaches an executor removes it. A trial or
-  selftest that cannot have one answers `503 tcd_unavailable` before any ledger row. A fallback
-  root that is a symlink or not a directory (it sits in executor-writable territory) is refused.
-  Every trusted bridge call for that session (the tab read, the release) passes the same dir. The codex `workspace-write` sandbox gains exactly one extra writable root,
+  selftest that cannot have one answers `503 tcd_unavailable` before any ledger row. The
+  allocation is a `SocketDir`: the dir is created relative to a descriptor of its parent opened
+  `O_DIRECTORY | O_NOFOLLOW` before any executor runs (a symlinked or non-directory fallback
+  root is refused), and its device and inode are recorded. Removal goes only through that kept
+  descriptor (`shutil.rmtree(name, dir_fd=...)`, symlink-attack safe; where unavailable, nothing
+  is removed and it is logged) and only if the name is still that dir; the descriptor is closed
+  on every path. One owner from creation on: a failure before the executor's own close
+  removes the still-empty dir. Every trusted bridge call for that session (the tab read, the
+  release) passes the same dir. The codex `workspace-write` sandbox gains exactly one extra writable root,
   `~/.cache/tcd_browser` (the CLI's session files, and the short socket-dir fallback). Secret
   stripping is unchanged. Claude gets no new tool.
 - **Lease:** the bridge runs `tcd-browser ab --session <name> --close` (20 s timeout, best
   effort, logged) after every TCD-mode executor run, whatever its outcome or exception.
-  A failed release is tried once more after 2 s. The socket dir is removed only after a
-  successful release; after two failures it is left exactly as it is (the daemon's own control
-  files survive for a later close) and one warning names the session and the path. The bridge
-  reads no file in the socket dir (the executor can write there) and signals no process.
+  `ab --close` always exits 0, so the close is classified by its stderr line: `released lease`
+  → remove the dir; `left to expire` (the gateway kept the lease until it idles out, ~10 min;
+  the CLI stopped the local daemon) → one warning, no retry, remove the dir; `no active
+  session` → remove the dir only if it has no entries at all (names listed through the kept
+  descriptor, no content read), else leave it and warn; anything else (non-zero exit,
+  timeout, no CLI, no such line) → one retry after 2 s, then leave the dir exactly as it is and
+  warn with the session and the path. The bridge reads no file in the socket dir and signals
+  no process. A TCD selftest records a pass only when its own close said `released lease`.
   Cancellation: a cancelled TCD-mode executor's process group is killed and reaped (10 s)
   before the cancellation propagates, so it cannot re-open the session after the release. The
   whole close (`tcd_browser.close_session`) is shielded. When the executor already returned a

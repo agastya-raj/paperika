@@ -80,6 +80,15 @@ if argv[-1:] == ["--close"]:
     if log:
         with open(log, "a") as fh:
             fh.write(json.dumps({"argv": ["close-finished"]}) + "\n")
+    # the real CLI always exits 0 and says on stderr how the close went
+    line = os.environ.get("STUB_TCD_CLOSE_LINE", "released")
+    session = argv[argv.index("--session") + 1] if "--session" in argv else "?"
+    sys.stderr.write({
+        "released": "tcd-browser: released lease L-1234abcd\n",
+        "left": "tcd-browser: lease L-1234abcd left to expire\n",
+        "none": f"tcd-browser: no active session '{session}'\n",
+        "silent": "",
+    }[line])
 sys.exit(int(os.environ.get("STUB_TCD_RC", "0")))
 """
 
@@ -575,20 +584,20 @@ def test_claude_fallback_in_tcd_mode_has_its_own_session_and_both_are_released(c
 
 
 def test_release_is_best_effort(cli, monkeypatch, caplog):
-    assert asyncio.run(tcd_browser.release("paperika-1-codex")) is True
+    assert asyncio.run(tcd_browser.release("paperika-1-codex")) == tcd_browser.RELEASED
     assert _releases(cli()) == ["paperika-1-codex"]
     closes = [c for c in cli() if c["argv"][-1:] == ["--close"]]
     assert closes[-1]["session"] is None  # --session is the only session the release names
     monkeypatch.setenv("STUB_TCD_RC", "2")
-    assert asyncio.run(tcd_browser.release("paperika-2-codex")) is False
+    assert asyncio.run(tcd_browser.release("paperika-2-codex")) == tcd_browser.UNCLASSIFIED
     monkeypatch.delenv("STUB_TCD_RC")
     monkeypatch.setattr(tcd_browser, "RELEASE_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setenv("STUB_TCD_SLEEP", "5")
     with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
-        assert asyncio.run(tcd_browser.release("paperika-3-codex")) is False
+        assert asyncio.run(tcd_browser.release("paperika-3-codex")) == tcd_browser.UNCLASSIFIED
     assert any("timed out" in r.getMessage() for r in caplog.records)
     monkeypatch.setattr(tcd_browser, "TCD_BROWSER_BIN", "/nonexistent/tcd-browser")
-    assert asyncio.run(tcd_browser.release("paperika-4-codex")) is False
+    assert asyncio.run(tcd_browser.release("paperika-4-codex")) == tcd_browser.UNCLASSIFIED
 
 
 # --------------------------------------------------- 6: the local Chrome ---
@@ -1426,7 +1435,7 @@ def test_every_tcd_site_uses_the_shielded_close_and_kill_on_cancel(cfg, cli, mon
 
     async def _record(session, socket_dir=None):
         released.append(session)
-        return True
+        return tcd_browser.RELEASED
     monkeypatch.setattr(tcd_browser, "release", _record)  # called only from the shielded close
     seen: list = []
     if site == "download":
@@ -1579,15 +1588,17 @@ def test_make_socket_dir_is_private_and_short(tmp_path, monkeypatch):
     short = tmp_path / "r"
     monkeypatch.setattr(tcd_browser, "SOCKET_PATH_MAX", len(str(short / "ab")) + 1 + tcd_browser.SOCKET_NAME_BUDGET)
     d = tcd_browser.make_socket_dir(short)
-    assert d == short / "ab" and (d.stat().st_mode & 0o777) == 0o700
+    assert d.path == short / "ab" and (d.path.stat().st_mode & 0o777) == 0o700
+    d.close()
     long_dir = tmp_path / ("x" * 40)
     monkeypatch.setattr(tcd_browser, "SOCKET_FALLBACK_ROOT", tmp_path / "fb")
     monkeypatch.setattr(tcd_browser, "SOCKET_PATH_MAX", len(str(tmp_path / "fb" / "abcdefgh")) + 1 + tcd_browser.SOCKET_NAME_BUDGET)
     f = tcd_browser.make_socket_dir(long_dir)
-    assert f.parent == tmp_path / "fb" and len(f.name) == 8 and (f.stat().st_mode & 0o777) == 0o700
+    assert f.path.parent == tmp_path / "fb" and len(f.name) == 8
+    assert (f.path.stat().st_mode & 0o777) == 0o700
     assert not (long_dir / "ab").exists()
     tcd_browser.remove_socket_dir(f)
-    assert not f.exists()
+    assert not f.path.exists() and f.parent_fd is None
 
 
 def test_the_socket_dir_reaches_the_executor_and_the_release_then_is_removed(cfg, cli, monkeypatch):
@@ -1638,7 +1649,7 @@ def test_the_socket_dir_is_removed_even_when_the_release_is_cancelled(cli, tmp_p
             await task
     asyncio.run(main())
     assert [c["argv"] for c in cli()][-1] == ["close-finished"]
-    assert not socket_dir.exists()
+    assert not socket_dir.path.exists() and socket_dir.parent_fd is None
 
 
 # ------------------------- pass 2, fix 1: a known outcome survives a late cancel ---
@@ -1780,9 +1791,11 @@ def test_a_preexisting_socket_dir_is_never_reused(tmp_path, monkeypatch):
     base = Path(tempfile.mkdtemp(prefix="pr", dir="/tmp"))
     try:
         run = tcd_browser.make_socket_dir(base / "r")
-        assert run == base / "r" / "ab"
+        assert run.path == base / "r" / "ab"
         again = tcd_browser.make_socket_dir(base / "r")
-        assert again.parent == base / "r" and again.name.startswith("ab-") and again != run
+        assert again.path.parent == base / "r" and again.name.startswith("ab-")
+        run.close()
+        again.close()
     finally:
         shutil.rmtree(base, ignore_errors=True)
     # fallback collision: a leftover <8 hex> dir is skipped, never reused
@@ -1792,8 +1805,9 @@ def test_a_preexisting_socket_dir_is_never_reused(tmp_path, monkeypatch):
     (leftover / "old.pid").write_text("1")
     names = iter(["aaaaaaaa", "bbbbbbbb"])
     made = tcd_browser.make_socket_dir(long_run)
-    assert made == tcd_browser.SOCKET_FALLBACK_ROOT / "bbbbbbbb"
-    assert (leftover / "old.pid").exists() and (made.stat().st_mode & 0o777) == 0o700
+    assert made.path == tcd_browser.SOCKET_FALLBACK_ROOT / "bbbbbbbb"
+    assert (leftover / "old.pid").exists() and (made.path.stat().st_mode & 0o777) == 0o700
+    made.close()
 
 
 def test_no_socket_dir_fits_means_no_socket_dir(tmp_path, monkeypatch):
@@ -1844,59 +1858,110 @@ def _populate(socket_dir: Path) -> dict[str, bytes]:
     return files
 
 
+def _fd_closed(fd: int) -> bool:
+    try:
+        os.fstat(fd)
+    except OSError:
+        return True
+    return False
+
+
 def test_a_failed_then_successful_release_removes_the_dir(cli, tmp_path, monkeypatch):
     monkeypatch.setenv("STUB_TCD_CLOSE_FAILS", "1")
-    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
-    _populate(socket_dir)
-    assert asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir)) is None
-    assert len(_releases(cli())) == 2  # failed, then tried once more
-    assert not socket_dir.exists()
+    sd = tcd_browser.make_socket_dir(tmp_path / "run")
+    _populate(sd.path)
+    closed = asyncio.run(tcd_browser.close_session("paperika-9-codex", sd))
+    assert closed.outcome == tcd_browser.RELEASED and closed.cancelled is None
+    assert len(_releases(cli())) == 2  # unclassified, then tried once more
+    assert not sd.path.exists() and sd.parent_fd is None
 
 
-def test_two_failed_releases_leave_the_dir_exactly_as_it_is(cli, tmp_path, monkeypatch, caplog):
+def test_two_unclassified_releases_leave_the_dir_exactly_as_it_is(cli, tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("STUB_TCD_CLOSE_FAILS", "2")
-    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
-    files = _populate(socket_dir)
+    sd = tcd_browser.make_socket_dir(tmp_path / "run")
+    files = _populate(sd.path)
     with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
-        asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir))
-    assert len(_releases(cli())) == 2
-    assert {p.name: p.read_bytes() for p in socket_dir.iterdir()} == files  # untouched
+        closed = asyncio.run(tcd_browser.close_session("paperika-9-codex", sd))
+    assert closed.outcome == tcd_browser.UNCLASSIFIED and len(_releases(cli())) == 2
+    assert {p.name: p.read_bytes() for p in sd.path.iterdir()} == files  # untouched
     warned = [r.getMessage() for r in caplog.records if "not released after two tries" in r.getMessage()]
-    assert len(warned) == 1 and "paperika-9-codex" in warned[0] and str(socket_dir) in warned[0]
+    assert len(warned) == 1 and "paperika-9-codex" in warned[0] and str(sd.path) in warned[0]
+    assert sd.parent_fd is None  # the descriptor is closed on this path too
 
 
-def _close_with_traps(socket_dir: Path, *, fails: int, monkeypatch) -> bool:
+def test_a_silent_exit_zero_is_unclassified(cli, tmp_path, monkeypatch):
+    monkeypatch.setenv("STUB_TCD_CLOSE_LINE", "silent")
+    sd = tcd_browser.make_socket_dir(tmp_path / "run")
+    closed = asyncio.run(tcd_browser.close_session("paperika-9-codex", sd))
+    assert closed.outcome == tcd_browser.UNCLASSIFIED and len(_releases(cli())) == 2
+    assert sd.path.exists()
+
+
+def test_left_to_expire_warns_removes_and_does_not_retry(cli, tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("STUB_TCD_CLOSE_LINE", "left")
+    sd = tcd_browser.make_socket_dir(tmp_path / "run")
+    _populate(sd.path)
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
+        closed = asyncio.run(tcd_browser.close_session("paperika-9-codex", sd))
+    assert closed.outcome == tcd_browser.LEFT_TO_EXPIRE and len(_releases(cli())) == 1
+    assert not sd.path.exists()
+    assert sum("idles out" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_no_active_session_with_an_empty_dir_removes_it(cli, tmp_path, monkeypatch):
+    monkeypatch.setenv("STUB_TCD_CLOSE_LINE", "none")
+    sd = tcd_browser.make_socket_dir(tmp_path / "run")
+    closed = asyncio.run(tcd_browser.close_session("paperika-9-codex", sd))
+    assert closed.outcome == tcd_browser.NO_SESSION and len(_releases(cli())) == 1
+    assert not sd.path.exists()
+
+
+def test_no_active_session_with_entries_leaves_the_dir(cli, tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("STUB_TCD_CLOSE_LINE", "none")
+    sd = tcd_browser.make_socket_dir(tmp_path / "run")
+    files = _populate(sd.path)
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
+        asyncio.run(tcd_browser.close_session("paperika-9-codex", sd))
+    assert {p.name: p.read_bytes() for p in sd.path.iterdir()} == files
+    assert any("holds entries" in r.getMessage() and str(sd.path) in r.getMessage()
+               for r in caplog.records)
+
+
+def _close_with_traps(sd, *, line: str, monkeypatch) -> bool:
     """Close with a FIFO named like a pid file and a huge-number pid file present.
     Runs in a thread: a blocking read of the FIFO would stall it (and the event loop)
     for good, so returning promptly is the proof nothing reads it."""
     import threading
-    os.mkfifo(socket_dir / "x.pid")
-    (socket_dir / "y.pid").write_text("9" * 40)
-    monkeypatch.setenv("STUB_TCD_CLOSE_FAILS", str(fails))
+    os.mkfifo(sd.path / "x.pid")
+    (sd.path / "y.pid").write_text("9" * 40)
+    monkeypatch.setenv("STUB_TCD_CLOSE_LINE", line)
     done = threading.Event()
 
     def _run():
-        asyncio.run(tcd_browser.close_session("paperika-9-codex", socket_dir))
+        asyncio.run(tcd_browser.close_session("paperika-9-codex", sd))
         done.set()
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
     finished = done.wait(15)
     if not finished:  # unblock a reader stuck on the FIFO so the thread can end
-        fd = os.open(socket_dir / "x.pid", os.O_WRONLY | os.O_NONBLOCK)
+        fd = os.open(sd.path / "x.pid", os.O_WRONLY | os.O_NONBLOCK)
         os.close(fd)
     return finished
 
 
-def test_the_close_never_reads_a_fifo_or_a_huge_pid_file_after_a_failed_release(cli, tmp_path, monkeypatch):
-    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
-    assert _close_with_traps(socket_dir, fails=2, monkeypatch=monkeypatch)
-    assert (socket_dir / "x.pid").exists() and (socket_dir / "y.pid").read_text() == "9" * 40
+@pytest.mark.parametrize("line", ["silent", "none"])
+def test_the_close_never_reads_a_fifo_or_a_huge_pid_file(cli, tmp_path, monkeypatch, line):
+    """Unclassified (left untouched) and no-session-with-entries (names listed, no
+    content read): both return promptly with both files intact."""
+    sd = tcd_browser.make_socket_dir(tmp_path / "run")
+    assert _close_with_traps(sd, line=line, monkeypatch=monkeypatch)
+    assert (sd.path / "x.pid").exists() and (sd.path / "y.pid").read_text() == "9" * 40
 
 
-def test_the_close_removes_a_fifo_and_a_huge_pid_file_after_a_successful_release(cli, tmp_path, monkeypatch):
-    socket_dir = tcd_browser.make_socket_dir(tmp_path / "run")
-    assert _close_with_traps(socket_dir, fails=0, monkeypatch=monkeypatch)
-    assert not socket_dir.exists()
+def test_the_close_removes_a_fifo_and_a_huge_pid_file_after_a_release(cli, tmp_path, monkeypatch):
+    sd = tcd_browser.make_socket_dir(tmp_path / "run")
+    assert _close_with_traps(sd, line="released", monkeypatch=monkeypatch)
+    assert not sd.path.exists()
 
 
 def test_the_close_code_reads_and_signals_nothing():
@@ -1907,6 +1972,176 @@ def test_the_close_code_reads_and_signals_nothing():
         assert forbidden not in src
     for gone in ("stop_leftover_daemons", "_pid_alive", "_cmdline", "_wait_dead"):
         assert not hasattr(tcd_browser, gone)
+
+
+# ------------------ pass 4, fix 1: the removal is bound to the created directory ---
+
+
+def _fallback_sd(tmp_path):
+    long_run = tmp_path / ("x" * 90)  # the primary cannot fit: the fallback is used
+    sd = tcd_browser.make_socket_dir(long_run)
+    assert sd.path.parent == tcd_browser.SOCKET_FALLBACK_ROOT
+    return sd
+
+
+def test_a_swapped_parent_never_redirects_the_removal(tmp_path, caplog):
+    """The reproduced attack: the fallback root is replaced by a symlink to another
+    directory with a same-named child. The bridge removes only what it created."""
+    sd = _fallback_sd(tmp_path)
+    root = tcd_browser.SOCKET_FALLBACK_ROOT
+    other = root.parent / "other"
+    (other / sd.name).mkdir(parents=True)
+    (other / sd.name / "keep.txt").write_text("not the bridge's")
+    root.rename(root.parent / "moved")
+    root.symlink_to(other)
+    fd = sd.parent_fd
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
+        tcd_browser.remove_socket_dir(sd)
+    assert (other / sd.name / "keep.txt").read_text() == "not the bridge's"
+    assert not (root.parent / "moved" / sd.name).exists()  # the bridge's own dir went
+    assert any("moved or replaced" in r.getMessage() for r in caplog.records)
+    assert sd.parent_fd is None and _fd_closed(fd)
+
+
+def test_a_swapped_final_directory_is_refused(tmp_path, caplog):
+    sd = _fallback_sd(tmp_path)
+    sd.path.rmdir()
+    sd.path.mkdir()  # same name, another directory
+    (sd.path / "keep.txt").write_text("not the bridge's")
+    fd = sd.parent_fd
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
+        tcd_browser.remove_socket_dir(sd)
+    assert (sd.path / "keep.txt").exists()
+    assert any("no longer the directory the bridge created" in r.getMessage() for r in caplog.records)
+    assert sd.parent_fd is None and _fd_closed(fd)
+
+
+def test_a_symlink_swapped_in_for_the_final_directory_is_refused(tmp_path):
+    sd = _fallback_sd(tmp_path)
+    target = tmp_path / "victim"
+    target.mkdir()
+    (target / "keep.txt").write_text("x")
+    sd.path.rmdir()
+    sd.path.symlink_to(target)
+    tcd_browser.remove_socket_dir(sd)
+    assert (target / "keep.txt").exists()
+
+
+def test_the_normal_removal_still_removes_and_closes(tmp_path):
+    sd = _fallback_sd(tmp_path)
+    (sd.path / "tcd-x.config").write_text("{}")
+    fd = sd.parent_fd
+    tcd_browser.remove_socket_dir(sd)
+    assert not sd.path.exists() and sd.parent_fd is None and _fd_closed(fd)
+
+
+def test_no_removal_without_the_safe_rmtree(tmp_path, monkeypatch, caplog):
+    sd = _fallback_sd(tmp_path)
+    monkeypatch.setattr(tcd_browser.shutil.rmtree, "avoids_symlink_attacks", False)
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.tcd_browser"):
+        tcd_browser.remove_socket_dir(sd)
+    assert sd.path.exists() and sd.parent_fd is None
+    assert any("not symlink-attack safe" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("line", ["released", "silent", "none"])
+def test_no_descriptor_is_left_open_across_closes(cli, tmp_path, monkeypatch, line):
+    """Removed (released), left in place (unclassified) or listed (no session): the
+    kept parent descriptor is closed every time."""
+    monkeypatch.setenv("STUB_TCD_CLOSE_LINE", line)
+    import gc
+    fd_dir = "/proc/self/fd" if Path("/proc/self/fd").is_dir() else "/dev/fd"
+    gc.collect()  # earlier tests' unreferenced connections must not close fds mid-count
+    before = len(os.listdir(fd_dir))
+    for i in range(8):
+        sd = tcd_browser.make_socket_dir(tmp_path / f"r{i}")
+        asyncio.run(tcd_browser.close_session(f"paperika-{i}-codex", sd))
+        assert sd.parent_fd is None
+    gc.collect()
+    assert len(os.listdir(fd_dir)) <= before  # eight allocations, no descriptor kept
+
+
+# ---------------- pass 4, fix 2: a selftest pass needs a confirmed release ---
+
+
+@pytest.mark.parametrize("line,outcome", [("left", "left_to_expire"), ("silent", "unclassified")])
+def test_a_selftest_pass_needs_its_lease_confirmed_released(cfg, cli, monkeypatch, line, outcome):
+    _write_state(cfg, sandbox_mode="workspace-write")
+    monkeypatch.setenv("STUB_TCD_CLOSE_LINE", line)
+    monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex([], text=_tcd_report()))
+    resp = _selftest(cfg)
+    assert resp.status_code == 502 and resp.json()["error_code"] == "executor_failed"
+    assert f"could not be confirmed released ({outcome})" in resp.json()["detail"]
+    assert _read_state(cfg)["tcd_codex_last_selftest_ok"] is False
+
+
+# ------------------ pass 4, fix 3: one owner from the moment the dir exists ---
+
+
+def _recording_allocations(monkeypatch) -> list:
+    made: list = []
+    real = tcd_browser.make_socket_dir
+
+    def _record(run_dir):
+        sd = real(run_dir)
+        made.append(sd)
+        return sd
+    monkeypatch.setattr(tcd_browser, "make_socket_dir", _record)
+    return made
+
+
+def _boom(*args, **kwargs):
+    raise RuntimeError("task.json could not be written")
+
+
+def test_a_preparation_failure_in_production_leaves_no_dir(cfg, cli, monkeypatch):
+    _ready_state(_tcd_cfg(cfg))
+    made = _recording_allocations(monkeypatch)
+    monkeypatch.setattr(executor, "write_task_json", _boom)
+    resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert resp.status_code == 500 and resp.json()["error_code"] == "bridge_error"
+    assert len(made) == 1 and not made[0].path.exists() and made[0].parent_fd is None
+    assert _releases(cli()) == []  # still empty: no CLI call needed
+
+
+def test_a_preparation_failure_in_a_trial_leaves_no_dir(cfg, cli, monkeypatch):
+    _ready_state(cfg)
+    made = _recording_allocations(monkeypatch)
+    monkeypatch.setattr(executor, "write_task_json", _boom)
+    client = TestClient(bridge_app.create_app(cfg), raise_server_exceptions=False)
+    assert _trial(client).status_code == 500
+    assert len(made) == 1 and not made[0].path.exists() and made[0].parent_fd is None
+    assert _ledger(cfg)[-1][1] == "interrupted"
+
+
+def test_a_selftest_executor_failure_leaves_no_dir(cfg, cli, monkeypatch):
+    _write_state(cfg, sandbox_mode="workspace-write")
+    monkeypatch.setenv("STUB_TCD_CLOSE_LINE", "none")  # never opened
+    made = _recording_allocations(monkeypatch)
+    monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex([], raise_exc=RuntimeError("x")))
+    assert _selftest(cfg).status_code == 500
+    assert len(made) == 1 and not made[0].path.exists() and made[0].parent_fd is None
+
+
+def test_a_preparation_failure_for_the_claude_fallback_leaves_no_dir(cfg, cli, monkeypatch):
+    _claude_ready_too(cfg)
+    monkeypatch.setattr(executor, "anthropic_api_key", lambda: "sk-test")
+    made = _recording_allocations(monkeypatch)
+    calls = {"n": 0}
+    real_write = executor.write_task_json
+
+    def _second_fails(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("task.json could not be written")
+        return real_write(*args, **kwargs)
+    monkeypatch.setattr(executor, "write_task_json", _second_fails)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([], kind="executor_died"))
+    monkeypatch.setattr(bridge_app, "run_claude", _fake_claude([]))
+    resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert resp.status_code == 500
+    assert len(made) == 2
+    assert all(not sd.path.exists() and sd.parent_fd is None for sd in made)
 
 
 # ------------------------- pass 3, fix 3: the selection creates the dir, once ---
@@ -1953,7 +2188,8 @@ def test_a_budget_exit_after_the_selection_leaves_no_socket_dir(cfg, cli, monkey
     monkeypatch.setattr(tcd_browser, "make_socket_dir", _recording)
     resp = _download(TestClient(bridge_app.create_app(cfg)))
     assert resp.status_code == 429 and resp.json()["error_code"] == "cooldown"
-    assert len(made) == 1 and made[0] is not None and not made[0].exists()
+    assert len(made) == 1 and made[0] is not None and not made[0].path.exists()
+    assert made[0].parent_fd is None
     assert "tcd_codex" not in _strategies(cfg)
 
 

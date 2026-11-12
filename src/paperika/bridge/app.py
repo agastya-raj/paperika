@@ -847,7 +847,7 @@ def _configured_tier3_browser(config: PaperikaConfig) -> str:
 async def _select_tier3_browser(
     bridge: Bridge, state: BridgeState, *, codex_can: bool, claude_can: bool,
     ensure_request: Callable[[], tuple[int, Path]],
-) -> tuple[bool, bool, bool, Path | None]:
+) -> tuple[bool, bool, bool, tcd_browser.SocketDir | None]:
     """THIS request's tier-3 browser, decided once at the tier-3 gate. Returns
     ``(tcd, codex_tcd, claude_tcd, socket_dir)``: whether tier 3 runs in TCD mode
     (then with the run's agent-browser socket dir, created HERE: if that fails for any
@@ -861,7 +861,7 @@ async def _select_tier3_browser(
     and can run, with claude as its fallback only if claude is TCD-ready too; else
     claude alone in TCD mode. A request never mixes a TCD run with a local one.
     Otherwise the local Chrome, exactly as before, with the reason logged once."""
-    local: tuple[bool, bool, bool, Path | None] = (False, False, False, None)
+    local: tuple[bool, bool, bool, tcd_browser.SocketDir | None] = (False, False, False, None)
     mode = _configured_tier3_browser(bridge.config)
     if mode == "local":
         return local
@@ -869,7 +869,7 @@ async def _select_tier3_browser(
         logger.warning("tier 3 browser: unknown tier3_browser %r; using the local Chrome", mode)
         return local
 
-    def _fallback(reason: str) -> tuple[bool, bool, bool, Path | None]:
+    def _fallback(reason: str) -> tuple[bool, bool, bool, tcd_browser.SocketDir | None]:
         logger.warning(
             "tier 3 browser: tcd configured but not ready (%s); using the local Chrome", reason
         )
@@ -894,10 +894,7 @@ async def _select_tier3_browser(
     # The run's agent-browser socket dir, created once, here, on the real run dir (the
     # request is materialized for it; tier 3 needs it anyway). Any failure: local.
     _request_id, run_dir = ensure_request()
-    try:
-        socket_dir = tcd_browser.make_socket_dir(run_dir)
-    except OSError as exc:
-        return _fallback(f"could not create an agent-browser socket dir ({type(exc).__name__})")
+    socket_dir = tcd_browser.make_socket_dir(run_dir)  # never raises
     if socket_dir is None:
         return _fallback(
             "no agent-browser socket dir could be created within the unix socket path limit"
@@ -1422,23 +1419,32 @@ async def _tcd_selftest_locked(
                                else "shared browser not up")
         return _json_error(503, "tcd_unavailable", f"tcd-browser status: {why}", ok=False)
     run_dir = bridge.config.db_path.parent / "codex_runs" / "selftest_tcd"
+    session = tcd_browser.session_name(f"selftest{int(time.time())}", driver)
     socket_dir = tcd_browser.make_socket_dir(run_dir)
     if socket_dir is None:
         return _json_error(503, "tcd_unavailable",
                            "no agent-browser socket dir fits the unix socket path limit", ok=False)
-    session = tcd_browser.session_name(f"selftest{int(time.time())}", driver)
-    try:
+    try:  # owned by the close from the moment it exists
         # The bridge's own read of the tab (before the release, through the same socket
         # dir) is the pass evidence the model cannot fake.
         result = await executor.run_tcd_selftest(
             run_dir, driver=driver, env=tcd_browser.session_env(session, socket_dir),
-            read_session_url=functools.partial(tcd_browser.session_url, session, socket_dir),
+            read_session_url=functools.partial(
+                tcd_browser.session_url, session, socket_dir.path),
             sandbox_mode=state.sandbox_mode, api_key=api_key,
         )
     except BaseException:
         await tcd_browser.close_session(session, socket_dir)
         raise
-    late_cancel = await tcd_browser.close_session(session, socket_dir, defer_cancel=True)
+    closed = await tcd_browser.close_session(session, socket_dir, defer_cancel=True)
+    late_cancel = closed.cancelled
+    if result.ok and closed.outcome != tcd_browser.RELEASED:
+        # A pass needs its own lease confirmed released ("left to expire" or an
+        # unclassified close is not that).
+        result = executor.SelftestResult(
+            False, error_code="executor_failed", wall_seconds=result.wall_seconds,
+            detail=f"the selftest's lease could not be confirmed released ({closed.outcome})",
+        )
     # Only the driver that ran: its pass never makes the other TCD-ready.
     bridge.state_store.update(**{
         f"tcd_{driver}_last_selftest_ok": result.ok,
@@ -1803,7 +1809,7 @@ async def _run_tier3(
     bridge: Bridge, *, request_id: int, run_dir: Path, doi: str, title: str,
     start_url: str, sandbox_mode: str | None, claude_go: bool, deadline: float,
     codex_wall: float = float(executor.EXEC_WALL_SECONDS), tcd: bool = False,
-    socket_dir: Path | None = None,
+    socket_dir: tcd_browser.SocketDir | None = None,
 ) -> Response:
     """Tier 3 driver chain (AGA-1460): codex first when usable, claude as the
     automatic fallback. ``sandbox_mode=None`` means codex is unusable (no selftest /
@@ -1830,15 +1836,17 @@ async def _run_tier3(
     # codex's capped wall reserved for it.
     if pending and remaining - CLEANUP_RESERVE_SECONDS < CLAUDE_FALLBACK_WINDOW_SECONDS:
         return _finish_failure(bridge, request_id=request_id, **pending)
-    api_key = executor.anthropic_api_key()
-    assert api_key  # claude_go implies a key
+    try:
+        api_key = executor.anthropic_api_key()
+        assert api_key  # claude_go implies a key
+    except BaseException:
+        if socket_dir is not None:  # still unused (claude was to run first): discard it
+            tcd_browser.remove_socket_dir(socket_dir)
+        raise
     if tcd and socket_dir is None:
         # The claude FALLBACK in TCD mode needs its own socket dir. If it cannot have
         # one, there is no fallback (never a local claude beside a TCD codex).
-        try:
-            socket_dir = tcd_browser.make_socket_dir(run_dir)
-        except OSError:
-            socket_dir = None
+        socket_dir = tcd_browser.make_socket_dir(run_dir)  # never raises
         if socket_dir is None:
             logger.warning("tier 3 browser: no agent-browser socket dir for the claude "
                            "fallback; codex's failure stands")
@@ -1862,7 +1870,7 @@ async def _run_executor_attempt(
     codex_wall: float = float(executor.EXEC_WALL_SECONDS),
     pending: dict[str, Any] | None = None,
     tcd: bool = False,
-    socket_dir: Path | None = None,
+    socket_dir: tcd_browser.SocketDir | None = None,
 ) -> Response | None:
     """One tier-3 executor attempt (``driver`` = codex | claude). Writes its own
     write-ahead row, runs the executor, resolves the terminal taxonomy (§2.7) — the
@@ -1878,20 +1886,26 @@ async def _run_executor_attempt(
     skipped: a TCD-mode run never touched it."""
     strategy = f"tcd_{driver}" if tcd else f"{driver}_bridge"
     if tcd:
-        # Created by the tier-3 selection (or _run_tier3 for a claude fallback).
+        # Created by the tier-3 selection (or _run_tier3 for a claude fallback); this
+        # attempt owns it from here.
         assert socket_dir is not None
-        sock: Path = socket_dir
-    attempt_id = bridge.write_ahead(
-        request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
-    )
-    executor.write_task_json(run_dir, doi=doi, title=title, start_url=start_url)
-    if tcd:
-        prompt = executor.render_tcd_prompt(run_dir)
-        session = tcd_browser.session_name(str(request_id), driver)
-        tcd_kw: dict[str, Any] = {"env": tcd_browser.session_env(session, sock), "tcd": True}
-    else:
-        prompt = executor.PROMPT_TEMPLATE.format(run_dir=str(run_dir))
-        tcd_kw = {}
+        sock: tcd_browser.SocketDir = socket_dir
+    try:
+        attempt_id = bridge.write_ahead(
+            request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
+        )
+        executor.write_task_json(run_dir, doi=doi, title=title, start_url=start_url)
+        if tcd:
+            prompt = executor.render_tcd_prompt(run_dir)
+            session = tcd_browser.session_name(str(request_id), driver)
+            tcd_kw: dict[str, Any] = {"env": tcd_browser.session_env(session, sock), "tcd": True}
+        else:
+            prompt = executor.PROMPT_TEMPLATE.format(run_dir=str(run_dir))
+            tcd_kw = {}
+    except BaseException:
+        if tcd:  # no executor ran: the dir is still empty, no CLI call is needed
+            tcd_browser.remove_socket_dir(sock)
+        raise
     started = _utc_now()
     try:
         if driver == "claude":
@@ -1917,7 +1931,8 @@ async def _run_executor_attempt(
     # persisted below (attempt row, latch) BEFORE a cancellation that arrived during
     # the close is re-raised.
     late_cancel = (
-        await tcd_browser.close_session(session, sock, defer_cancel=True) if tcd else None
+        (await tcd_browser.close_session(session, sock, defer_cancel=True)).cancelled
+        if tcd else None
     )
     screenshot = str(run_dir / "final.png") if (run_dir / "final.png").exists() else None
     if exec_result.cost_usd is not None:
@@ -2345,16 +2360,25 @@ async def _trial_locked(
     # BEFORE the write-ahead row, so a filesystem failure here leaves no running attempt.
     trial_dl = run_dir / "downloads"
     trial_dl.mkdir(parents=True, exist_ok=True)
+    # The socket dir has one owner from the moment it exists: ``owned`` until the
+    # executor's own close takes it over (any earlier exception removes it).
+    owned: tcd_browser.SocketDir | None = None
     if tcd:
         made = tcd_browser.make_socket_dir(run_dir)
         if made is None:
             return _json_error(503, "tcd_unavailable",
                                "no agent-browser socket dir fits the unix socket path limit")
-        socket_dir: Path = made
-    request_id = bridge.trial_ledger_request_id()
-    attempt_id = bridge.write_ahead(
-        request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
-    )
+        socket_dir: tcd_browser.SocketDir = made
+        owned = made
+    try:
+        request_id = bridge.trial_ledger_request_id()
+        attempt_id = bridge.write_ahead(
+            request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
+        )
+    except BaseException:
+        if owned is not None:
+            tcd_browser.remove_socket_dir(owned)
+        raise
     resolved = False
     try:
         executor.write_task_json(run_dir, doi=doi, title=title, start_url=f"https://doi.org/{doi}")
@@ -2367,6 +2391,7 @@ async def _trial_locked(
         else:
             prompt = executor.render_prompt(run_dir, download_dir=trial_dl)
             tcd_kw = {}
+        owned = None  # the executor's close owns it from here
         started = _utc_now()
         try:
             if driver == "claude":
@@ -2387,7 +2412,7 @@ async def _trial_locked(
         # A returned result is recorded below even when the trial is cancelled during
         # the close; that cancellation is re-raised only afterwards.
         late_cancel = (
-            await tcd_browser.close_session(session, socket_dir, defer_cancel=True)
+            (await tcd_browser.close_session(session, socket_dir, defer_cancel=True)).cancelled
             if tcd else None
         )
         exec_result.notes = _redact_all(exec_result.notes)
@@ -2487,6 +2512,8 @@ async def _trial_locked(
         }
         return JSONResponse(status_code=200, content=body)
     except BaseException:
+        if owned is not None:  # failed before the executor's close took it over
+            tcd_browser.remove_socket_dir(owned)
         # A crash/cancel after the write-ahead row: close it so it does not sit
         # 'running' until the next restart (it still counts toward spacing + caps). A TCD
         # trial's row already resolved with the run's real outcome is left as it is; a
