@@ -281,7 +281,7 @@ How the tool behaves (read this before your first command):
 - Every browser step is one invocation:
     /home/agastya/.local/bin/tcd-browser ab -- <command>
   where <command> is one of: open <url> | snapshot -i | click @eN |
-  get url | get title | get text <selector> | wait <ms> | eval "<js>" |
+  get url | get title | get text <selector> | wait <ms> | eval '<js>' |
   screenshot <path>.
 - EACH SHELL COMMAND YOU RUN STARTS WITH A FRESH, BLANK TAB. Nothing on the
   page carries over from one shell command to the next: not the page, not
@@ -306,7 +306,7 @@ The working method:
   A. Look: ONE command opens start_url, waits out a challenge page if there
      is one (below), and prints what you need to choose: get url, get title,
      and the candidate PDF links as text and href, e.g. with
-       eval "Array.from(document.querySelectorAll('a')).filter(a => /pdf/i.test(a.href + ' ' + a.textContent)).map(a => a.textContent.trim().slice(0, 80) + ' | ' + a.href).join(' || ')"
+       eval 'Array.from(document.querySelectorAll("a")).filter(a => /pdf/i.test(a.href + " " + a.textContent)).map(a => a.textContent.trim().slice(0, 80) + " | " + a.href).join(" || ")'
      or with snapshot -i. A later command may look again at any address you
      have read.
   B. Fetch: ONE command runs "downloads" and notes the newest entry, opens
@@ -314,7 +314,7 @@ The working method:
      "downloads" until an entry newer than the one you noted appears, and
      copies it out (see "Getting the PDF out of the browser").
   Where a page needs a click instead of an href, the open, the click (by
-  eval with a CSS selector, e.g. eval "document.querySelector('<selector>').click()",
+  eval with a CSS selector, e.g. eval 'document.querySelector("<selector>").click()',
   or by a ref from a snapshot -i taken earlier in that SAME command) and the
   follow-up read all go in one command.
 
@@ -398,8 +398,15 @@ Hard rules (non-negotiable, no budget or judgment overrides these):
 - Never read, print or copy the CLI's key file (~/.config/tcd_browser/key) or
   any cookies or stored credentials (no eval of document.cookie,
   localStorage or sessionStorage).
-- Put every URL in single quotes in your shell commands, and never let the
-  shell expand text that came from task.json or a page.
+- Shell quoting: every address and every piece of JavaScript you pass to the
+  client goes in SINGLE quotes, never in double quotes and never unquoted,
+  so the shell expands nothing. The text inside those quotes must contain no
+  single quote: in an address write %27 in its place (start_url in task.json
+  already has this done; do it yourself for any address read from a page);
+  in JavaScript use double quotes for strings. A CSS selector inside your
+  JavaScript must contain no single quote, double quote or backslash; if the
+  one you need does, select another way (by tag, attribute or position).
+  Put no other text from task.json or from a page into a shell command.
 - Never touch or list other tabs, and never open a second tab: work only in
   your own session.
 - Do not close your session or tab: the bridge closes it after you finish.
@@ -762,6 +769,13 @@ def build_argv(
         *schema_args,
         prompt,
     ]
+
+
+def shell_safe_url(url: str) -> str:
+    """AGA-1702: in TCD mode the model writes shell commands that carry addresses in
+    single quotes, so an address must hold no single quote. ``%27`` is the same
+    address to a server. Used for the ``start_url`` a TCD-mode run is given."""
+    return url.replace("'", "%27")
 
 
 def write_task_json(run_dir: Path, *, doi: str, title: str, start_url: str) -> None:
@@ -1286,8 +1300,14 @@ async def run_tcd_selftest(
         screenshot.unlink()  # never follows a link; a stale file cannot satisfy (c)
     except FileNotFoundError:
         pass
-    except OSError:
-        pass  # e.g. a directory there: (c) then fails on its own
+    except OSError as exc:
+        # Whatever sits at that name could not be cleared, so nothing found there after
+        # the run would prove this run wrote it: fail before any executor starts.
+        return SelftestResult(
+            ok=False, error_code="executor_failed",
+            detail=f"tcd selftest not run: the previous {TCD_SELFTEST_SCREENSHOT} could not "
+                   f"be cleared ({type(exc).__name__})",
+        )
     prompt = render_tcd_selftest_prompt(run_dir)
     window_start = time.time()
     if driver == "claude":

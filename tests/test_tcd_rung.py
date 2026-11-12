@@ -454,7 +454,9 @@ def test_tcd_prompt_is_static_apart_from_run_dir(tmp_path):
     "never accept terms", "never submit a form", "Never visit anything but doi.org and this paper's publisher",
     "never login, view, run, mcp, upload, ticket or key", "~/.config/tcd_browser/key",
     "document.cookie", "Never touch or list other tabs", "Do not close your session or tab",
-    "Put every URL in single quotes",
+    "goes in SINGLE quotes, never in double quotes and never unquoted",
+    "in an address write %27 in its place", "in JavaScript use double quotes for strings",
+    "Put no other text from task.json or from a page into a shell command",
     # the tool's real model: a fresh tab per shell command, chained steps, by address
     "EACH SHELL COMMAND YOU RUN STARTS WITH A FRESH, BLANK TAB",
     "Only the browser's cookies and its downloads folder persist between commands",
@@ -2157,3 +2159,78 @@ def test_a_symlinked_fallback_root_is_refused(tmp_path, monkeypatch):
                         len(os.fsencode(str(link / "abcdefgh"))) + 1 + tcd_browser.SOCKET_NAME_BUDGET)
     assert tcd_browser.make_socket_dir(long_run) is None
     assert list(target.iterdir()) == []
+
+
+# --- pass-7 fixes: shell quoting, and a screenshot that cannot be cleared ------------------
+
+
+def test_shell_safe_url_leaves_no_single_quote():
+    hostile = "https://example.org/a'; printf MARKER; #"
+    assert "'" not in executor.shell_safe_url(hostile)
+    assert executor.shell_safe_url(hostile) == "https://example.org/a%27; printf MARKER; #"
+    plain = "https://doi.org/10.1364/ofc.2025.m1j.5"
+    assert executor.shell_safe_url(plain) == plain
+
+
+def test_tcd_prompt_single_quotes_every_address_and_script():
+    prompt = executor.render_tcd_prompt(Path("/tmp/run"))
+    # No example hands JavaScript or an address to the shell in double quotes or bare.
+    assert 'eval "' not in prompt
+    assert "open '<url>'" in prompt and "open <url>;" not in prompt
+    for line in prompt.splitlines():
+        if "eval '" in line and "<js>" not in line:
+            body = line.split("eval '", 1)[1].rsplit("'", 1)[0]
+            assert "'" not in body, line  # the JavaScript itself holds no single quote
+
+
+def test_selftest_fails_before_any_run_when_the_old_screenshot_cannot_be_cleared(
+    cfg, cli, monkeypatch
+):
+    _write_state(cfg, sandbox_mode="workspace-write")
+    stale = cfg.db_path.parent / "codex_runs" / "selftest_tcd" / executor.TCD_SELFTEST_SCREENSHOT
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(VALID_PNG)  # a qualifying PNG with a fresh mtime
+    real_unlink = Path.unlink
+
+    def _denied(self, *a, **kw):
+        if self.name == executor.TCD_SELFTEST_SCREENSHOT:
+            raise PermissionError(13, "denied")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", _denied)
+    seen: list = []
+    # The executor would report success and write nothing new: without the fix the old
+    # file, still inside the grace window, satisfied the screenshot check.
+    monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex(seen, text=_tcd_report(), png=None))
+    resp = _selftest(cfg)
+    assert resp.status_code == 502, resp.text
+    assert "could not be cleared" in resp.json()["detail"]
+    assert seen == []  # no executor was started
+    state = json.loads((cfg.db_path.parent / "bridge_state.json").read_text())
+    assert state.get("tcd_codex_last_selftest_ok") is False
+
+
+@pytest.mark.parametrize("tcd", [True, False])
+def test_only_a_tcd_run_gets_a_start_url_without_a_single_quote(cfg, cli, monkeypatch, tcd):
+    """TCD mode: the model writes shell commands, so the address it is handed holds no
+    single quote. Local mode's task.json is exactly what main writes."""
+    _ready_state(cfg)
+    if tcd:
+        _tcd_cfg(cfg)
+    hostile = "https://pub.example/a'; printf MARKER; #"
+    written: list[str] = []
+
+    async def _fake(run_dir, prompt, sandbox_mode, **kw):
+        written.append(json.loads((run_dir / "task.json").read_text())["start_url"])
+        return executor.ExecResult(kind="gave_up", notes="fake")
+
+    monkeypatch.setattr(bridge_app, "run_codex", _fake)
+    client = TestClient(bridge_app.create_app(cfg))
+    client.post("/download", headers=_auth(),
+                json={"doi": DOI, "title": TITLE, "source_url": hostile})
+    assert len(written) == 1
+    if tcd:
+        assert "'" not in written[0] and written[0] == executor.shell_safe_url(written[0])
+        assert "%27" in written[0]
+    else:
+        assert "'" in written[0]

@@ -1883,7 +1883,10 @@ async def _run_executor_attempt(
     attempt_id = bridge.write_ahead(
         request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
     )
-    executor.write_task_json(run_dir, doi=doi, title=title, start_url=start_url)
+    executor.write_task_json(
+        run_dir, doi=doi, title=title,
+        start_url=executor.shell_safe_url(start_url) if tcd else start_url,
+    )
     if tcd:
         prompt = executor.render_tcd_prompt(run_dir)
         session = tcd_browser.session_name(str(request_id), driver)
@@ -2357,7 +2360,11 @@ async def _trial_locked(
     )
     resolved = False
     try:
-        executor.write_task_json(run_dir, doi=doi, title=title, start_url=f"https://doi.org/{doi}")
+        trial_url = f"https://doi.org/{doi}"
+        executor.write_task_json(
+            run_dir, doi=doi, title=title,
+            start_url=executor.shell_safe_url(trial_url) if tcd else trial_url,
+        )
         if tcd:
             prompt = executor.render_tcd_prompt(run_dir, download_dir=trial_dl)
             session = tcd_browser.session_name(f"trial{attempt_id}", driver)
