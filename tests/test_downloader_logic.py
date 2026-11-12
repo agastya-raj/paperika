@@ -1320,6 +1320,12 @@ def test_all_digit_code_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     _reject_case(tmp_path, monkeypatch, page, doi="10.1364/xx.2020.001234")
 
 
+def test_all_letter_code_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # A paper code holds a letter AND a digit; "abc" is not one, whatever the page shows.
+    page = _page("ABC", "OFC 2025 \u00a9 Optica Publishing Group 2025")
+    _reject_case(tmp_path, monkeypatch, page, doi="10.1364/ofc.2025.abc")
+
+
 def test_short_title_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _reject_case(tmp_path, monkeypatch, _page(title="Margin Driven QoT"), title="Margin Driven QoT")
 
