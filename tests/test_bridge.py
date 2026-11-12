@@ -1513,6 +1513,198 @@ def test_ladder_does_not_wait_when_tier1_cooldown_exceeds_cap(cfg, monkeypatch):
     assert resp.status_code == 503 and resp.json()["error_code"] == "selftest_required"
 
 
+# --- AGA-1702: tier 3 waits out a short driver cooldown -------------------------
+
+
+def _seed_driver(cfg, strategy: str, seconds_ago: float, *, outcome="gave_up") -> None:
+    con = _conn(cfg)
+    con.execute("INSERT INTO paper_requests (raw_input, status, created_at, updated_at) VALUES ('x','failed',?,?)",
+                (limits.iso(_now()), limits.iso(_now())))
+    rid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    ts = limits.iso(_now() - timedelta(seconds=seconds_ago))
+    con.execute("INSERT INTO paper_attempts (request_id, attempt_number, status, strategy, created_at, started_at, outcome) "
+                "VALUES (?,1,'failed',?,?,?,?)", (rid, strategy, ts, ts, outcome))
+    con.commit()
+    con.close()
+
+
+def _age_attempts(cfg, seconds: float) -> None:
+    """Move the clock forward for the rate ledger: every attempt started `seconds` earlier."""
+    con = _conn(cfg)
+    for row in con.execute("SELECT id, started_at FROM paper_attempts").fetchall():
+        new = limits.iso(datetime.fromisoformat(row["started_at"]) - timedelta(seconds=seconds))
+        con.execute("UPDATE paper_attempts SET started_at=?, created_at=? WHERE id=?", (new, new, row["id"]))
+    con.commit()
+    con.close()
+
+
+def _tier3_setup(cfg, monkeypatch, *, claude=True):
+    """Codex sandbox armed, claude optionally keyed, SLEEP stubbed (and the rate
+    ledger aged by the sleep, as the real clock would), both drivers faked."""
+    _seed_sandbox_mode(cfg)
+    if claude:
+        _with_key(monkeypatch)
+    slept: list[float] = []
+    codex, claude_c = {"n": 0}, {"n": 0}
+
+    async def _sleep(seconds):
+        slept.append(seconds)
+        _age_attempts(cfg, seconds + 1)
+
+    monkeypatch.setattr(bridge_app, "SLEEP", _sleep)
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex_recorder(codex))
+    monkeypatch.setattr(bridge_app, "run_claude", _claude_recorder(claude_c))
+    return slept, codex, claude_c
+
+
+def _post_t3(cfg, tag):
+    return TestClient(bridge_app.create_app(cfg)).post(
+        "/download", headers=_auth(), json={"doi": f"10.1364/jocn.{tag}", "title": f"Tier Three {tag}"})
+
+
+def test_tier3_waits_for_the_shorter_cooldown_and_runs_claude(cfg, monkeypatch):
+    """codex 100 s left, claude 60 s left: one sleep of ~60, then claude runs (codex
+    still blocked) and the request is not a 429."""
+    slept, codex, claude = _tier3_setup(cfg, monkeypatch)
+    bridge_app.build_bridge(cfg)
+    _seed_driver(cfg, "codex_bridge", 80)
+    _seed_driver(cfg, "claude_bridge", 120)
+    resp = _post_t3(cfg, "wait1")
+    assert len(slept) == 1 and 58 <= slept[0] <= 62
+    assert (codex["n"], claude["n"]) == (0, 1)
+    assert resp.status_code != 429 and resp.json()["error_code"] == "paywalled_no_access"
+    assert [s for s, _ in _strategies(cfg)][-1] == "claude_bridge"
+
+
+def test_tier3_uses_a_fresh_decision_when_the_cooldown_ended_during_tiers_1_and_2(cfg, monkeypatch):
+    """The pre-flight sees codex blocked; tier 2 takes 'time' (the ledger ages 100 s);
+    tier 3 re-checks, finds codex free and runs it with NO sleep."""
+    slept, codex, _ = _tier3_setup(cfg, monkeypatch, claude=False)
+    bridge_app.build_bridge(cfg)
+    _seed_driver(cfg, "codex_bridge", 100)  # 80 s left at pre-flight
+
+    async def _slow_scripted(**kwargs):
+        _age_attempts(cfg, 100)
+        return scripted_browser.ScriptedFetchResult(kind="no_pdf", notes="slow miss")
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _slow_scripted)
+    resp = _post_t3(cfg, "stale1")
+    assert slept == [] and codex["n"] == 1
+    assert resp.status_code != 429
+    assert [s for s, _ in _strategies(cfg)][-1] == "codex_bridge"
+
+
+def test_tier3_does_not_wait_when_the_cooldown_exceeds_the_cap(cfg, monkeypatch):
+    """Above TIER3_COOLDOWN_WAIT_MAX: no sleep, 429 cooldown carrying the FRESH retry_after."""
+    slept, codex, _ = _tier3_setup(cfg, monkeypatch, claude=False)
+    bridge_app.build_bridge(cfg)
+    monkeypatch.setattr(bridge_app, "TIER3_COOLDOWN_WAIT_MAX", 100)
+    _seed_driver(cfg, "codex_bridge", 10)  # 171 s left at pre-flight
+
+    async def _slow_scripted(**kwargs):
+        _age_attempts(cfg, 30)
+        return scripted_browser.ScriptedFetchResult(kind="no_pdf", notes="slow miss")
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _slow_scripted)
+    resp = _post_t3(cfg, "cap1")
+    assert slept == [] and codex["n"] == 0
+    assert resp.status_code == 429 and resp.json()["error_code"] == "cooldown"
+    assert 105 <= resp.json()["retry_after_seconds"] <= 142  # ~141, not the stale 171
+
+
+def test_tier3_never_waits_for_a_daily_cap(cfg, monkeypatch):
+    slept, codex, claude = _tier3_setup(cfg, monkeypatch)
+    bridge_app.build_bridge(cfg)
+    monkeypatch.setitem(limits.RATE_RULES, "codex_bridge", (1, 1))
+    monkeypatch.setitem(limits.RATE_RULES, "claude_bridge", (1, 1))
+    _seed_driver(cfg, "codex_bridge", 5)
+    _seed_driver(cfg, "claude_bridge", 5)
+    resp = _post_t3(cfg, "dcap1")
+    assert slept == [] and (codex["n"], claude["n"]) == (0, 0)
+    assert resp.status_code == 429 and resp.json()["error_code"] == "daily_cap"
+
+
+def test_tier3_does_not_wait_when_the_budget_cannot_cover_it(cfg, monkeypatch):
+    """Wait 60 needs remaining - 60 >= 180 + 120, i.e. now <= 780 of the 1140 budget."""
+    slept, codex, _ = _tier3_setup(cfg, monkeypatch, claude=False)
+    bridge_app.build_bridge(cfg)
+    t = {"now": 0.0}
+    monkeypatch.setattr(bridge_app, "MONOTONIC", lambda: t["now"])
+    _seed_driver(cfg, "codex_bridge", 120)  # 60 s left
+
+    async def _slow_scripted(**kwargs):
+        t["now"] += 781
+        return scripted_browser.ScriptedFetchResult(kind="no_pdf", notes="slow miss")
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _slow_scripted)
+    resp = _post_t3(cfg, "bud1")
+    assert slept == [] and codex["n"] == 0
+    assert resp.status_code == 429 and resp.json()["error_code"] == "cooldown"
+
+
+def test_tier3_budget_boundary_still_waits(cfg, monkeypatch):
+    """The same case at now == 780 is exactly enough: it waits."""
+    slept, _, _ = _tier3_setup(cfg, monkeypatch, claude=False)
+    bridge_app.build_bridge(cfg)
+    t = {"now": 0.0}
+    monkeypatch.setattr(bridge_app, "MONOTONIC", lambda: t["now"])
+    _seed_driver(cfg, "codex_bridge", 120)
+
+    async def _slow_scripted(**kwargs):
+        t["now"] += 780
+        return scripted_browser.ScriptedFetchResult(kind="no_pdf", notes="slow miss")
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _slow_scripted)
+    _post_t3(cfg, "bud2")
+    assert len(slept) == 1
+
+
+def test_tier3_codex_free_while_claude_cools_down_runs_without_sleeping(cfg, monkeypatch):
+    slept, codex, claude = _tier3_setup(cfg, monkeypatch)
+    bridge_app.build_bridge(cfg)
+    _seed_driver(cfg, "claude_bridge", 100)
+    _post_t3(cfg, "one1")
+    assert slept == [] and (codex["n"], claude["n"]) == (1, 0)
+
+
+def test_tier3_claude_free_while_codex_cools_down_runs_without_sleeping(cfg, monkeypatch):
+    slept, codex, claude = _tier3_setup(cfg, monkeypatch)
+    bridge_app.build_bridge(cfg)
+    _seed_driver(cfg, "codex_bridge", 100)
+    _post_t3(cfg, "one2")
+    assert slept == [] and (codex["n"], claude["n"]) == (0, 1)
+
+
+def test_tier3_ignores_the_cooldown_of_an_unusable_driver(cfg, monkeypatch):
+    """codex has no sandbox mode (unusable) and an 11 s cooldown; claude is usable with
+    ~100 s left. The wait is claude's ~100 s, not codex's 11 s."""
+    slept, codex, claude = _tier3_setup(cfg, monkeypatch)
+    (cfg.db_path.parent / "bridge_state.json").write_text("{}", encoding="utf-8")  # codex unarmed
+    bridge_app.build_bridge(cfg)
+    _seed_driver(cfg, "codex_bridge", 170)
+    _seed_driver(cfg, "claude_bridge", 80)
+    _post_t3(cfg, "unus1")
+    assert len(slept) == 1 and 99 <= slept[0] <= 102
+    assert (codex["n"], claude["n"]) == (0, 1)
+
+
+def test_walled_tiers_with_both_drivers_cooling_get_a_tier3_attempt(cfg, monkeypatch):
+    """Request 184's shape: both deterministic tiers walled, both drivers in cooldown.
+    After the wait a tier-3 attempt row exists; the answer is not bot_wall_unclassified."""
+    slept, _, _ = _tier3_setup(cfg, monkeypatch)
+    bridge_app.build_bridge(cfg)
+    _seed_driver(cfg, "codex_bridge", 80)
+    _seed_driver(cfg, "claude_bridge", 120)
+
+    async def _wall_direct(**kwargs):
+        return direct_fetch.DirectFetchResult(kind="wall", final_url="https://pub.example/t1")
+
+    async def _wall_scripted(**kwargs):
+        return scripted_browser.ScriptedFetchResult(kind="wall", final_url="https://pub.example/t2")
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _wall_direct)
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _wall_scripted)
+    resp = _post_t3(cfg, "wall1")
+    assert len(slept) == 1
+    assert resp.json()["error_code"] != "bot_wall_unclassified"
+    assert [s for s, _ in _strategies(cfg)][-1] in ("codex_bridge", "claude_bridge")
+
+
 def test_ladder_all_tiers_rate_blocked_429_min_retry(cfg):
     """Every tier in cooldown ⇒ 429 with the SMALLEST retry_after (direct_fetch's)."""
     _seed_sandbox_mode(cfg)

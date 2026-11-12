@@ -674,6 +674,9 @@ def test_no_local_chrome_recovery_after_a_bad_tcd_outcome(cfg, cli, monkeypatch,
 def test_tcd_rate_blocked_with_chrome_down_reports_the_rate_not_chrome(cfg, cli, monkeypatch, chrome_calls):
     _ready_state(_tcd_cfg(cfg))
     chrome_calls["ok"] = False
+    # AGA-1702: a 151 s cooldown is now waited out; this test is about which error a
+    # still-blocked request reports, so switch the wait off.
+    monkeypatch.setattr(bridge_app, "TIER3_COOLDOWN_WAIT_MAX", 0)
     bridge_app.build_bridge(cfg)
     _insert_attempt(cfg, "tcd_codex", _now() - timedelta(seconds=30))
     resp = _download(TestClient(bridge_app.create_app(cfg)))
@@ -2373,3 +2376,31 @@ def test_the_start_address_file_raises_no_policy_flag_in_a_tcd_trial_only(
     resp = _trial(client, browser="local", doi="10.1234/captcha")
     assert resp.status_code == 200, resp.text
     assert resp.json()["policy_flags"] == ["captcha@start_url.txt"]
+
+
+# --------------------------------- AGA-1702: tier 3 waits out a short cooldown ---
+
+
+def test_tcd_tier3_waits_out_a_short_cooldown_and_the_row_is_tcd_codex(cfg, cli, monkeypatch):
+    """Both LLM drivers' pool is cooling (a tcd_codex attempt 80 s ago): tier 3 sleeps
+    the remaining ~100 s, then runs codex in TCD mode (row tcd_codex, not a 429)."""
+    _ready_state(_tcd_cfg(cfg))
+    bridge_app.build_bridge(cfg)
+    _insert_attempt(cfg, "tcd_codex", _now() - timedelta(seconds=80))
+    slept: list[float] = []
+
+    async def _sleep(seconds):
+        slept.append(seconds)
+        con = _conn(cfg)
+        old = limits.iso(_now() - timedelta(seconds=seconds + 100))
+        con.execute("UPDATE paper_attempts SET started_at=?, created_at=?", (old, old))
+        con.commit()
+        con.close()
+
+    monkeypatch.setattr(bridge_app, "SLEEP", _sleep)
+    seen: list = []
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(seen, kind="paywalled_no_access"))
+    resp = _download(TestClient(bridge_app.create_app(cfg)))
+    assert len(slept) == 1 and 98 <= slept[0] <= 102
+    assert resp.status_code != 429 and resp.json()["error_code"] == "paywalled_no_access"
+    assert len(seen) == 1 and _strategies(cfg)[-1] == "tcd_codex"

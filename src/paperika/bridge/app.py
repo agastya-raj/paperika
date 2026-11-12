@@ -92,6 +92,9 @@ TIER1_BUDGET = 60.0
 # tier 1 (direct_fetch spacing is 30 s, so this is cooldown + margin). SLEEP is
 # a module attribute so tests can stub the wait.
 TIER1_COOLDOWN_WAIT_MAX = 45
+# AGA-1702: the longest tier-3 driver cooldown the ladder waits out (the LLM
+# spacing is 180 s, so this is spacing + margin).
+TIER3_COOLDOWN_WAIT_MAX = 185
 SLEEP = asyncio.sleep
 TIER2_BUDGET = 45.0
 
@@ -1654,6 +1657,33 @@ async def _download_locked(
         tier_kinds.get("direct_fetch") == "wall"
         and tier_kinds.get("scripted_browser") == "wall"
     )
+    # AGA-1702: tier 3 merely cooling down is not a reason to refuse. The pre-flight
+    # decisions are stale by now (tiers 1+2 ran up to ~105 s), and back-to-back
+    # requests landed inside both drivers' 180 s spacing: 2 of 12 real requests on
+    # 2026-11-12 ended 429 cooldown / 502 bot_wall_unclassified with no tier-3 attempt.
+    # Re-check fresh; if no usable driver is allowed, wait out the shortest short
+    # cooldown (the lock is held either way) and re-check. A daily cap is never waited.
+    with bridge.db.transaction() as conn:
+        for strat in ("codex_bridge", "claude_bridge"):
+            if strat in rate:
+                rate[strat] = limits.check_rate(conn, strat)
+    usable = {"codex_bridge": bool(state.sandbox_mode), "claude_bridge": claude_ready}
+    if not any(usable[s] and rate[s].allowed for s in rate if s in usable):
+        waits = [
+            rate[s].retry_after_seconds for s in rate
+            if usable.get(s)
+            and rate[s].error_code == "cooldown"
+            and rate[s].retry_after_seconds is not None
+            and rate[s].retry_after_seconds <= TIER3_COOLDOWN_WAIT_MAX
+        ]
+        if waits:
+            wait = min(waits)
+            if deadline - MONOTONIC() - wait >= FALLBACK_MIN_SECONDS + CLEANUP_RESERVE_SECONDS:
+                await SLEEP(wait)
+                with bridge.db.transaction() as conn:
+                    for strat in ("codex_bridge", "claude_bridge"):
+                        if strat in rate:
+                            rate[strat] = limits.check_rate(conn, strat)
     # AGA-1702: re-arm a latched-off / stale codex once per 24 h, then pick the
     # browser tier 3 drives. A TCD-mode tier 3 does not need the local Chrome (tier 2
     # above keeps its own Chrome rule).
