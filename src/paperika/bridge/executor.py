@@ -290,7 +290,7 @@ How the tool behaves (read this before your first command):
   command stays cleared in the next).
 - Steps that depend on each other must therefore be CHAINED IN ONE shell
   command, joined with ";" or "&&", e.g.
-    T=/home/agastya/.local/bin/tcd-browser; $T ab -- open "$(cat {run_dir}/start_url.txt)"; $T ab -- get url; $T ab -- get title
+    T=/home/agastya/.local/bin/tcd-browser; $T ab -- open "$(cat -- {sh_dir}/start_url.txt)"; $T ab -- get url; $T ab -- get title
 - Element refs (@e3 and so on) printed by snapshot -i are valid only inside
   the same shell command that printed them, so you cannot choose one after
   reading it. Work by ADDRESS instead, as below.
@@ -307,7 +307,7 @@ The working method:
      if there is one (below), and prints what you need to choose. Open the
      start address ONLY in this exact form, which hands the client the
      address byte for byte without the shell reading it:
-       open "$(cat {run_dir}/start_url.txt)"
+       open "$(cat -- {sh_dir}/start_url.txt)"
      (the file holds start_url; never type or paste start_url into a command
      yourself). Then print: get url, get title,
      and the candidate PDF links as text and href, e.g. with
@@ -350,8 +350,8 @@ lands in ONE downloads folder on the browser's host that every tab shares:
      between polls) for up to 60 seconds. Only an entry that appeared after
      your own action, newer than the one you noted, is yours. Never take a
      file that was already there.
-  3. mkdir -p {run_dir}/tcd_download, then copy it out with
-     "download --latest {run_dir}/tcd_download". The copy must have the name
+  3. mkdir -p {sh_dir}/tcd_download, then copy it out with
+     "download --latest {sh_dir}/tcd_download". The copy must have the name
      of the entry you identified; if another tab's download became the newest
      meanwhile, delete the copy and report gave_up, saying so in the notes.
      ("downloads" and "download --latest" also work in a later command.)
@@ -414,7 +414,10 @@ Hard rules (non-negotiable, no budget or judgment overrides these):
   CSS selector inside your JavaScript must contain no single quote, double
   quote or backslash; if the one you need does, select another way (by tag,
   attribute or position). Put no other text from task.json or from a page
-  into a shell command.
+  into a shell command. A file path you type in a shell command goes in
+  single quotes if it holds a space or any character the shell treats
+  specially; the paths in the examples here are already written safely, so
+  copy them as they are.
 - Never touch or list other tabs, and never open a second tab: work only in
   your own session.
 - Do not close your session or tab: the bridge closes it after you finish.
@@ -422,7 +425,7 @@ Hard rules (non-negotiable, no budget or judgment overrides these):
 - Before finishing (success or failure), screenshot to {run_dir}/final.png
   IN THE SAME COMMAND as the last page it should show (a later command would
   only capture a blank tab), e.g.
-    ... ; /home/agastya/.local/bin/tcd-browser ab -- screenshot {run_dir}/final.png
+    ... ; /home/agastya/.local/bin/tcd-browser ab -- screenshot {sh_dir}/final.png
 
 Report ONLY the structured outcome: outcome, file_path (absolute path of the
 saved PDF or null), final_url (from "get url"), notes (one short paragraph of
@@ -432,7 +435,9 @@ what happened, including anything suspicious you ignored)."""
 def render_tcd_prompt(run_dir: Path, *, download_dir: Path | None = None) -> str:
     """The static TCD prompt with ``{run_dir}`` filled; ``download_dir`` redirects
     the production download dir exactly as ``render_prompt`` does (trials)."""
-    text = TCD_PROMPT_TEMPLATE.format(run_dir=str(run_dir))
+    # {sh_dir} is the same folder written for a shell command (shlex.quote: unchanged
+    # for an ordinary path, quoted when it holds a space or a shell character).
+    text = TCD_PROMPT_TEMPLATE.format(run_dir=str(run_dir), sh_dir=shlex.quote(str(run_dir)))
     return text.replace(PROD_DOWNLOAD_DIR, str(download_dir)) if download_dir else text
 
 
@@ -452,7 +457,7 @@ TCD_SELFTEST_PROMPT_TEMPLATE = (
     "/home/agastya/.local/bin/tcd-browser ab -- open https://example.org; "
     "/home/agastya/.local/bin/tcd-browser ab -- get title; "
     "/home/agastya/.local/bin/tcd-browser ab -- get url; "
-    "/home/agastya/.local/bin/tcd-browser ab -- screenshot {run_dir}/selftest.png\n"
+    "/home/agastya/.local/bin/tcd-browser ab -- screenshot {sh_dir}/selftest.png\n"
     "Do not close the session, visit no other page and use no other tcd-browser "
     "subcommand. Then report the structured outcome: outcome gave_up, file_path "
     "null, final_url null, and notes exactly two lines and nothing else: "
@@ -467,7 +472,7 @@ SELFTEST_PNG_GRACE_SECONDS = 2.0  # filesystem timestamp granularity
 
 
 def render_tcd_selftest_prompt(run_dir: Path) -> str:
-    return TCD_SELFTEST_PROMPT_TEMPLATE.format(run_dir=str(run_dir))
+    return TCD_SELFTEST_PROMPT_TEMPLATE.format(sh_dir=shlex.quote(str(run_dir)))
 
 
 def check_selftest_screenshot(path: Path, window_start: float, window_end: float) -> str | None:
@@ -785,7 +790,7 @@ START_URL_FILE = "start_url.txt"
 def write_start_url_file(run_dir: Path, start_url: str) -> None:
     """AGA-1702: in TCD mode the model writes shell commands. The start address comes
     from the request, so the model never types it: the TCD prompt opens it as
-    ``"$(cat {run_dir}/start_url.txt)"``, which hands the client the exact bytes with
+    ``"$(cat -- <run_dir>/start_url.txt)"``, which hands the client the exact bytes with
     no shell expansion and without altering the address. Written without a trailing
     newline; the address itself is never rewritten."""
     (run_dir / START_URL_FILE).write_text(start_url, encoding="utf-8")

@@ -15,8 +15,10 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import sqlite3
 import string
+import subprocess
 import time
 
 from fastapi.testclient import TestClient
@@ -426,7 +428,7 @@ def test_local_prompt_is_byte_for_byte_unchanged():
 
 def test_tcd_prompt_is_static_apart_from_run_dir(tmp_path):
     fields = {f for _, f, _, _ in string.Formatter().parse(executor.TCD_PROMPT_TEMPLATE) if f}
-    assert fields == {"run_dir"}
+    assert fields == {"run_dir", "sh_dir"}  # one folder, plain and shell-quoted
     text = executor.render_tcd_prompt(tmp_path)
     assert "{" not in text and "}" not in text
     assert f"{tmp_path}/task.json" in text and f"{tmp_path}/final.png" in text
@@ -477,7 +479,7 @@ def test_tcd_prompt_assumes_no_state_between_commands():
 
 def test_tcd_selftest_prompt_chains_one_command_and_is_static(tmp_path):
     fields = {f for _, f, _, _ in string.Formatter().parse(executor.TCD_SELFTEST_PROMPT_TEMPLATE) if f}
-    assert fields == {"run_dir"}
+    assert fields == {"sh_dir"}  # the run folder, shell-quoted
     text = executor.render_tcd_selftest_prompt(tmp_path)
     assert "{" not in text and "}" not in text
     assert "exactly ONE shell command that chains four steps" in text
@@ -2178,7 +2180,7 @@ def test_tcd_prompt_single_quotes_every_address_and_script():
     # No example hands JavaScript or an address to the shell in double quotes or bare.
     assert 'eval "' not in prompt
     # The start address is never typed: it is opened from the file the bridge wrote.
-    assert 'open "$(cat /tmp/run/start_url.txt)"' in prompt
+    assert 'open "$(cat -- /tmp/run/start_url.txt)"' in prompt
     assert "open '<url>'" not in prompt and "%27" not in prompt
     assert "'\\''" in prompt  # the POSIX escape for a quote inside single quotes
     for line in prompt.splitlines():
@@ -2244,7 +2246,65 @@ def test_the_start_address_is_never_rewritten_and_a_tcd_run_gets_it_as_a_file(
     assert seen[0]["task"] == hostile  # never rewritten, in either mode
     if tcd:
         assert seen[0]["file"] == hostile  # exact bytes, no trailing newline
-        assert f'open "$(cat {seen[0]["run_dir"]}/start_url.txt)"' in seen[0]["prompt"]
+        assert f'open "$(cat -- {seen[0]["run_dir"]}/start_url.txt)"' in seen[0]["prompt"]
         assert hostile not in seen[0]["prompt"]  # the prompt stays static
     else:
         assert seen[0]["file"] is None
+
+
+def _sh(shell: str, command: str) -> str:
+    return subprocess.run([shell, "-c", command], capture_output=True, text=True, check=True).stdout
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+def test_every_path_the_tcd_prompts_hand_to_a_shell_survives_an_odd_state_folder(tmp_path, shell):
+    """A state folder with a space, a dollar name, quotes and a semicolon (PAPERIKA_DB_PATH
+    is free-form): the commands the prompts tell the model to copy still name the right
+    files, and the start address still arrives byte for byte. Run in a real shell."""
+    run_dir = tmp_path / "pa per $UNSET_VARIABLE 'q' \"d\" ;x" / "codex_runs" / "7"
+    run_dir.mkdir(parents=True)
+    address = "https://pub.example/o'brien.pdf?sig=a'b&x=$HOME`id`$(id)*;#"
+    executor.write_start_url_file(run_dir, address)
+    prompt = executor.render_tcd_prompt(run_dir)
+    opens = re.findall(r'open ("\$\(cat -- .+?/start_url\.txt\)")', prompt)
+    assert len(opens) == 2  # the chained example and step A
+    for expr in opens:
+        assert _sh(shell, f"printf '%s' {expr}") == address
+    for pattern, name in (
+        (r"mkdir -p (.+?/tcd_download)", "tcd_download"),
+        (r"download --latest (.+?/tcd_download)", "tcd_download"),
+        (r"ab -- screenshot (.+?/final\.png)", "final.png"),
+    ):
+        tokens = re.findall(pattern, prompt)
+        assert tokens, pattern
+        for token in tokens:
+            assert _sh(shell, f"printf '%s' {token}") == str(run_dir / name)
+    selftest = executor.render_tcd_selftest_prompt(run_dir)
+    (token,) = re.findall(r"ab -- screenshot (.+?/selftest\.png)", selftest)
+    assert _sh(shell, f"printf '%s' {token}") == str(run_dir / executor.TCD_SELFTEST_SCREENSHOT)
+
+
+def test_an_ordinary_state_folder_is_written_into_the_tcd_prompts_unquoted():
+    prompt = executor.render_tcd_prompt(Path("/home/a/.local/state/paperika/codex_runs/12"))
+    assert 'open "$(cat -- /home/a/.local/state/paperika/codex_runs/12/start_url.txt)"' in prompt
+    assert "mkdir -p /home/a/.local/state/paperika/codex_runs/12/tcd_download" in prompt
+    assert "'/home/a" not in prompt
+
+
+def test_the_start_address_file_raises_no_policy_flag(cfg, cli, monkeypatch, tmp_path):
+    """The file is the bridge's own copy of the request's address, like task.json: a DOI
+    or address that happens to hold a flagged word says nothing about the model."""
+    (tmp_path / executor.START_URL_FILE).write_text("https://doi.org/10.1234/captcha password")
+    (tmp_path / "s.py").write_text("x = 'captcha'\n")
+    assert bridge_app._policy_flags(tmp_path) == ["captcha@s.py"]
+    _ready_state(cfg)
+
+    async def _fake(run_dir, prompt, sandbox_mode, **kw):
+        assert (run_dir / executor.START_URL_FILE).read_text() == "https://doi.org/10.1234/captcha"
+        return executor.ExecResult(kind="gave_up", notes="fake")
+
+    monkeypatch.setattr(bridge_app, "run_codex", _fake)
+    resp = _trial(TestClient(bridge_app.create_app(cfg)), doi="10.1234/captcha")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["policy_flags"] == []
+

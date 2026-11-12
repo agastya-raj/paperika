@@ -167,6 +167,7 @@ _POLICY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 # the model's final report, not the model's scripts).
 _POLICY_SCAN_SKIP = {
     "task.json", "outcome.schema.json", "argv.json", "last_message.txt",
+    executor.START_URL_FILE,  # AGA-1702: the request's own address, not a model script
 }
 _POLICY_SCAN_SUFFIXES = {".py", ".js", ".mjs", ".sh", ".log", ".txt", ".json", ".md", ".html"}
 _POLICY_SCAN_MAX_BYTES = 2_000_000
