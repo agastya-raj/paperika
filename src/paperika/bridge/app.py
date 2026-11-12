@@ -1883,11 +1883,9 @@ async def _run_executor_attempt(
     attempt_id = bridge.write_ahead(
         request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
     )
-    executor.write_task_json(
-        run_dir, doi=doi, title=title,
-        start_url=executor.shell_safe_url(start_url) if tcd else start_url,
-    )
+    executor.write_task_json(run_dir, doi=doi, title=title, start_url=start_url)
     if tcd:
+        executor.write_start_url_file(run_dir, start_url)
         prompt = executor.render_tcd_prompt(run_dir)
         session = tcd_browser.session_name(str(request_id), driver)
         tcd_kw: dict[str, Any] = {"env": tcd_browser.session_env(session, sock), "tcd": True}
@@ -2361,11 +2359,9 @@ async def _trial_locked(
     resolved = False
     try:
         trial_url = f"https://doi.org/{doi}"
-        executor.write_task_json(
-            run_dir, doi=doi, title=title,
-            start_url=executor.shell_safe_url(trial_url) if tcd else trial_url,
-        )
+        executor.write_task_json(run_dir, doi=doi, title=title, start_url=trial_url)
         if tcd:
+            executor.write_start_url_file(run_dir, trial_url)
             prompt = executor.render_tcd_prompt(run_dir, download_dir=trial_dl)
             session = tcd_browser.session_name(f"trial{attempt_id}", driver)
             tcd_kw: dict[str, Any] = {

@@ -290,7 +290,7 @@ How the tool behaves (read this before your first command):
   command stays cleared in the next).
 - Steps that depend on each other must therefore be CHAINED IN ONE shell
   command, joined with ";" or "&&", e.g.
-    T=/home/agastya/.local/bin/tcd-browser; $T ab -- open '<url>'; $T ab -- get url; $T ab -- get title
+    T=/home/agastya/.local/bin/tcd-browser; $T ab -- open "$(cat {run_dir}/start_url.txt)"; $T ab -- get url; $T ab -- get title
 - Element refs (@e3 and so on) printed by snapshot -i are valid only inside
   the same shell command that printed them, so you cannot choose one after
   reading it. Work by ADDRESS instead, as below.
@@ -303,8 +303,13 @@ How the tool behaves (read this before your first command):
       (copies the newest download into a local directory)
 
 The working method:
-  A. Look: ONE command opens start_url, waits out a challenge page if there
-     is one (below), and prints what you need to choose: get url, get title,
+  A. Look: ONE command opens the start address, waits out a challenge page
+     if there is one (below), and prints what you need to choose. Open the
+     start address ONLY in this exact form, which hands the client the
+     address byte for byte without the shell reading it:
+       open "$(cat {run_dir}/start_url.txt)"
+     (the file holds start_url; never type or paste start_url into a command
+     yourself). Then print: get url, get title,
      and the candidate PDF links as text and href, e.g. with
        eval 'Array.from(document.querySelectorAll("a")).filter(a => /pdf/i.test(a.href + " " + a.textContent)).map(a => a.textContent.trim().slice(0, 80) + " | " + a.href).join(" || ")'
      or with snapshot -i. A later command may look again at any address you
@@ -398,15 +403,18 @@ Hard rules (non-negotiable, no budget or judgment overrides these):
 - Never read, print or copy the CLI's key file (~/.config/tcd_browser/key) or
   any cookies or stored credentials (no eval of document.cookie,
   localStorage or sessionStorage).
-- Shell quoting: every address and every piece of JavaScript you pass to the
-  client goes in SINGLE quotes, never in double quotes and never unquoted,
-  so the shell expands nothing. The text inside those quotes must contain no
-  single quote: in an address write %27 in its place (start_url in task.json
-  already has this done; do it yourself for any address read from a page);
-  in JavaScript use double quotes for strings. A CSS selector inside your
-  JavaScript must contain no single quote, double quote or backslash; if the
-  one you need does, select another way (by tag, attribute or position).
-  Put no other text from task.json or from a page into a shell command.
+- Shell quoting: the start address is opened only from its file, in the
+  exact form given in step A. Every OTHER address (one you read from a
+  page) and every piece of JavaScript you pass to the client goes in SINGLE
+  quotes, never in double quotes and never unquoted, so the shell expands
+  nothing. Never change an address. If an address contains a single quote,
+  write that one character as '\\'' (close the quote, an escaped quote,
+  reopen the quote), so the client still receives the address unchanged. In
+  JavaScript use double quotes for strings, so it holds no single quote. A
+  CSS selector inside your JavaScript must contain no single quote, double
+  quote or backslash; if the one you need does, select another way (by tag,
+  attribute or position). Put no other text from task.json or from a page
+  into a shell command.
 - Never touch or list other tabs, and never open a second tab: work only in
   your own session.
 - Do not close your session or tab: the bridge closes it after you finish.
@@ -771,11 +779,16 @@ def build_argv(
     ]
 
 
-def shell_safe_url(url: str) -> str:
-    """AGA-1702: in TCD mode the model writes shell commands that carry addresses in
-    single quotes, so an address must hold no single quote. ``%27`` is the same
-    address to a server. Used for the ``start_url`` a TCD-mode run is given."""
-    return url.replace("'", "%27")
+START_URL_FILE = "start_url.txt"
+
+
+def write_start_url_file(run_dir: Path, start_url: str) -> None:
+    """AGA-1702: in TCD mode the model writes shell commands. The start address comes
+    from the request, so the model never types it: the TCD prompt opens it as
+    ``"$(cat {run_dir}/start_url.txt)"``, which hands the client the exact bytes with
+    no shell expansion and without altering the address. Written without a trailing
+    newline; the address itself is never rewritten."""
+    (run_dir / START_URL_FILE).write_text(start_url, encoding="utf-8")
 
 
 def write_task_json(run_dir: Path, *, doi: str, title: str, start_url: str) -> None:

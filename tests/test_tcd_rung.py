@@ -455,14 +455,15 @@ def test_tcd_prompt_is_static_apart_from_run_dir(tmp_path):
     "never login, view, run, mcp, upload, ticket or key", "~/.config/tcd_browser/key",
     "document.cookie", "Never touch or list other tabs", "Do not close your session or tab",
     "goes in SINGLE quotes, never in double quotes and never unquoted",
-    "in an address write %27 in its place", "in JavaScript use double quotes for strings",
+    "Never change an address", "In JavaScript use double quotes for strings",
+    "the start address is opened only from its file",
     "Put no other text from task.json or from a page into a shell command",
     # the tool's real model: a fresh tab per shell command, chained steps, by address
     "EACH SHELL COMMAND YOU RUN STARTS WITH A FRESH, BLANK TAB",
     "Only the browser's cookies and its downloads folder persist between commands",
     "Steps that depend on each other must therefore be CHAINED IN ONE shell command",
     "valid only inside the same shell command that printed them",
-    "Work by ADDRESS instead", "A. Look: ONE command opens start_url", "B. Fetch: ONE command",
+    "Work by ADDRESS instead", "A. Look: ONE command opens the start address", "B. Fetch: ONE command",
     "the open, the click", "IN THE SAME COMMAND as the last page it should show",
 ])
 def test_tcd_prompt_holds_the_rules(phrase):
@@ -998,9 +999,12 @@ def _trial(client, **over):
 def _fake_trial_codex(seen: list):
     async def _fake(run_dir, prompt, sandbox_mode, **kw):
         seen.append({"run_dir": run_dir, "prompt": prompt, **kw})
+        url_file = run_dir / executor.START_URL_FILE
+        _fake.start_files.append(url_file.read_text() if url_file.exists() else None)
         path = run_dir / "downloads" / "trial.pdf"
         _make_pdf(path, doi=DOI, title=TITLE)
         return executor.ExecResult(kind="downloaded", file_path=str(path), notes="ok")
+    _fake.start_files = []
     return _fake
 
 
@@ -1008,11 +1012,14 @@ def test_trial_in_tcd_mode(cfg, cli, monkeypatch, chrome_calls):
     _ready_state(cfg)  # production stays local: trials pick the browser per request
     chrome_calls["ok"] = False  # the local Chrome is not needed
     seen: list = []
-    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(seen))
+    fake = _fake_trial_codex(seen)
+    monkeypatch.setattr(bridge_app, "run_codex", fake)
     resp = _trial(TestClient(bridge_app.create_app(cfg)))
     body = resp.json()
     assert resp.status_code == 200, resp.text
     assert body["browser"] == "tcd" and body["gate"] == "pass"
+    # the start address reaches the model as a file, exact and with no trailing newline
+    assert fake.start_files == [f"https://doi.org/{DOI}"]
     con = _conn(cfg)
     att = con.execute("SELECT id, strategy FROM paper_attempts").fetchone()
     con.close()
@@ -1043,9 +1050,11 @@ def test_trial_tcd_claude_and_local_trial_unchanged(cfg, cli, monkeypatch):
     con.commit()
     con.close()
     seen: list = []
-    monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(seen))
+    fake = _fake_trial_codex(seen)
+    monkeypatch.setattr(bridge_app, "run_codex", fake)
     resp = _trial(client, browser="local")
     assert resp.status_code == 200 and resp.json()["browser"] == "local"
+    assert fake.start_files == [None]  # a local trial gets no start-address file
     assert "env" not in seen[0] and "tcd" not in seen[0]
     assert _strategies(cfg)[-1] == "trial_codex" and len(_releases(cli())) == 1
 
@@ -2164,19 +2173,14 @@ def test_a_symlinked_fallback_root_is_refused(tmp_path, monkeypatch):
 # --- pass-7 fixes: shell quoting, and a screenshot that cannot be cleared ------------------
 
 
-def test_shell_safe_url_leaves_no_single_quote():
-    hostile = "https://example.org/a'; printf MARKER; #"
-    assert "'" not in executor.shell_safe_url(hostile)
-    assert executor.shell_safe_url(hostile) == "https://example.org/a%27; printf MARKER; #"
-    plain = "https://doi.org/10.1364/ofc.2025.m1j.5"
-    assert executor.shell_safe_url(plain) == plain
-
-
 def test_tcd_prompt_single_quotes_every_address_and_script():
     prompt = executor.render_tcd_prompt(Path("/tmp/run"))
     # No example hands JavaScript or an address to the shell in double quotes or bare.
     assert 'eval "' not in prompt
-    assert "open '<url>'" in prompt and "open <url>;" not in prompt
+    # The start address is never typed: it is opened from the file the bridge wrote.
+    assert 'open "$(cat /tmp/run/start_url.txt)"' in prompt
+    assert "open '<url>'" not in prompt and "%27" not in prompt
+    assert "'\\''" in prompt  # the POSIX escape for a quote inside single quotes
     for line in prompt.splitlines():
         if "eval '" in line and "<js>" not in line:
             body = line.split("eval '", 1)[1].rsplit("'", 1)[0]
@@ -2211,26 +2215,36 @@ def test_selftest_fails_before_any_run_when_the_old_screenshot_cannot_be_cleared
 
 
 @pytest.mark.parametrize("tcd", [True, False])
-def test_only_a_tcd_run_gets_a_start_url_without_a_single_quote(cfg, cli, monkeypatch, tcd):
-    """TCD mode: the model writes shell commands, so the address it is handed holds no
-    single quote. Local mode's task.json is exactly what main writes."""
+def test_the_start_address_is_never_rewritten_and_a_tcd_run_gets_it_as_a_file(
+    cfg, cli, monkeypatch, tcd
+):
+    """The model never types the start address in TCD mode: the bridge writes it, byte
+    for byte, to start_url.txt, and the prompt opens it from there. task.json is what main
+    writes in both modes, and local mode gets no extra file."""
     _ready_state(cfg)
     if tcd:
         _tcd_cfg(cfg)
-    hostile = "https://pub.example/a'; printf MARKER; #"
-    written: list[str] = []
+    hostile = "https://pub.example/o'brien.pdf?sig=a'; printf MARKER; #"
+    seen: list[dict] = []
 
     async def _fake(run_dir, prompt, sandbox_mode, **kw):
-        written.append(json.loads((run_dir / "task.json").read_text())["start_url"])
+        url_file = run_dir / executor.START_URL_FILE
+        seen.append({
+            "task": json.loads((run_dir / "task.json").read_text())["start_url"],
+            "file": url_file.read_text() if url_file.exists() else None,
+            "prompt": prompt, "run_dir": run_dir,
+        })
         return executor.ExecResult(kind="gave_up", notes="fake")
 
     monkeypatch.setattr(bridge_app, "run_codex", _fake)
     client = TestClient(bridge_app.create_app(cfg))
     client.post("/download", headers=_auth(),
                 json={"doi": DOI, "title": TITLE, "source_url": hostile})
-    assert len(written) == 1
+    assert len(seen) == 1
+    assert seen[0]["task"] == hostile  # never rewritten, in either mode
     if tcd:
-        assert "'" not in written[0] and written[0] == executor.shell_safe_url(written[0])
-        assert "%27" in written[0]
+        assert seen[0]["file"] == hostile  # exact bytes, no trailing newline
+        assert f'open "$(cat {seen[0]["run_dir"]}/start_url.txt)"' in seen[0]["prompt"]
+        assert hostile not in seen[0]["prompt"]  # the prompt stays static
     else:
-        assert "'" in written[0]
+        assert seen[0]["file"] is None
