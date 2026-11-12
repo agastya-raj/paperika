@@ -440,3 +440,122 @@ network, no codex `models_cache.json`, which is client-version filtered and omit
 `codex.reasoning_effort` (`executor.CODEX_REASONING_EFFORT`, `"high"`) and `claude.model`
 (`executor.CLAUDE_MODEL`). The daily KC watcher compares them with the Sol tier named in the
 canon; on a bump, change the constant and `POST /selftest/codex`.
+
+## Tier 3 through the TCD browser (AGA-1702)
+
+Tier 3's executors (codex, then the claude fallback) can drive the **TCD browser** — a
+long-lived real Chrome with a shared, signed-in profile on another university host, reached
+only through the `tcd-browser` CLI at `/home/agastya/.local/bin/tcd-browser` — instead of the
+local managed Chrome. Elsevier, tiers 1-2, the identity gate, the outcome taxonomy and the
+request budget are unchanged.
+
+- **Setting:** `PAPERIKA_TIER3_BROWSER` = `local` (default) | `tcd` (`PaperikaConfig.tier3_browser`).
+  Readiness is **per driver**: a driver is TCD-ready when the CLI exists, a cached
+  `tcd-browser status` (60 s cache, 5 s timeout) reports `gateway … ok=True` and
+  `browser shared=up`, and that driver's OWN `POST /selftest/tcd` passed within
+  `SELFTEST_MAX_AGE_DAYS` (14). With the setting on `tcd`, tier 3:
+  - codex armed and TCD-ready: today's chain in TCD mode; claude takes over on the usual
+    fallback kinds only if claude is TCD-ready too, else there is no fallback in that request
+    (a request never mixes a TCD run with a local one);
+  - codex not TCD-ready (or unable to run) but claude TCD-ready and able to run: claude alone
+    in TCD mode, codex skipped;
+  - no TCD-ready driver can run: the local Chrome exactly as before, the reason logged once.
+- **Prompt:** `executor.TCD_PROMPT_TEMPLATE`, static apart from `{run_dir}` like the local one
+  (task data stays in `task.json`). It keeps the goal, data rule, access judgement, PDF
+  finding, per-paper budget, report and `final.png`, and swaps in the CLI mechanics: challenge
+  pages are waited out (10 s, at most three times, never clicked); the PDF href is opened
+  directly rather than fighting an overlay; a download is taken only if it appeared after the
+  executor's own action, copied with `download --latest` into `{run_dir}/tcd_download`, then
+  moved to `<download dir>/<sanitized-doi>.pdf` and checked for `%PDF-`. Hard rules: no login,
+  credentials, CAPTCHA, terms or forms; only doi.org and the paper's publisher; no CLI
+  subcommand besides `ab`, `downloads`, `download --latest`; never the key file or cookies;
+  never other tabs; never close the session.
+- **Spawn:** env `TCD_BROWSER_SESSION=paperika-<request id>-<driver>` (trials
+  `paperika-trial<attempt id>-<driver>`) and `AGENT_BROWSER_SOCKET_DIR=<socket dir>`. The CLI's
+  `ab` drives an agent-browser daemon whose unix socket otherwise lands in `~/.agent-browser`,
+  which the codex sandbox cannot write; the bridge creates a private (0700) socket dir per run,
+  exclusively (an existing dir is never reused; a collision picks a new name), `<run_dir>/ab`,
+  or, when a socket in it would pass the 107-BYTE unix path limit (measured with
+  `os.fsencode`; budget: the daemon's 34-byte `tcd-<session[:16]>-<lease[:8]>.sock` + 4 bytes
+  margin; trial run dirs are too long), a short `~/.cache/tcd_browser/paperika-ab/<8 hex>`.
+  Production creates it ONCE, in the tier-3 selection, and hands it on (a claude fallback gets
+  a fresh one, or no fallback); if creation fails for any reason the request runs local with
+  the reason logged, and a request that then never reaches an executor removes it. A trial or
+  selftest that cannot have one answers `503 tcd_unavailable` before any ledger row. Creation
+  opens the parent `O_DIRECTORY | O_NOFOLLOW` (a symlinked or non-directory parent is refused),
+  creates the child exclusively with `os.mkdir(name, 0o700, dir_fd=...)` (a taken name is never
+  reused; bounded retries) and closes the parent descriptor before returning a plain path.
+  **The bridge never removes these dirs**: `<run_dir>/ab` stays in the kept per-request run
+  dir, trials and selftests leave their short `~/.cache/tcd_browser/paperika-ab/<8 hex>`.
+  After a normal close a dir holds two small files (`.config`, `.target`); an early exit
+  leaves it empty. They may be deleted by hand when no run is active. Every trusted bridge
+  call for that session (the tab read, the release) passes the same dir. The codex `workspace-write` sandbox gains exactly one extra writable root,
+  `~/.cache/tcd_browser` (the CLI's session files, and the short socket-dir fallback). Secret
+  stripping is unchanged. Claude gets no new tool.
+- **Lease:** the bridge runs `tcd-browser ab --session <name> --close` (20 s timeout, best
+  effort, logged) after every TCD-mode executor run, whatever its outcome or exception.
+  `ab --close` always exits 0, so the close is classified only from an exact, whole-output
+  match: exit 0 and a stripped stderr of exactly ONE line that fully matches `tcd-browser:
+  released lease <16 lowercase hex>`, `tcd-browser: lease <16 lowercase hex> left to expire`
+  or `tcd-browser: no active session '<the exact session name the bridge passed>'`. Anything
+  else (several lines, extra text, another session, a non-zero exit, a timeout, no CLI) is
+  unclassified (lease metadata the executor can write must not forge a line). The outcome
+  only drives logging (one warning for `left to expire`: the lease is held until it idles
+  out, ~10 min), one retry after 2 s when unclassified (then one warning with the session and
+  the dir), and the selftest rule: a TCD selftest records a pass only when its own close was
+  `released lease`. The bridge reads, lists and deletes nothing in the socket dir and signals
+  no process.
+  Cancellation: a cancelled TCD-mode executor's process group is killed and reaped (10 s)
+  before the cancellation propagates, so it cannot re-open the session after the release. The
+  whole close (`tcd_browser.close_session`) is shielded. When the executor already returned a
+  result, a cancellation that arrives during the close is held until that result is persisted
+  (the attempt row, the latch, the driver's selftest fields), then re-raised; when the executor
+  itself was cancelled, the close finishes and the cancellation is re-raised. The bridge's own
+  CLI calls are killed on cancellation too. Local-mode cancellation is unchanged.
+- **Local Chrome:** a TCD-mode tier 3 does not require it and is never followed by the local
+  Chrome recovery; the pre-flight and tier 2 keep their Chrome rules.
+- **Recording and limits:** attempts are `tcd_codex` / `tcd_claude` (trials `trial_tcd_codex`
+  / `trial_tcd_claude`). `limits.RATE_POOLS` makes each share the spacing and daily cap of
+  the local driver's strategy (`codex_bridge`, `claude_bridge`, `trial_codex`,
+  `trial_claude`); all four join the global LLM spacing. No extra attempt is ever added.
+- **`POST /selftest/tcd`** (token, lock; `?driver=codex|claude`, default codex when armed
+  else claude): fresh status check (`503 tcd_unavailable` when down), then one executor opens
+  https://example.org through the CLI and reports, through `OUTCOME_SCHEMA` (both drivers),
+  `gave_up` with notes `TCD_TITLE=` / `TCD_URL=`. The result is recorded for the driver that
+  ran only (`tcd_<driver>_last_selftest_ok/at`). It passes only when (a) the run completed
+  normally (that `gave_up`; never timeout, `executor_died`, auth, quota or budget), (b) the
+  pair is exactly `Example Domain` and `https://example.org/` (or without the slash), and
+  (c) the bridge's own `tcd-browser ab --session <name> -- get url` (20 s, made after the run
+  and before the release) reads the expected URL: the two strings are public constants, (c)
+  is evidence a model cannot supply. The bridge releases the lease.
+- **`/healthz` `tcd` block** (authenticated tier only): `configured_mode`, `cli_present`,
+  `gateway {ok, shared_up, error, probe_age_seconds}` (probed only when the configured mode is
+  `tcd` and the CLI exists; null otherwise), `tcd_usable` (true when the browser answers and
+  at least one driver is TCD-ready; null in local mode), `drivers.{codex,claude}`
+  `{last_selftest_ok, last_selftest_at, selftest_fresh}`, `attempts_today` per TCD strategy,
+  `claude_cost_usd` and
+  `trial_claude_cost_usd` month-to-date.
+- **Trials:** `/admin/trial` takes `browser: "local"|"tcd"` (default local, `422
+  invalid_browser`); `tcd` needs that trial's own driver to be TCD-ready (`503
+  tcd_unavailable`), skips the Chrome
+  pre-flight, uses the trial's private download dir, and the response carries `browser`.
+
+### The codex latch re-arms itself (AGA-1702)
+
+When a `/download` reaches the tier-3 gate with codex off or its selftest stale
+(`codex_usable` false), a selftest has run before (`last_selftest_at` set), the persisted mode
+is not `bypass`, no selftest (manual or automatic) started in the last 24 h, codex's rate rule
+allows it, the codex pool has room today for the selftest AND the paper attempt after it, and
+the local Chrome is up, the bridge runs the selftest's `workspace-write` variant alone
+(`executor.run_selftest_sandboxed`, wall capped at 180 s and within the request budget; skipped
+when tier 3 would be left under `FALLBACK_MIN_SECONDS`). It never runs the bypass variant and
+never persists `bypass`: a host that needs bypass still needs the manual `POST
+/selftest/codex`, which is unchanged. The launch is a ledger row on the current request,
+strategy `codex_selftest`, pooled with `codex_bridge`: it spends the same DAILY CAP but is
+left out of every spacing computation (`check_rate`'s pooled spacing and the global LLM
+spacing; spacing is about paper attempts, `limits.SPACING_EXEMPT`), resolved
+`selftest_ok` / `selftest_failed` (`interrupted` on a cancel); it never carries a screenshot,
+is never wall evidence, and the startup sweep closes it without salvaging through it.
+`codex_rearm_attempted_at` is written before it runs. A pass sets `sandbox_mode=workspace-write`
+as `POST /selftest/codex` would; a failure records `last_selftest_ok=false` and leaves
+`sandbox_mode` as it was, clearing it only on `codex_auth`. It never runs from `/healthz`.

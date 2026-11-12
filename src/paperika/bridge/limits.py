@@ -43,13 +43,40 @@ RATE_RULES: dict[str, tuple[int, int]] = {
     "trial_claude": (0, 60),
 }
 
+# AGA-1702: a tier-3 attempt through the TCD browser is recorded under its own
+# strategy name but spends the SAME budget as a local-Chrome attempt by the same
+# driver: ``check_rate`` on either name counts the rows of both (one clock, one
+# daily cap). Maps each TCD strategy to the strategy whose rule and budget it shares.
+RATE_POOLS: dict[str, str] = {
+    "tcd_codex": "codex_bridge",
+    "tcd_claude": "claude_bridge",
+    "trial_tcd_codex": "trial_codex",
+    "trial_tcd_claude": "trial_claude",
+    # The automatic codex latch re-arm (app._maybe_rearm_codex) is a codex launch
+    # too: its ledger row spends the codex pool like a paper attempt.
+    "codex_selftest": "codex_bridge",
+}
+# The re-arm's ledger strategy; never a paper attempt (no PDF, no screenshot).
+CODEX_SELFTEST_STRATEGY = "codex_selftest"
+# Spacing is about PAPER attempts; selftests have never been part of it (the manual
+# ones write no row at all). A codex_selftest row therefore spends the pooled DAILY
+# CAP but is left out of every spacing computation: check_rate's pooled spacing and
+# the global LLM spacing (check_llm_spacing) used by trials. The paper attempt that
+# follows a re-arm, and later requests, are not cooled down by it.
+SPACING_EXEMPT: frozenset[str] = frozenset({CODEX_SELFTEST_STRATEGY})
+
 # AGA-1461: every LLM-driven strategy, production and trial. ``check_llm_spacing``
 # applies ONE shared clock across them so a trial and a production run never overlap
 # the provider rate limits. Production's own check_rate stays per-strategy and never
 # sees trial rows.
-LLM_STRATEGIES: tuple[str, ...] = ("codex_bridge", "claude_bridge", "trial_codex", "trial_claude")
+LLM_STRATEGIES: tuple[str, ...] = (
+    "codex_bridge", "claude_bridge", "trial_codex", "trial_claude",
+    # AGA-1702: the TCD-mode twins of all four (the re-arm row is spacing-exempt).
+    *(s for s in RATE_POOLS if s not in SPACING_EXEMPT),
+)
 LLM_SPACING_SECONDS = 180
 TRIAL_STRATEGIES: tuple[str, ...] = ("trial_codex", "trial_claude")
+TCD_STRATEGIES: tuple[str, ...] = ("tcd_codex", "tcd_claude", "trial_tcd_codex", "trial_tcd_claude")
 # SQL fragment: excludes trial rows from the whole-ledger (strategy=None) counts so
 # the production totals never include bake-off attempts.
 _NOT_TRIAL = "COALESCE(strategy, '') NOT LIKE 'trial\\_%' ESCAPE '\\'"
@@ -164,25 +191,46 @@ def check_rate(
     """Per-strategy pre-flight spacing + daily-cap gate. Consults ONLY attempts of
     ``strategy``. Called inside the lock, BEFORE the write-ahead row is inserted (so
     a rejection never starts the clock). ``min_spacing_seconds``/``daily_cap`` fall
-    back to that strategy's ``RATE_RULES`` entry when not explicitly overridden."""
+    back to that strategy's ``RATE_RULES`` entry when not explicitly overridden.
+    AGA-1702: a strategy in a ``RATE_POOLS`` pair is checked against its owner's rule
+    over the rows of the whole pool (e.g. codex_bridge + tcd_codex)."""
     now = now or utc_now()
-    default_spacing, default_cap = RATE_RULES.get(strategy, (MIN_SPACING_SECONDS, DAILY_CAP))
+    owner = RATE_POOLS.get(strategy, strategy)
+    members = pool_members(strategy)
+    default_spacing, default_cap = RATE_RULES.get(owner, (MIN_SPACING_SECONDS, DAILY_CAP))
     if min_spacing_seconds is None:
         min_spacing_seconds = default_spacing
     if daily_cap is None:
         daily_cap = default_cap
 
-    last = most_recent_attempt_start(conn, strategy=strategy)
+    starts = [most_recent_attempt_start(conn, strategy=m) for m in members
+              if m not in SPACING_EXEMPT]
+    last = max((s for s in starts if s is not None), default=None)
     if last is not None:
         elapsed = (now - last).total_seconds()
         if elapsed < min_spacing_seconds:
             retry_after = int(min_spacing_seconds - elapsed) + 1
             return RateDecision(False, "cooldown", retry_after)
 
-    if attempts_today(conn, strategy, now=now) >= daily_cap:
+    if sum(attempts_today(conn, m, now=now) for m in members) >= daily_cap:
         return RateDecision(False, "daily_cap")
 
     return RateDecision(True)
+
+
+def pool_members(strategy: str) -> tuple[str, ...]:
+    """``strategy``'s rate pool: its owner plus every strategy pooled with it."""
+    owner = RATE_POOLS.get(strategy, strategy)
+    return (owner, *(alias for alias, own in RATE_POOLS.items() if own == owner))
+
+
+def pool_room_today(
+    conn: sqlite3.Connection, strategy: str, *, now: datetime | None = None
+) -> int:
+    """Launches left today under ``strategy``'s pooled daily cap."""
+    owner = RATE_POOLS.get(strategy, strategy)
+    cap = RATE_RULES.get(owner, (MIN_SPACING_SECONDS, DAILY_CAP))[1]
+    return cap - sum(attempts_today(conn, m, now=now) for m in pool_members(strategy))
 
 
 def check_llm_spacing(

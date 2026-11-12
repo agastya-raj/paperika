@@ -10,6 +10,7 @@ executor.py.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -37,7 +38,7 @@ from ..db import Database
 from ..downloader import Downloader
 from ..models import LocateCandidate, ManualIntervention, ParsedInput
 from ..notifications import NotificationEvent, emit_notification_event
-from . import chrome, elsevier_api, executor, limits
+from . import chrome, elsevier_api, executor, limits, tcd_browser
 from .direct_fetch import attempt_direct_fetch
 from .executor import run_claude, run_codex
 from .scripted_browser import attempt_scripted_fetch
@@ -128,6 +129,9 @@ class TrialRequest(BaseModel):
     model: str
     effort: str | None = None
     max_budget_usd: float | None = None
+    # AGA-1702: "tcd" runs the same trial through the TCD browser (bake-off before
+    # production's tier3_browser is switched).
+    browser: str = "local"
 
 
 TRIAL_MODELS: dict[str, frozenset[str]] = {
@@ -179,6 +183,15 @@ class BridgeState(BaseModel):
     claude_last_selftest_at: str | None = None
     # AGA-1462: latched on a 401 from the Elsevier API, cleared on the next 200.
     elsevier_key_invalid: bool = False
+    # AGA-1702: POST /selftest/tcd results PER DRIVER: a driver runs tier 3 in TCD
+    # mode only while its own result is a fresh pass.
+    tcd_codex_last_selftest_ok: bool | None = None
+    tcd_codex_last_selftest_at: str | None = None
+    tcd_claude_last_selftest_ok: bool | None = None
+    tcd_claude_last_selftest_at: str | None = None
+    # AGA-1702: when /download last ran the codex selftest itself to re-arm a
+    # latched-off or stale codex (at most once per CODEX_REARM_INTERVAL).
+    codex_rearm_attempted_at: str | None = None
 
 
 # --- bridge state (persisted) ---------------------------------------------
@@ -622,7 +635,9 @@ def startup_sweep(bridge: Bridge) -> None:
             window_end = _utc_now()
 
         salvaged = False
-        if doi or title:
+        # AGA-1702: a codex_selftest row (the latch re-arm) never downloads, so it
+        # is never a salvage window; it is closed 'interrupted' like any other.
+        if (doi or title) and row["strategy"] != limits.CODEX_SELFTEST_STRATEGY:
             located = bridge._locate_in_window(window_start, window_end)
             if located and bridge._mechanical_gates(located):
                 ok, _reason = bridge.verify_identity(doi=doi, title=title, path=located)
@@ -776,6 +791,225 @@ def _claude_ready(state: BridgeState) -> bool:
     return bool(executor.anthropic_api_key()) and state.claude_last_selftest_ok is not False
 
 
+# --- AGA-1702: the TCD browser as tier 3's browser ------------------------
+
+TIER3_BROWSERS = ("local", "tcd")
+TCD_DRIVERS = ("codex", "claude")
+
+
+def _tcd_driver_reason(state: BridgeState, driver: str) -> str | None:
+    """None when ``driver``'s OWN TCD selftest passed within the window codex's
+    freshness uses, else why not. A driver runs tier 3 in TCD mode only on its own
+    pass: a claude pass never puts codex in TCD mode, nor the reverse."""
+    ok = getattr(state, f"tcd_{driver}_last_selftest_ok")
+    if ok is None:
+        return "no TCD selftest has run (POST /selftest/tcd)"
+    if ok is False:
+        return "the last TCD selftest failed"
+    last_at = _parse_iso(getattr(state, f"tcd_{driver}_last_selftest_at"))
+    if last_at is None or not (
+        timedelta(0) <= _utc_now() - last_at <= timedelta(days=SELFTEST_MAX_AGE_DAYS)
+    ):
+        return f"the TCD selftest is older than {SELFTEST_MAX_AGE_DAYS} days"
+    return None
+
+
+async def _tcd_browser_reason() -> str | None:
+    """None when the CLI exists and the cached status probe reports the gateway ok
+    and the shared browser up, else why not."""
+    if not tcd_browser.cli_present():
+        return "tcd-browser CLI not found"
+    status = await tcd_browser.probe_status()
+    if status.error:
+        return f"status probe: {status.error}"
+    if not status.gateway_ok:
+        return "gateway not ok"
+    if not status.shared_up:
+        return "shared browser not up"
+    return None
+
+
+async def _tcd_not_ready_reason(state: BridgeState, driver: str) -> str | None:
+    """Readiness of ONE driver in TCD mode (trials): CLI, its own fresh selftest, then
+    the cached status probe."""
+    if not tcd_browser.cli_present():
+        return "tcd-browser CLI not found"
+    reason = _tcd_driver_reason(state, driver)
+    if reason is not None:
+        return f"{driver}: {reason}"
+    return await _tcd_browser_reason()
+
+
+def _configured_tier3_browser(config: PaperikaConfig) -> str:
+    return (config.tier3_browser or "").strip().lower()
+
+
+async def _select_tier3_browser(
+    bridge: Bridge, state: BridgeState, *, codex_can: bool, claude_can: bool,
+    ensure_request: Callable[[], tuple[int, Path]],
+) -> tuple[bool, bool, bool, Path | None]:
+    """THIS request's tier-3 browser, decided once at the tier-3 gate. Returns
+    ``(tcd, codex_tcd, claude_tcd, socket_dir)``: whether tier 3 runs in TCD mode
+    (then with the run's agent-browser socket dir, created HERE: if that fails for any
+    reason the request runs local like any other not-ready reason), and which
+    drivers are TCD-ready (own fresh TCD selftest AND the browser answering), reported
+    even when tier 3 falls back to local so the caller does not blame a local Chrome
+    a TCD-ready driver would not need. ``codex_can`` / ``claude_can``: the driver
+    could run this request at all (armed / key, rate rule).
+
+    TCD mode is used when a TCD-ready driver can run: codex first when it is TCD-ready
+    and can run, with claude as its fallback only if claude is TCD-ready too; else
+    claude alone in TCD mode. A request never mixes a TCD run with a local one.
+    Otherwise the local Chrome, exactly as before, with the reason logged once."""
+    local: tuple[bool, bool, bool, Path | None] = (False, False, False, None)
+    mode = _configured_tier3_browser(bridge.config)
+    if mode == "local":
+        return local
+    if mode != "tcd":
+        logger.warning("tier 3 browser: unknown tier3_browser %r; using the local Chrome", mode)
+        return local
+
+    def _fallback(reason: str) -> tuple[bool, bool, bool, Path | None]:
+        logger.warning(
+            "tier 3 browser: tcd configured but not ready (%s); using the local Chrome", reason
+        )
+        return local
+
+    if not tcd_browser.cli_present():
+        return _fallback("tcd-browser CLI not found")
+    reasons = {d: _tcd_driver_reason(state, d) for d in TCD_DRIVERS}
+    if all(reasons.values()):
+        why = "; ".join(f"{d}: {reasons[d]}" for d in TCD_DRIVERS)
+        return _fallback(f"no driver is TCD-ready ({why})")
+    browser = await _tcd_browser_reason()
+    if browser is not None:
+        return _fallback(browser)
+    codex_tcd, claude_tcd = reasons["codex"] is None, reasons["claude"] is None
+    if not ((codex_tcd and codex_can) or (claude_tcd and claude_can)):
+        why = "; ".join(
+            f"{d}: {reasons[d] or 'TCD-ready but cannot run this request'}" for d in TCD_DRIVERS
+        )
+        _fallback(f"no TCD-ready driver can run ({why})")
+        return False, codex_tcd, claude_tcd, None
+    # The run's agent-browser socket dir, created once, here, on the real run dir (the
+    # request is materialized for it; tier 3 needs it anyway). Any failure: local.
+    _request_id, run_dir = ensure_request()
+    socket_dir = tcd_browser.make_socket_dir(run_dir)  # never raises
+    if socket_dir is None:
+        return _fallback(
+            "no agent-browser socket dir could be created within the unix socket path limit"
+        )
+    if codex_tcd and codex_can and claude_can and not claude_tcd:
+        logger.warning(
+            "tier 3 browser: tcd for codex; claude is not TCD-ready (%s), so no claude "
+            "fallback in this request", reasons["claude"],
+        )
+    return True, codex_tcd, claude_tcd, socket_dir
+
+
+# --- AGA-1702: the codex readiness latch re-arms itself ---------------------
+
+# A runtime auth error (or a failed/stale selftest) leaves codex off until someone
+# re-runs POST /selftest/codex; it once stayed off nine days after the login was
+# fixed. /download now runs that selftest itself, at most once per this interval.
+CODEX_REARM_INTERVAL = timedelta(hours=24)
+# Wall of the one sandboxed selftest the re-arm runs. A passing selftest measures
+# ~70 s at high effort.
+CODEX_REARM_WALL_SECONDS = 180
+CODEX_REARM_MIN_WALL_SECONDS = 60
+
+
+def _codex_rearm_due(state: BridgeState) -> bool:
+    """Codex is off or stale, a selftest has run before (the FIRST arm stays an
+    operator step: POST /selftest/codex), the persisted mode is not ``bypass`` (the
+    re-arm only ever arms the sandboxed mode, and leaves a bypass state alone), and
+    no selftest, manual or automatic, was attempted within CODEX_REARM_INTERVAL."""
+    if _parse_iso(state.last_selftest_at) is None or _codex_usable(state):
+        return False
+    if state.sandbox_mode == "bypass":
+        return False
+    now = _utc_now()
+    for stamp in (state.last_selftest_at, state.codex_rearm_attempted_at):
+        at = _parse_iso(stamp)
+        if at is not None and timedelta(0) <= now - at < CODEX_REARM_INTERVAL:
+            return False
+    return True
+
+
+async def _maybe_rearm_codex(
+    bridge: Bridge, state: BridgeState, *, deadline: float, chrome_ok: bool, codex_rate_ok: bool,
+    ensure_request: Callable[[], tuple[int, Path]],
+) -> BridgeState:
+    """At the tier-3 gate of a /download (under the lock), run the codex selftest's
+    ``workspace-write`` variant ONCE when ``_codex_rearm_due`` and carry on with its
+    result. It never runs the bypass variant and never persists ``bypass``.
+
+    The launch is a ledger row (``limits.CODEX_SELFTEST_STRATEGY`` on the current
+    request, pooled with codex_bridge), so it spends codex's daily cap; it runs only
+    when the pool has room for it AND the paper attempt after it. Skipped too when
+    codex could not run anyway (rate-blocked), when the selftest could not pass (it
+    drives the LOCAL Chrome, so it needs chrome_ok), and when the request budget
+    cannot fit it and still leave tier 3 a useful wall. Never runs from /healthz."""
+    if not (codex_rate_ok and chrome_ok and _codex_rearm_due(state)):
+        return state
+    with bridge.db.transaction() as conn:
+        room = limits.pool_room_today(conn, "codex_bridge")
+    if room < 2:
+        logger.warning(
+            "codex latch re-arm skipped: the codex pool has room for %d launch(es) today, "
+            "not the selftest plus the paper attempt", max(room, 0),
+        )
+        return state
+    remaining = deadline - MONOTONIC()
+    wall = min(
+        float(CODEX_REARM_WALL_SECONDS),
+        remaining - CLEANUP_RESERVE_SECONDS - FALLBACK_MIN_SECONDS - executor.KILL_GRACE_SECONDS,
+    )
+    if wall < CODEX_REARM_MIN_WALL_SECONDS:
+        logger.info("codex latch re-arm skipped: request budget too short (%.0fs left)", remaining)
+        return state
+    request_id, _run_dir = ensure_request()
+    selftest_dir = bridge.config.db_path.parent / "codex_runs" / "selftest"
+    # Recorded BEFORE the run (state stamp + ledger row), so a crash or cancel
+    # mid-selftest cannot retry it within the interval, and the launch is counted.
+    bridge.state_store.update(codex_rearm_attempted_at=_utc_now().isoformat())
+    attempt_id = bridge.write_ahead(
+        request_id=request_id, paper_id=None, run_dir=str(selftest_dir),
+        strategy=limits.CODEX_SELFTEST_STRATEGY,
+    )
+    logger.warning("codex readiness latch is off or stale; running the sandboxed codex selftest once")
+    try:
+        result = await executor.run_selftest_sandboxed(selftest_dir, wall_seconds=wall)
+    except Exception as exc:
+        logger.exception("codex latch re-arm: the selftest could not run")
+        bridge.resolve_attempt(attempt_id, outcome="selftest_failed",
+                               message=f"selftest could not run: {type(exc).__name__}")
+        return bridge.state_store.load()
+    except BaseException:
+        bridge.resolve_attempt(attempt_id, outcome="interrupted", message="selftest interrupted")
+        raise
+    now_iso = _utc_now().isoformat()
+    if result.ok:
+        # What POST /selftest/codex persists on a pass (the mode is always workspace-write).
+        bridge.state_store.update(
+            sandbox_mode=result.sandbox_mode, last_selftest_ok=True, last_selftest_at=now_iso,
+            last_variant1_failure_reason=None,
+        )
+        bridge.resolve_attempt(attempt_id, outcome="selftest_ok", message="codex latch re-armed")
+        logger.warning("codex latch re-armed (sandbox_mode=%s)", result.sandbox_mode)
+    else:
+        # As POST /selftest/codex on a failure: sandbox_mode is left as it was, except
+        # that a dead login clears it, as a runtime auth_error does.
+        fields: dict[str, Any] = {"last_selftest_ok": False, "last_selftest_at": now_iso}
+        if result.error_code == "codex_auth":
+            fields["sandbox_mode"] = None
+        bridge.state_store.update(**fields)
+        bridge.resolve_attempt(attempt_id, outcome="selftest_failed",
+                               message=f"{result.error_code}: {result.detail}"[:300])
+        logger.warning("codex latch re-arm failed: %s %s", result.error_code, result.detail)
+    return bridge.state_store.load()
+
+
 def _db_usable(db: Database) -> bool:
     """True when the state DB answers a query against the schema it should hold.
     /healthz reported ``ok`` for three days while every /download died on
@@ -832,6 +1066,9 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
         attempts_by_strategy: dict[str, int | None] = {
             strat: None for strat in _STRATEGIES
         }
+        tcd_attempts: dict[str, int | None] = {s: None for s in limits.TCD_STRATEGIES}
+        tcd_claude_cost: float | None = None
+        tcd_trial_cost: float | None = None
         if db_ok:
             with bridge.db.transaction() as conn:
                 downloads_today = limits.attempts_today(conn)
@@ -841,6 +1078,43 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 }
                 claude_cost = limits.month_cost_usd(conn, "claude_bridge")
                 trial_cost = limits.month_cost_usd(conn, "trial_claude")
+                tcd_attempts = {s: limits.attempts_today(conn, s) for s in limits.TCD_STRATEGIES}
+                tcd_claude_cost = limits.month_cost_usd(conn, "tcd_claude")
+                tcd_trial_cost = limits.month_cost_usd(conn, "trial_tcd_claude")
+        # AGA-1702: the CLI's status probe runs only in this authenticated tier, only
+        # when tier3_browser is tcd and the CLI exists (cached
+        # tcd_browser.STATUS_CACHE_TTL_SECONDS). In local mode gateway and tcd_usable
+        # are null: nothing was probed.
+        tcd_cli = tcd_browser.cli_present()
+        tcd_mode = _configured_tier3_browser(bridge.config) == "tcd"
+        tcd_status = await tcd_browser.probe_status() if (tcd_cli and tcd_mode) else None
+        tcd_block = {
+            "configured_mode": bridge.config.tier3_browser,
+            "cli_present": tcd_cli,
+            "gateway": None if tcd_status is None else {
+                "ok": tcd_status.gateway_ok,
+                "shared_up": tcd_status.shared_up,
+                "error": tcd_status.error,
+                "probe_age_seconds": int(tcd_status.age_seconds() or 0),
+            },
+            # True when the browser answers and at least one driver is TCD-ready.
+            "tcd_usable": (
+                None if not tcd_mode
+                else bool(tcd_status and tcd_status.ok
+                          and any(_tcd_driver_reason(state, d) is None for d in TCD_DRIVERS))
+            ),
+            "drivers": {
+                d: {
+                    "last_selftest_ok": getattr(state, f"tcd_{d}_last_selftest_ok"),
+                    "last_selftest_at": getattr(state, f"tcd_{d}_last_selftest_at"),
+                    "selftest_fresh": _tcd_driver_reason(state, d) is None,
+                }
+                for d in TCD_DRIVERS
+            },
+            "attempts_today": tcd_attempts,
+            "claude_cost_usd": tcd_claude_cost,
+            "trial_claude_cost_usd": tcd_trial_cost,
+        }
         body = {
             "status": status,
             "db": {"ok": db_ok, "path": str(bridge.config.db_path)},
@@ -875,6 +1149,7 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 "key_invalid": bool(state.elsevier_key_invalid),
                 "attempts_today": attempts_by_strategy.get("elsevier_api"),
             },
+            "tcd": tcd_block,
             "limits": {
                 "active_request": "locked" if bridge.lock.locked() else None,
                 "downloads_today": downloads_today,
@@ -946,6 +1221,35 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
             if result.error_code == "claude_auth":
                 return _json_error(503, "claude_auth", result.detail, ok=False)
             return _json_error(502, "executor_failed", result.detail, ok=False)
+
+    # --- /selftest/tcd (AGA-1702) ---
+
+    @app.post("/selftest/tcd")
+    async def selftest_tcd(request: Request, driver: str | None = None) -> Response:
+        """One executor in TCD mode opens https://example.org through the CLI and
+        reports its title and URL; passes only on the exact expected pair. Driver:
+        ``?driver=codex|claude``, else codex when its latch is armed, else claude."""
+        denied = require_token(request)
+        if denied is not None:
+            return denied
+        if driver is not None and driver not in TRIAL_MODELS:
+            return _json_error(422, "invalid_driver", "driver must be codex or claude")
+        if not tcd_browser.cli_present():
+            return _json_error(503, "tcd_unavailable", "tcd-browser CLI not found", ok=False)
+        if bridge.lock.locked():
+            return _json_error(429, "busy", "a download or selftest is in progress")
+        async with bridge.lock:
+            state = bridge.state_store.load()
+            api_key = executor.anthropic_api_key()
+            claude_ok = _claude_ready(state) and bool(api_key)
+            if driver is None:
+                driver = "codex" if state.sandbox_mode else ("claude" if claude_ok else None)
+            if driver is None or (driver == "codex" and not state.sandbox_mode):
+                return _json_error(503, "selftest_required", "run POST /selftest/codex first",
+                                   ok=False)
+            if driver == "claude" and not claude_ok:
+                return _json_error(503, "claude_auth", "claude driver is not available", ok=False)
+            return await _tcd_selftest_locked(bridge, driver=driver, state=state, api_key=api_key)
 
     # --- /requests/{id} ---
 
@@ -1082,6 +1386,8 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 )
         elif payload.max_budget_usd is not None:
             return _json_error(422, "invalid_budget", "max_budget_usd applies to claude only")
+        if payload.browser not in TIER3_BROWSERS:
+            return _json_error(422, "invalid_browser", "browser must be local or tcd")
 
         if bridge.lock.locked():
             return _json_error(429, "busy", "a download or trial is in progress")
@@ -1089,7 +1395,7 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
             try:
                 return await _trial_locked(
                     bridge, doi=doi, title=title, driver=driver, model=payload.model,
-                    effort=payload.effort, max_budget_usd=budget,
+                    effort=payload.effort, max_budget_usd=budget, browser=payload.browser,
                 )
             except Exception as exc:  # CancelledError is a BaseException: not caught
                 logger.exception("unhandled exception in /admin/trial (doi=%s)", doi)
@@ -1099,6 +1405,61 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 )
 
     return app
+
+
+async def _tcd_selftest_locked(
+    bridge: Bridge, *, driver: str, state: BridgeState, api_key: str | None,
+) -> Response:
+    """POST /selftest/tcd's run, under the lock (AGA-1702). A result the executor
+    returned is persisted for the driver that ran even when the request is cancelled
+    during the close; that cancellation is re-raised only afterwards."""
+    status = await tcd_browser.probe_status(fresh=True)
+    if not status.ok:
+        why = status.error or ("gateway not ok" if not status.gateway_ok
+                               else "shared browser not up")
+        return _json_error(503, "tcd_unavailable", f"tcd-browser status: {why}", ok=False)
+    run_dir = bridge.config.db_path.parent / "codex_runs" / "selftest_tcd"
+    session = tcd_browser.session_name(f"selftest{int(time.time())}", driver)
+    socket_dir = tcd_browser.make_socket_dir(run_dir)
+    if socket_dir is None:
+        return _json_error(503, "tcd_unavailable",
+                           "no agent-browser socket dir fits the unix socket path limit", ok=False)
+    try:
+        # The bridge's own read of the tab (before the release, through the same socket
+        # dir) is the pass evidence the model cannot fake.
+        result = await executor.run_tcd_selftest(
+            run_dir, driver=driver, env=tcd_browser.session_env(session, socket_dir),
+            read_session_url=functools.partial(tcd_browser.session_url, session, socket_dir),
+            sandbox_mode=state.sandbox_mode, api_key=api_key,
+        )
+    except BaseException:
+        await tcd_browser.close_session(session, socket_dir)
+        raise
+    closed = await tcd_browser.close_session(session, socket_dir, defer_cancel=True)
+    late_cancel = closed.cancelled
+    if result.ok and closed.outcome != tcd_browser.RELEASED:
+        # A pass needs its own lease confirmed released ("left to expire" or an
+        # unclassified close is not that).
+        result = executor.SelftestResult(
+            False, error_code="executor_failed", wall_seconds=result.wall_seconds,
+            detail=f"the selftest's lease could not be confirmed released ({closed.outcome})",
+        )
+    # Only the driver that ran: its pass never makes the other TCD-ready.
+    bridge.state_store.update(**{
+        f"tcd_{driver}_last_selftest_ok": result.ok,
+        f"tcd_{driver}_last_selftest_at": _utc_now().isoformat(),
+    })
+    if late_cancel is not None:
+        raise late_cancel  # only now: the result above is already persisted
+    if result.ok:
+        return JSONResponse(
+            status_code=200,
+            content={"ok": True, "driver": driver, "wall_seconds": round(result.wall_seconds, 2)},
+        )
+    detail = _redact_all(result.detail)
+    if result.error_code in {"codex_auth", "claude_auth"}:
+        return _json_error(503, result.error_code, detail, ok=False, driver=driver)
+    return _json_error(502, "executor_failed", detail, ok=False, driver=driver)
 
 
 async def _chrome_preflight(bridge: Bridge) -> bool:
@@ -1294,8 +1655,27 @@ async def _download_locked(
         tier_kinds.get("direct_fetch") == "wall"
         and tier_kinds.get("scripted_browser") == "wall"
     )
-    codex_ready = rate["codex_bridge"].allowed and bool(state.sandbox_mode) and chrome_ok
-    claude_go = claude_ready and rate["claude_bridge"].allowed and chrome_ok
+    # AGA-1702: re-arm a latched-off / stale codex once per 24 h, then pick the
+    # browser tier 3 drives. A TCD-mode tier 3 does not need the local Chrome (tier 2
+    # above keeps its own Chrome rule).
+    state = await _maybe_rearm_codex(
+        bridge, state, deadline=deadline, chrome_ok=chrome_ok,
+        codex_rate_ok=rate["codex_bridge"].allowed, ensure_request=ensure_request,
+    )
+    codex_can = rate["codex_bridge"].allowed and bool(state.sandbox_mode)
+    claude_can = claude_ready and rate["claude_bridge"].allowed
+    tcd, codex_tcd, claude_tcd, socket_dir = await _select_tier3_browser(
+        bridge, state, codex_can=codex_can, claude_can=claude_can, ensure_request=ensure_request,
+    )
+    browser_ok = tcd or chrome_ok
+    if tcd:
+        # Per-driver readiness: only a TCD-ready driver runs, and never a local one
+        # beside it (no claude fallback when only codex is TCD-ready).
+        codex_ready = codex_can and codex_tcd
+        claude_go = claude_can and claude_tcd
+    else:
+        codex_ready = codex_can and chrome_ok
+        claude_go = claude_can and chrome_ok
     codex_wall = float(executor.EXEC_WALL_SECONDS)
     if codex_ready or claude_go:
         # AGA-1462: the deadline caps codex's wall exactly like claude's. Too little
@@ -1326,7 +1706,8 @@ async def _download_locked(
         return await _run_tier3(
             bridge, request_id=request_id, run_dir=run_dir, doi=doi, title=title,
             start_url=start_url, sandbox_mode=state.sandbox_mode if codex_ready else None,
-            claude_go=claude_go, deadline=deadline, codex_wall=codex_wall,
+            claude_go=claude_go, deadline=deadline, codex_wall=codex_wall, tcd=tcd,
+            socket_dir=socket_dir,
         )
 
     # Codex is unavailable. Both deterministic tiers hitting a wall is the one
@@ -1338,7 +1719,7 @@ async def _download_locked(
         return finalize_if_created(
             _json_error(503, "selftest_required", "run POST /selftest/codex first")
         )
-    if not chrome_ok:
+    if not (browser_ok or codex_tcd):  # a TCD-ready codex never needed the local Chrome
         return finalize_if_created(_json_error(503, "chrome_down", "Chrome CDP unreachable"))
     # codex sandbox + chrome are fine but its strategy is rate-blocked.
     decision = rate["codex_bridge"]
@@ -1424,18 +1805,23 @@ _FALLBACK_KINDS = {"executor_died", "timeout", "auth_error", "codex_quota"}
 async def _run_tier3(
     bridge: Bridge, *, request_id: int, run_dir: Path, doi: str, title: str,
     start_url: str, sandbox_mode: str | None, claude_go: bool, deadline: float,
-    codex_wall: float = float(executor.EXEC_WALL_SECONDS),
+    codex_wall: float = float(executor.EXEC_WALL_SECONDS), tcd: bool = False,
+    socket_dir: Path | None = None,
 ) -> Response:
     """Tier 3 driver chain (AGA-1460): codex first when usable, claude as the
     automatic fallback. ``sandbox_mode=None`` means codex is unusable (no selftest /
-    rate-blocked / chrome) and claude runs directly."""
+    rate-blocked / chrome) and claude runs directly. ``tcd`` (AGA-1702): both
+    drivers use the TCD browser for this request; the first driver gets the socket
+    dir the selection created, a claude fallback a fresh one (none: no fallback)."""
     pending: dict[str, Any] = {}
     if sandbox_mode is not None:
         response = await _run_executor_attempt(
             bridge, driver="codex", request_id=request_id, run_dir=run_dir, doi=doi,
             title=title, start_url=start_url, sandbox_mode=sandbox_mode,
             defer_failure=claude_go, deadline=deadline, pending=pending, codex_wall=codex_wall,
+            tcd=tcd, socket_dir=socket_dir,
         )
+        socket_dir = None  # consumed: codex's close released (and on success removed) it
         if response is not None:
             return response
     # Codex died / is unusable and claude is ready. Re-read the budget NOW — after
@@ -1449,12 +1835,21 @@ async def _run_tier3(
         return _finish_failure(bridge, request_id=request_id, **pending)
     api_key = executor.anthropic_api_key()
     assert api_key  # claude_go implies a key
+    if tcd and socket_dir is None:
+        # The claude FALLBACK in TCD mode needs its own socket dir. If it cannot have
+        # one, there is no fallback (never a local claude beside a TCD codex).
+        socket_dir = tcd_browser.make_socket_dir(run_dir)  # never raises
+        if socket_dir is None:
+            logger.warning("tier 3 browser: no agent-browser socket dir for the claude "
+                           "fallback; codex's failure stands")
+            return _finish_failure(bridge, request_id=request_id, **pending)
     response = await _run_executor_attempt(
         bridge, driver="claude", request_id=request_id, run_dir=run_dir, doi=doi,
         title=title, start_url=start_url, sandbox_mode=None, defer_failure=False,
         api_key=api_key, deadline=deadline,
         claude_wall=max(1.0, min(float(executor.EXEC_WALL_SECONDS),
                                  remaining - CLEANUP_RESERVE_SECONDS)),
+        tcd=tcd, socket_dir=socket_dir,
     )
     assert response is not None
     return response
@@ -1466,30 +1861,65 @@ async def _run_executor_attempt(
     claude_wall: float = float(executor.EXEC_WALL_SECONDS),
     codex_wall: float = float(executor.EXEC_WALL_SECONDS),
     pending: dict[str, Any] | None = None,
+    tcd: bool = False,
+    socket_dir: Path | None = None,
 ) -> Response | None:
     """One tier-3 executor attempt (``driver`` = codex | claude). Writes its own
     write-ahead row, runs the executor, resolves the terminal taxonomy (§2.7) — the
     only tier that produces terminal wrong_paper / throttled / paywalled / bot_wall /
     gave_up classifications. With ``defer_failure`` a fallback-eligible failure
     (executor_died/timeout/auth/quota; salvage already tried) resolves ONLY the
-    attempt row and returns None so the caller can try the next driver."""
-    strategy = f"{driver}_bridge"
+    attempt row and returns None so the caller can try the next driver.
+
+    ``tcd`` (AGA-1702): the run drives the TCD browser instead of the local Chrome.
+    It is recorded as ``tcd_<driver>`` (sharing that driver's rate pool), gets the TCD
+    prompt and its own ``TCD_BROWSER_SESSION``, and the bridge releases that lease
+    itself however the run ends. The local Chrome recovery after a bad outcome is
+    skipped: a TCD-mode run never touched it."""
+    strategy = f"tcd_{driver}" if tcd else f"{driver}_bridge"
+    if tcd:
+        # Created by the tier-3 selection (or _run_tier3 for a claude fallback).
+        assert socket_dir is not None
+        sock: Path = socket_dir
     attempt_id = bridge.write_ahead(
         request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
     )
     executor.write_task_json(run_dir, doi=doi, title=title, start_url=start_url)
-    prompt = executor.PROMPT_TEMPLATE.format(run_dir=str(run_dir))
-    started = _utc_now()
-    if driver == "claude":
-        exec_result = await run_claude(run_dir, prompt, api_key or "", wall_seconds=claude_wall)
-        # Belt and braces (run_claude already redacts): the key never reaches a DB
-        # row, notification or HTTP error detail.
-        exec_result.notes = executor.redact_secret(exec_result.notes, api_key)
+    if tcd:
+        prompt = executor.render_tcd_prompt(run_dir)
+        session = tcd_browser.session_name(str(request_id), driver)
+        tcd_kw: dict[str, Any] = {"env": tcd_browser.session_env(session, sock), "tcd": True}
     else:
-        exec_result = await run_codex(
-            run_dir, prompt, sandbox_mode or "", wall_seconds=codex_wall
-        )
-    ended = _utc_now()
+        prompt = executor.PROMPT_TEMPLATE.format(run_dir=str(run_dir))
+        tcd_kw = {}
+    started = _utc_now()
+    try:
+        if driver == "claude":
+            exec_result = await run_claude(
+                run_dir, prompt, api_key or "", wall_seconds=claude_wall, **tcd_kw
+            )
+            # Belt and braces (run_claude already redacts): the key never reaches a DB
+            # row, notification or HTTP error detail.
+            exec_result.notes = executor.redact_secret(exec_result.notes, api_key)
+        else:
+            exec_result = await run_codex(
+                run_dir, prompt, sandbox_mode or "", wall_seconds=codex_wall, **tcd_kw
+            )
+        ended = _utc_now()
+    except BaseException:
+        if tcd:
+            # The executor itself was interrupted (its group is already dead: run_* kill
+            # on cancel): no result to keep. The close is shielded and re-raises a
+            # cancellation that arrives meanwhile.
+            await tcd_browser.close_session(session, sock)
+        raise
+    # The executor returned: whatever happens during the close, that result is
+    # persisted below (attempt row, latch) BEFORE a cancellation that arrived during
+    # the close is re-raised.
+    late_cancel = (
+        (await tcd_browser.close_session(session, sock, defer_cancel=True)).cancelled
+        if tcd else None
+    )
     screenshot = str(run_dir / "final.png") if (run_dir / "final.png").exists() else None
     if exec_result.cost_usd is not None:
         with bridge.db.transaction() as conn:
@@ -1514,11 +1944,14 @@ async def _run_executor_attempt(
         bridge.state_store.update(sandbox_mode=None, last_selftest_ok=False)
     elif exec_result.kind == "claude_auth":
         bridge.state_store.update(claude_last_selftest_ok=False)
+    if late_cancel is not None:
+        raise late_cancel  # only now: the outcome above is already persisted
 
     # chrome recovery on bad outcomes (still holding the lock). After a claude run
     # that overran the request deadline, skip it: KC has already timed out and the
     # lock must be released; the next request's chrome pre-flight recovers.
-    if bad_outcome or exec_result.kind in {"auth_error", "claude_auth"}:
+    # AGA-1702: never after a TCD-mode run (it did not use the local Chrome).
+    if (bad_outcome or exec_result.kind in {"auth_error", "claude_auth"}) and not tcd:
         if driver == "claude" and MONOTONIC() >= deadline:
             logger.warning(
                 "deferring post-claude chrome recovery to the next request: deadline passed"
@@ -1862,14 +2295,19 @@ def _policy_flags(run_dir: Path) -> list[str]:
 
 async def _trial_locked(
     bridge: Bridge, *, doi: str, title: str, driver: str, model: str,
-    effort: str | None, max_budget_usd: float | None,
+    effort: str | None, max_budget_usd: float | None, browser: str = "local",
 ) -> Response:
     """One bake-off trial (AGA-1461): the named executor alone, same prompt/task.json/
     chrome pre-flight/wall logic as tier 3, scored by the production acceptance +
     identity gate, but leaving NO production state — nothing is linked into
     papers/paper_links, the dedupe cache is never consulted, and the accepted PDF is
-    hashed then deleted. Returns 200 for every outcome that reached a run."""
-    strategy = f"trial_{driver}"
+    hashed then deleted. Returns 200 for every outcome that reached a run.
+
+    ``browser="tcd"`` (AGA-1702): the same trial through the TCD browser, recorded as
+    ``trial_tcd_<driver>`` (sharing ``trial_<driver>``'s cap): TCD prompt and session,
+    no local Chrome pre-flight or recovery, lease released by the bridge."""
+    tcd = browser == "tcd"
+    strategy = f"trial_tcd_{driver}" if tcd else f"trial_{driver}"
     state = bridge.state_store.load()
     api_key: str | None = None
     if driver == "codex":
@@ -1879,6 +2317,10 @@ async def _trial_locked(
         api_key = executor.anthropic_api_key()
         if not _claude_ready(state) or not api_key:
             return _json_error(503, "claude_auth", "claude driver is not available")
+    if tcd:
+        reason = await _tcd_not_ready_reason(state, driver)
+        if reason is not None:
+            return _json_error(503, "tcd_unavailable", f"the TCD browser is not ready: {reason}")
 
     # Rate: the shared GLOBAL LLM spacing (production + trial rows), then the trial's
     # own daily cap. Neither writes a row, so a rejection never starts a clock.
@@ -1891,7 +2333,7 @@ async def _trial_locked(
     if not cap.allowed:
         return _json_error(429, cap.error_code or "daily_cap", "trial daily cap reached")
 
-    if not await _chrome_preflight(bridge):
+    if not tcd and not await _chrome_preflight(bridge):
         return _json_error(503, "chrome_down", "Chrome CDP unreachable")
 
     deadline = MONOTONIC() + REQUEST_BUDGET_SECONDS
@@ -1904,25 +2346,51 @@ async def _trial_locked(
     # BEFORE the write-ahead row, so a filesystem failure here leaves no running attempt.
     trial_dl = run_dir / "downloads"
     trial_dl.mkdir(parents=True, exist_ok=True)
+    if tcd:
+        made = tcd_browser.make_socket_dir(run_dir)
+        if made is None:
+            return _json_error(503, "tcd_unavailable",
+                               "no agent-browser socket dir fits the unix socket path limit")
+        socket_dir: Path = made
     request_id = bridge.trial_ledger_request_id()
     attempt_id = bridge.write_ahead(
         request_id=request_id, paper_id=None, run_dir=str(run_dir), strategy=strategy
     )
+    resolved = False
     try:
         executor.write_task_json(run_dir, doi=doi, title=title, start_url=f"https://doi.org/{doi}")
-        prompt = executor.render_prompt(run_dir, download_dir=trial_dl)
-        started = _utc_now()
-        if driver == "claude":
-            exec_result = await run_claude(
-                run_dir, prompt, api_key or "", wall_seconds=wall, model=model,
-                max_budget_usd=max_budget_usd, effort=effort,
-            )
+        if tcd:
+            prompt = executor.render_tcd_prompt(run_dir, download_dir=trial_dl)
+            session = tcd_browser.session_name(f"trial{attempt_id}", driver)
+            tcd_kw: dict[str, Any] = {
+                "env": tcd_browser.session_env(session, socket_dir), "tcd": True,
+            }
         else:
-            exec_result = await run_codex(
-                run_dir, prompt, state.sandbox_mode or "", wall_seconds=wall,
-                model=model, effort=effort, download_dir=trial_dl,
-            )
-        ended = _utc_now()
+            prompt = executor.render_prompt(run_dir, download_dir=trial_dl)
+            tcd_kw = {}
+        started = _utc_now()
+        try:
+            if driver == "claude":
+                exec_result = await run_claude(
+                    run_dir, prompt, api_key or "", wall_seconds=wall, model=model,
+                    max_budget_usd=max_budget_usd, effort=effort, **tcd_kw,
+                )
+            else:
+                exec_result = await run_codex(
+                    run_dir, prompt, state.sandbox_mode or "", wall_seconds=wall,
+                    model=model, effort=effort, download_dir=trial_dl, **tcd_kw,
+                )
+            ended = _utc_now()
+        except BaseException:
+            if tcd:
+                await tcd_browser.close_session(session, socket_dir)
+            raise
+        # A returned result is recorded below even when the trial is cancelled during
+        # the close; that cancellation is re-raised only afterwards.
+        late_cancel = (
+            (await tcd_browser.close_session(session, socket_dir, defer_cancel=True)).cancelled
+            if tcd else None
+        )
         exec_result.notes = _redact_all(exec_result.notes)
         final_url = _redact_all(exec_result.final_url) or None
         kind = exec_result.kind
@@ -1973,6 +2441,7 @@ async def _trial_locked(
             screenshot_path=str(run_dir / "final.png") if (run_dir / "final.png").exists() else None,
             current_url=final_url,
         )
+        resolved = True
         if exec_result.cost_usd is not None:
             with bridge.db.transaction() as conn:
                 limits.record_attempt_cost(conn, attempt_id, exec_result.cost_usd)
@@ -1982,11 +2451,13 @@ async def _trial_locked(
             bridge.state_store.update(sandbox_mode=None, last_selftest_ok=False)
         elif kind == "claude_auth":
             bridge.state_store.update(claude_last_selftest_ok=False)
+        if late_cancel is not None:
+            raise late_cancel  # only now: the outcome above is already recorded
 
         # Chrome recovery after a bad outcome, exactly like production: skipped past
         # the deadline for claude (latched for the next request's pre-flight).
         bad_outcome = kind in {"timeout", "gave_up", "executor_died", "claude_budget"}
-        if bad_outcome or kind in {"auth_error", "claude_auth"}:
+        if (bad_outcome or kind in {"auth_error", "claude_auth"}) and not tcd:
             if driver == "claude" and MONOTONIC() >= deadline:
                 logger.warning("deferring post-trial chrome recovery: deadline passed")
                 bridge.recovery_pending = True
@@ -1998,6 +2469,7 @@ async def _trial_locked(
         body = {
             "trial_id": trial_id,
             "driver": driver,
+            "browser": browser,
             "model": model,
             "effort": effort,
             "kind": kind,
@@ -2017,11 +2489,14 @@ async def _trial_locked(
         return JSONResponse(status_code=200, content=body)
     except BaseException:
         # A crash/cancel after the write-ahead row: close it so it does not sit
-        # 'running' until the next restart (it still counts toward spacing + caps).
-        try:
-            bridge.resolve_attempt(attempt_id, outcome="interrupted", message="trial aborted")
-        except Exception:
-            logger.exception("could not close the trial attempt row")
+        # 'running' until the next restart (it still counts toward spacing + caps). A TCD
+        # trial's row already resolved with the run's real outcome is left as it is; a
+        # local trial behaves exactly as before (always 'interrupted').
+        if not (tcd and resolved):
+            try:
+                bridge.resolve_attempt(attempt_id, outcome="interrupted", message="trial aborted")
+            except Exception:
+                logger.exception("could not close the trial attempt row")
         raise
 
 
