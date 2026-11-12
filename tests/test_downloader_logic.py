@@ -1198,7 +1198,8 @@ REFERENCE_LINK_BYTES = (
 )
 
 
-def _identity_downloader(tmp_path: Path, monkeypatch, pdf_bytes: bytes, text: str, head: str):
+def _identity_downloader(tmp_path: Path, monkeypatch, pdf_bytes: bytes, page: str):
+    """`page` is the text of page 1 (pdftotext -f 1 -l 1); pages 1-2 text is the same."""
     config = build_config(tmp_path)
     config.ensure_runtime_dirs()
     db = Database.from_config(config)
@@ -1206,125 +1207,116 @@ def _identity_downloader(tmp_path: Path, monkeypatch, pdf_bytes: bytes, text: st
     downloader = StubDownloader(config, db)
     pdf_path = config.download_dir / "case.pdf"
     pdf_path.write_bytes(pdf_bytes)
-    monkeypatch.setattr(downloader, "_extract_pdf_text", lambda path, max_chars=20000: text)
-    monkeypatch.setattr(downloader, "_extract_pdf_head", lambda path, max_chars=1000: head, raising=False)
+    monkeypatch.setattr(downloader, "_extract_pdf_text", lambda path, max_chars=20000: page)
+    monkeypatch.setattr(downloader, "_extract_pdf_head", lambda path, max_chars=1000: page[:max_chars], raising=False)
     return downloader, pdf_path
 
 
-@pytest.mark.parametrize(
-    ("requested", "observed"),
-    [
-        (
-            "Simultaneous monitoring of 8 fiber routes by means of high-speed switching for time-sharing FDM-DAS",
-            "Simultaneous monitoring of 8 fiber routes by means of highspeed switching for time-sharing FDM-DAS",
-        ),
-        (
-            "ANN-Based Transfer Learning for QoT Prediction in Real-Time Mixed Line-Rate Systems",
-            "ANN-Based Transfer Learning for QoT Prediction in RealTime Mixed Line-Rate Systems",
-        ),
-    ],
-)
-def test_title_containment_tolerates_lost_hyphen(tmp_path: Path, requested: str, observed: str):
-    config = build_config(tmp_path)
-    config.ensure_runtime_dirs()
-    db = Database.from_config(config)
-    db.init()
-    downloader = StubDownloader(config, db)
-    assert downloader._text_contains_normalized_title(requested, f"Header\n{observed}\nAuthors") is True
+def _verify(downloader, pdf_path, doi: str = OFC_DOI, title: str = OFC_TITLE):
+    return downloader._verify_downloaded_pdf_identity(infer_input(f"{title} {doi}"), pdf_path)
 
 
-def test_title_containment_squashed_route_needs_25_chars(tmp_path: Path):
-    config = build_config(tmp_path)
-    config.ensure_runtime_dirs()
-    db = Database.from_config(config)
-    db.init()
-    downloader = StubDownloader(config, db)
-    # 20 squashed characters: the lost hyphen is not forgiven.
-    assert downloader._text_contains_normalized_title("Real-Time QoT Estimate", "RealTime QoT Estimate") is False
-    # The plain route still works for short titles.
-    assert downloader._text_contains_normalized_title("Short Title", "x Short Title y") is True
-    assert downloader._text_contains_normalized_title("Short Title", "x Other Title y") is False
+def _rejected_for_conflict(result, observed: str, doi: str = OFC_DOI):
+    assert result.ok is False
+    assert result.reason == f"expected DOI {doi} but observed {observed}"
 
 
-def test_hyperlink_doi_first_title_at_page_head_is_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    downloader, pdf_path = _identity_downloader(
-        tmp_path, monkeypatch, REFERENCE_LINK_BYTES,
-        text=f"M1J.5\nOFC 2025\n{OFC_TITLE}\nbody",
-        head=f"M1J.5\nOFC 2025 (c) Optica Publishing Group 2025\n{OFC_TITLE}\nAuthors",
+def test_meeting_paper_accepted_on_code_year_and_title(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = (
+        "M1J.5\nOFC 2025 \u00a9 Optica Publishing Group 2025\n"
+        "QoT Estimation with Margin-Driven Transfer\nLearning in Time-Varying Optical Networks\nAuthors"
     )
-    result = downloader._verify_downloaded_pdf_identity(infer_input(f"{OFC_TITLE} {OFC_DOI}"), pdf_path)
+    d, p = _identity_downloader(tmp_path, monkeypatch, REFERENCE_LINK_BYTES, page)
+    result = _verify(d, p)
     assert result.ok is True
-    assert "head of page 1" in result.reason
-    assert downloader._extract_pdf_identity(pdf_path)[1] is None
+    assert result.reason.startswith("Matched the Optica meeting paper code, year and requested title")
 
 
-def test_hyperlink_doi_first_title_only_in_references_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    downloader, pdf_path = _identity_downloader(
-        tmp_path, monkeypatch, REFERENCE_LINK_BYTES,
-        text=f"A different paper on routing\nbody\n[12] {OFC_TITLE}, OFC 2025.",
-        head="A different paper on routing\nSome Author",
+def test_meeting_paper_accepted_with_lost_hyphen_and_no_doi(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    title = "Simultaneous monitoring of 8 fiber routes by means of high-speed switching for time-sharing FDM-DAS"
+    page = (
+        "Th1I.2\nOFC 2025 \u00a9 Optica Publishing Group 2025\n"
+        "Simultaneous monitoring of 8 fiber routes by means of highspeed switching for time-sharing FDM-DAS"
     )
-    result = downloader._verify_downloaded_pdf_identity(infer_input(f"{OFC_TITLE} {OFC_DOI}"), pdf_path)
-    assert result.ok is False
-    assert "hyperlink" in result.reason and "head of page 1" in result.reason
+    d, p = _identity_downloader(tmp_path, monkeypatch, b"%PDF-1.4\n", page)
+    assert _verify(d, p, "10.1364/ofc.2025.th1i.2", title).ok is True
 
 
-def test_citing_paper_with_hyperlink_to_requested_doi_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    # The hole: the first DOI in the bytes is a hyperlink to the REQUESTED DOI.
-    link = b"%PDF-1.4\n<<\n/S/URI\n/URI(https://doi.org/10.1364/ofc.2025.m1j.5)\n>>\n"
-    downloader, pdf_path = _identity_downloader(
-        tmp_path, monkeypatch, link,
-        text=f"A citing paper\nbody\nReferences\n[3] {OFC_TITLE}",
-        head="A citing paper\nSome Author",
-    )
-    result = downloader._verify_downloaded_pdf_identity(infer_input(f"{OFC_TITLE} {OFC_DOI}"), pdf_path)
-    assert result.ok is False
+def test_meeting_paper_accepted_with_pdf_suffix_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    title = "ANN-Based Transfer Learning for QoT Prediction in Real-Time Mixed Line-Rate Systems"
+    page = "W4F.3.pdf\nOFC 2018 \u00a9 OSA 2018\nANN-Based Transfer Learning for QoT Prediction in RealTime Mixed Line-Rate Systems"
+    d, p = _identity_downloader(tmp_path, monkeypatch, b"%PDF-1.4\n", page)
+    assert _verify(d, p, "10.1364/ofc.2018.w4f.3", title).ok is True
 
 
-def test_hyperlink_doi_also_printed_in_page_text_is_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    link = b"%PDF-1.4\n<<\n/S/URI\n/URI(https://doi.org/10.1364/ofc.2025.m1j.5)\n>>\n"
-    downloader, pdf_path = _identity_downloader(
-        tmp_path, monkeypatch, link,
-        text=f"{OFC_TITLE}\nhttps://doi.org/{OFC_DOI}",
-        head="unrelated head",
-    )
-    result = downloader._verify_downloaded_pdf_identity(infer_input(f"{OFC_TITLE} {OFC_DOI}"), pdf_path)
-    assert result.ok is True
+NETWORKS = "10.1364/networks.2020.nem3b.2"
+GOOD_HEAD = f"M1J.5\nOFC 2025 (c) Optica 2025\n{OFC_TITLE}\nAuthors\n"
 
 
-def test_hyperlink_doi_is_never_promoted_even_after_a_later_doi(tmp_path: Path):
-    config = build_config(tmp_path)
-    config.ensure_runtime_dirs()
-    db = Database.from_config(config)
-    db.init()
-    downloader = StubDownloader(config, db)
-    pdf_path = config.download_dir / "later.pdf"
-    pdf_path.write_bytes(
-        b"%PDF-1.4\n/URI (https://doi.org/10.1364/NETWORKS.2020.NeM3B.2)\n"
-        b"<< /Subject (doi:10.1364/ofc.2025.m1j.5) >>\n"
-    )
-    assert downloader._extract_pdf_identity(pdf_path)[1] is None
-    assert downloader._pdf_leads_with_hyperlink_doi(pdf_path) is True
+def test_comment_on_title_with_own_doi_in_link_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = f"Comment on {OFC_TITLE}\nA. Author\n"
+    d, p = _identity_downloader(tmp_path, monkeypatch, b"%PDF-1.4\n/URI(https://doi.org/10.1364/oe.999999)\n", page)
+    _rejected_for_conflict(_verify(d, p), "10.1364/oe.999999")
 
 
-def test_non_link_first_doi_that_differs_is_still_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    downloader, pdf_path = _identity_downloader(
-        tmp_path, monkeypatch, b"%PDF-1.4\n<< /Subject (doi:10.1364/networks.2020.nem3b.2) >>\n",
-        text=f"{OFC_TITLE}\nbody", head=OFC_TITLE,
-    )
-    result = downloader._verify_downloaded_pdf_identity(infer_input(f"{OFC_TITLE} {OFC_DOI}"), pdf_path)
-    assert result.ok is False
-    assert result.reason == f"expected DOI {OFC_DOI} but observed 10.1364/networks.2020.nem3b.2"
+def test_title_quoted_in_unrelated_abstract_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = f"A different paper\nAbstract: we extend {OFC_TITLE} to new cases.\n"
+    d, p = _identity_downloader(tmp_path, monkeypatch, b"%PDF-1.4\n/URI(https://doi.org/10.1364/oe.999999)\n", page)
+    _rejected_for_conflict(_verify(d, p), "10.1364/oe.999999")
 
 
-def test_licence_doi_link_is_not_a_hyperlink_lead(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    # A licence DOI inside /URI keeps its own branch (running-head guard), not the hyperlink one.
-    downloader, pdf_path = _identity_downloader(
-        tmp_path, monkeypatch, b"%PDF-1.4\n<< /URI (https://doi.org/10.1364/OA_License_v1) >>\n",
-        text=f"{OFC_TITLE}\nbody", head=OFC_TITLE,
-    )
-    assert downloader._pdf_leads_with_hyperlink_doi(pdf_path) is False
-    assert downloader._pdf_leads_with_licence_doi(pdf_path) is True
-    result = downloader._verify_downloaded_pdf_identity(infer_input(f"{OFC_TITLE} {OFC_DOI}"), pdf_path)
-    assert result.ok is False
-    assert "licence-DOI" in result.reason
+def test_same_title_journal_version_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = f"{OFC_TITLE}\nJournal of Optical Communications and Networking, 2026\n"
+    d, p = _identity_downloader(tmp_path, monkeypatch, b"%PDF-1.4\n/URI(https://doi.org/10.1364/jocn.123456)\n", page)
+    _rejected_for_conflict(_verify(d, p), "10.1364/jocn.123456")
+
+
+def test_comment_marker_does_not_hide_a_metadata_doi(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = f"{OFC_TITLE}\nSome Author\n"
+    pdf = b"%PDF-1.4\n% /URI(\n<< /Subject (doi:10.1364/oe.999999) >>\n"
+    d, p = _identity_downloader(tmp_path, monkeypatch, pdf, page)
+    assert d._extract_pdf_identity(p)[1] == "10.1364/oe.999999"
+    _rejected_for_conflict(_verify(d, p), "10.1364/oe.999999")
+
+
+def test_meeting_paper_with_conflicting_doi_printed_on_page_one_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    page = GOOD_HEAD + "x" * 1200 + "\nhttps://doi.org/10.1364/oe.999999\n"
+    d, p = _identity_downloader(tmp_path, monkeypatch, b"%PDF-1.4\n/Subject (doi:10.1364/oe.999999)\n", page)
+    _rejected_for_conflict(_verify(d, p), "10.1364/oe.999999")
+
+
+def test_meeting_paper_with_wrong_year_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = GOOD_HEAD.replace("2025", "2024")
+    d, p = _identity_downloader(tmp_path, monkeypatch, REFERENCE_LINK_BYTES, page)
+    _rejected_for_conflict(_verify(d, p), NETWORKS)
+
+
+def test_meeting_paper_code_inside_longer_token_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = GOOD_HEAD.replace("M1J.5", "XM1J.52")
+    d, p = _identity_downloader(tmp_path, monkeypatch, REFERENCE_LINK_BYTES, page)
+    _rejected_for_conflict(_verify(d, p), NETWORKS)
+
+
+def test_meeting_paper_with_other_title_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = "M1J.5\nOFC 2025\nAn entirely different title about fibre amplifiers and noise\n"
+    d, p = _identity_downloader(tmp_path, monkeypatch, REFERENCE_LINK_BYTES, page)
+    _rejected_for_conflict(_verify(d, p), NETWORKS)
+
+
+def test_old_style_journal_doi_never_takes_meeting_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    doi = "10.1364/oe.20.001798"
+    assert downloader_module.OPTICA_CONFERENCE_DOI.match(doi) is None
+    assert downloader_module.OPTICA_CONFERENCE_DOI.match("10.1364/jocn.409538") is None
+    page = f"2012 1798\n{OFC_TITLE}\n"
+    d, p = _identity_downloader(tmp_path, monkeypatch, REFERENCE_LINK_BYTES, page)
+    _rejected_for_conflict(_verify(d, p, doi), NETWORKS, doi)
+
+
+def test_non_optica_doi_with_meeting_like_suffix_never_takes_meeting_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    doi = "10.1109/ofc.2025.m1j.5"
+    d, p = _identity_downloader(tmp_path, monkeypatch, REFERENCE_LINK_BYTES, GOOD_HEAD)
+    _rejected_for_conflict(_verify(d, p, doi), NETWORKS, doi)
