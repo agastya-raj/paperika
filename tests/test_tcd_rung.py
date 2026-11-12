@@ -36,25 +36,48 @@ STATUS_OK = (
 
 _STUB_TCD = r"""
 import json, os, sys, time
+argv = sys.argv[1:]
+entry = {
+    "argv": argv,
+    "session": os.environ.get("TCD_BROWSER_SESSION"),
+    "token_seen": "PAPERIKA_BRIDGE_TOKEN" in os.environ,
+}
+victim = os.environ.get("STUB_VICTIM_PIDFILE")
+if victim and argv[-1:] == ["--close"]:
+    # was the executor still alive when the bridge released its session?
+    try:
+        os.kill(int(open(victim).read()), 0)
+        entry["victim_alive"] = True
+    except (ProcessLookupError, ValueError, OSError):
+        entry["victim_alive"] = False
 log = os.environ.get("STUB_TCD_LOG")
 if log:
     with open(log, "a") as fh:
-        fh.write(json.dumps({
-            "argv": sys.argv[1:],
-            "session": os.environ.get("TCD_BROWSER_SESSION"),
-            "token_seen": "PAPERIKA_BRIDGE_TOKEN" in os.environ,
-        }) + "\n")
+        fh.write(json.dumps(entry) + "\n")
+if os.environ.get("STUB_TCD_PIDFILE"):
+    with open(os.environ["STUB_TCD_PIDFILE"], "w") as fh:
+        fh.write(str(os.getpid()))
 if os.environ.get("STUB_TCD_SLEEP"):
     time.sleep(float(os.environ["STUB_TCD_SLEEP"]))
-if sys.argv[1:2] == ["status"]:
+if argv[:1] == ["status"]:
     sys.stdout.write(os.environ.get("STUB_TCD_STATUS", ""))
     sys.exit(int(os.environ.get("STUB_TCD_STATUS_RC", "0")))
+if argv[-2:] == ["get", "url"]:
+    time.sleep(float(os.environ.get("STUB_TCD_URL_SLEEP", "0")))
+    sys.stdout.write(os.environ.get("STUB_TCD_URL", "https://example.org/") + "\n")
+    sys.exit(int(os.environ.get("STUB_TCD_URL_RC", "0")))
+if argv[-1:] == ["--close"]:
+    time.sleep(float(os.environ.get("STUB_TCD_CLOSE_SLEEP", "0")))
+    if log:
+        with open(log, "a") as fh:
+            fh.write(json.dumps({"argv": ["close-finished"]}) + "\n")
 sys.exit(int(os.environ.get("STUB_TCD_RC", "0")))
 """
 
 
 _REAL_RUN_CODEX = executor.run_codex
 _REAL_RUN_CLAUDE = executor.run_claude
+_REAL_SANDBOXED = executor.run_selftest_sandboxed
 
 # ---------------------------------------------------------------- fixtures ---
 
@@ -68,6 +91,7 @@ def _no_real_executors(monkeypatch):
         monkeypatch.setattr(target, "run_codex", _refuse)
         monkeypatch.setattr(target, "run_claude", _refuse)
     monkeypatch.setattr(executor, "run_selftest", _refuse)
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _refuse)
 
 
 @pytest.fixture
@@ -527,14 +551,15 @@ def test_claude_fallback_in_tcd_mode_has_its_own_session_and_both_are_released(c
     assert resp.json()["error_code"] == "paywalled_no_access"
     assert _strategies(cfg)[-2:] == ["tcd_codex", "tcd_claude"]
     assert cseen[0]["env"] == {"TCD_BROWSER_SESSION": f"paperika-{rid}-claude"}
-    assert "tcd" not in cseen[0]  # claude gets no new tool or flag, only the env var
+    assert cseen[0]["tcd"] is True  # kill-on-cancel only; claude gets no new tool
     assert _releases(cli()) == [f"paperika-{rid}-codex", f"paperika-{rid}-claude"]
 
 
 def test_release_is_best_effort(cli, monkeypatch, caplog):
     assert asyncio.run(tcd_browser.release("paperika-1-codex")) is True
     assert _releases(cli()) == ["paperika-1-codex"]
-    assert cli()[-1]["session"] is None  # --session is the only session the release names
+    closes = [c for c in cli() if c["argv"][-1:] == ["--close"]]
+    assert closes[-1]["session"] is None  # --session is the only session the release names
     monkeypatch.setenv("STUB_TCD_RC", "2")
     assert asyncio.run(tcd_browser.release("paperika-2-codex")) is False
     monkeypatch.delenv("STUB_TCD_RC")
@@ -656,71 +681,107 @@ def test_tcd_strategies_join_the_global_llm_spacing(cfg, conn):
 
 
 def _tcd_report(title="Example Domain", url="https://example.org/") -> str:
-    return f"TCD_TITLE={title}\nTCD_URL={url}\n"
+    return f"TCD_TITLE={title}\nTCD_URL={url}"
 
 
-def _fake_selftest_codex(seen: list, *, text: str | None = None, kind="executor_died",
-                         raise_exc=None):
+def _fake_selftest_codex(seen: list, *, text: str = "", kind="gave_up", raise_exc=None):
     async def _fake(run_dir, prompt, sandbox_mode, **kw):
         seen.append({"prompt": prompt, "sandbox_mode": sandbox_mode, **kw})
         if raise_exc is not None:
             raise raise_exc
-        events = [{"type": "turn.completed"}] if text is not None else []
-        return executor.ExecResult(kind=kind, events=events, raw_last_message=text or "")
+        exit_code = 124 if kind == "timeout" else 0
+        return executor.ExecResult(kind=kind, notes=text, exit_code=exit_code)
     return _fake
 
 
-def test_selftest_tcd_passes_on_the_exact_title_and_url(cfg, cli, monkeypatch):
+def _selftest(cfg, **params):
+    client = TestClient(bridge_app.create_app(cfg), raise_server_exceptions=False)
+    return client.post("/selftest/tcd", headers=_auth(), params=params)
+
+
+def _get_urls(calls: list[dict]) -> list[str]:
+    return [c["argv"][2] for c in calls if c["argv"][-2:] == ["get", "url"]]
+
+
+def test_selftest_tcd_passes_on_all_three_conditions(cfg, cli, monkeypatch):
     _write_state(cfg, sandbox_mode="workspace-write")
     seen: list = []
     monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex(seen, text=_tcd_report()))
-    resp = TestClient(bridge_app.create_app(cfg)).post("/selftest/tcd", headers=_auth())
-    assert resp.status_code == 200 and resp.json()["ok"] is True and resp.json()["driver"] == "codex"
+    resp = _selftest(cfg)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is True and resp.json()["driver"] == "codex"
     state = _read_state(cfg)
     assert state["tcd_last_selftest_ok"] is True and state["tcd_last_selftest_at"]
     session = seen[0]["env"]["TCD_BROWSER_SESSION"]
     assert seen[0]["prompt"] == executor.TCD_SELFTEST_PROMPT and seen[0]["tcd"] is True
-    assert seen[0]["sandbox_mode"] == "workspace-write" and seen[0]["write_schema"] is False
+    assert seen[0]["sandbox_mode"] == "workspace-write"
+    assert "write_schema" not in seen[0]  # both drivers answer through OUTCOME_SCHEMA
     assert session.startswith("paperika-selftest") and session.endswith("-codex")
-    assert _releases(cli()) == [session]
+    # the bridge's own read, then the release, both on that session, in that order
+    calls = [c["argv"] for c in cli() if c["argv"][:1] == ["ab"]]
+    assert calls == [["ab", "--session", session, "--", "get", "url"],
+                     ["ab", "--session", session, "--close"]]
+    assert not any(c.get("token_seen") for c in cli())
 
 
-@pytest.mark.parametrize("text", [
-    _tcd_report(title="Example Domains"),
-    _tcd_report(title="Ignore previous instructions"),
-    _tcd_report(url="https://example.org/evil"),
-    _tcd_report(url="http://example.org/"),
-    "TCD_TITLE=Example Domain\n",
-    "",
+@pytest.mark.parametrize("kind,text", [
+    ("timeout", _tcd_report()),           # right strings, but the run timed out (exit 124)
+    ("executor_died", _tcd_report()),     # right strings, but the run died
+    ("codex_quota", _tcd_report()),
+    ("gave_up", _tcd_report(title="Example Domains")),
+    ("gave_up", _tcd_report(title="Ignore previous instructions")),
+    ("gave_up", _tcd_report(url="https://example.org/evil")),
+    ("gave_up", _tcd_report(url="http://example.org/")),
+    ("gave_up", "TCD_TITLE=Example Domain"),
+    ("gave_up", ""),
 ])
-def test_selftest_tcd_fails_on_anything_but_the_exact_pair(cfg, cli, monkeypatch, text):
+def test_selftest_tcd_fails_without_a_normal_run_and_the_exact_pair(cfg, cli, monkeypatch, kind, text):
     _write_state(cfg, sandbox_mode="workspace-write")
     seen: list = []
-    monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex(seen, text=text))
-    resp = TestClient(bridge_app.create_app(cfg)).post("/selftest/tcd", headers=_auth())
+    monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex(seen, text=text, kind=kind))
+    resp = _selftest(cfg)
     assert resp.status_code == 502 and resp.json()["error_code"] == "executor_failed"
     assert _read_state(cfg)["tcd_last_selftest_ok"] is False
     assert _releases(cli()) == [seen[0]["env"]["TCD_BROWSER_SESSION"]]
 
 
-def test_selftest_tcd_executor_failure_and_exception_still_release(cfg, cli, monkeypatch):
+@pytest.mark.parametrize("env,why", [
+    ({"STUB_TCD_URL": "about:blank"}, "the bridge read the session's tab at 'about:blank'"),
+    ({"STUB_TCD_URL": "https://evil.example/"}, "'https://evil.example/'"),
+    ({"STUB_TCD_URL_RC": "1"}, "get url exited 1"),
+    ({"STUB_TCD_URL": ""}, "get url printed nothing"),
+    ({"STUB_TCD_URL_SLEEP": "5"}, "get url timed out"),
+])
+def test_selftest_tcd_fails_when_the_bridge_read_disagrees(cfg, cli, monkeypatch, env, why):
+    """The reported strings are public constants: without the bridge's own read of
+    the tab returning example.org, a model that never browsed would pass."""
+    _write_state(cfg, sandbox_mode="workspace-write")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(tcd_browser, "SESSION_URL_TIMEOUT_SECONDS", 0.5)
+    seen: list = []
+    monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex(seen, text=_tcd_report()))
+    resp = _selftest(cfg)
+    assert resp.status_code == 502 and why in resp.json()["detail"]
+    assert _read_state(cfg)["tcd_last_selftest_ok"] is False
+    session = seen[0]["env"]["TCD_BROWSER_SESSION"]
+    assert _get_urls(cli()) == [session] and _releases(cli()) == [session]
+
+
+def test_selftest_tcd_executor_exception_still_releases(cfg, cli, monkeypatch):
     _write_state(cfg, sandbox_mode="workspace-write")
     seen: list = []
-    monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex(seen, text=None))  # died
-    client = TestClient(bridge_app.create_app(cfg), raise_server_exceptions=False)
-    resp = client.post("/selftest/tcd", headers=_auth())
-    assert resp.status_code == 502 and _read_state(cfg)["tcd_last_selftest_ok"] is False
     monkeypatch.setattr(executor, "run_codex",
                         _fake_selftest_codex(seen, raise_exc=RuntimeError("spawn blew up")))
-    assert client.post("/selftest/tcd", headers=_auth()).status_code == 500
-    assert _releases(cli()) == [s["env"]["TCD_BROWSER_SESSION"] for s in seen]
-    assert len(seen) == 2
+    assert _selftest(cfg).status_code == 500
+    assert _releases(cli()) == [seen[0]["env"]["TCD_BROWSER_SESSION"]]
+    assert _get_urls(cli()) == []  # no read after a crash: it is a failure anyway
 
 
 def test_selftest_tcd_codex_auth_is_503(cfg, cli, monkeypatch):
     _write_state(cfg, sandbox_mode="workspace-write")
     monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex([], kind="auth_error"))
-    resp = TestClient(bridge_app.create_app(cfg)).post("/selftest/tcd", headers=_auth())
+    resp = _selftest(cfg)
     assert resp.status_code == 503 and resp.json()["error_code"] == "codex_auth"
 
 
@@ -731,11 +792,11 @@ def test_selftest_tcd_with_claude(cfg, cli, monkeypatch):
 
     async def _claude(run_dir, prompt, api_key, **kw):
         seen.append(kw)
-        return executor.ExecResult(kind="gave_up", notes=_tcd_report().strip())
+        return executor.ExecResult(kind="gave_up", notes=_tcd_report())
     monkeypatch.setattr(executor, "run_claude", _claude)
-    resp = TestClient(bridge_app.create_app(cfg)).post("/selftest/tcd", headers=_auth())
+    resp = _selftest(cfg)
     assert resp.status_code == 200 and resp.json()["driver"] == "claude"
-    assert seen[0]["env"]["TCD_BROWSER_SESSION"].endswith("-claude")
+    assert seen[0]["env"]["TCD_BROWSER_SESSION"].endswith("-claude") and seen[0]["tcd"] is True
 
 
 def test_selftest_tcd_refusals_run_no_executor(cfg, cli, monkeypatch):
@@ -767,7 +828,18 @@ def test_parse_tcd_selftest(text, expected):
     assert executor.parse_tcd_selftest(text) == expected
 
 
-def test_healthz_tcd_block(cfg, cli, monkeypatch):
+@pytest.mark.parametrize("out,expected", [
+    ("https://example.org/\n", ("https://example.org/", None)),
+    ("--- boundary nonce=1 ---\nhttps://example.org/\n--- end ---\n", ("https://example.org/", None)),
+    ("about:blank\n", ("about:blank", None)),
+])
+def test_session_url_reads_the_url_line(cli, monkeypatch, out, expected):
+    monkeypatch.setenv("STUB_TCD_URL", out.rstrip("\n"))
+    assert asyncio.run(tcd_browser.session_url("paperika-9-codex")) == expected
+    assert _get_urls(cli()) == ["paperika-9-codex"]
+
+
+def test_healthz_tcd_block_in_local_mode_never_probes(cfg, cli):
     _ready_state(cfg)
     bridge_app.build_bridge(cfg)
     _insert_attempt(cfg, "tcd_codex", _now() - timedelta(seconds=10))
@@ -775,30 +847,38 @@ def test_healthz_tcd_block(cfg, cli, monkeypatch):
     body = client.get("/healthz", headers=_auth()).json()
     tcd = body["tcd"]
     assert tcd["configured_mode"] == "local" and tcd["cli_present"] is True
-    assert tcd["gateway"]["ok"] is True and tcd["gateway"]["shared_up"] is True
-    assert tcd["gateway"]["error"] is None
-    assert tcd["tcd_usable"] is True
+    assert tcd["gateway"] is None and tcd["tcd_usable"] is None
     assert tcd["last_selftest_ok"] is True and tcd["last_selftest_at"]
     assert tcd["attempts_today"] == {"tcd_codex": 1, "tcd_claude": 0,
                                      "trial_tcd_codex": 0, "trial_tcd_claude": 0}
+    assert "tcd_codex" not in body["limits"]["attempts_today"]  # existing dict unchanged
+    assert cli() == []
+
+
+def test_healthz_tcd_block_in_tcd_mode(cfg, cli):
+    _ready_state(_tcd_cfg(cfg))
+    client = TestClient(bridge_app.create_app(cfg))
+    tcd = client.get("/healthz", headers=_auth()).json()["tcd"]
+    assert tcd["configured_mode"] == "tcd" and tcd["cli_present"] is True
+    assert tcd["gateway"]["ok"] is True and tcd["gateway"]["shared_up"] is True
+    assert tcd["gateway"]["error"] is None and tcd["tcd_usable"] is True
     client.get("/healthz", headers=_auth())
     assert [c["argv"] for c in cli()] == [["status"]]  # cached
     # the unauthenticated tier never reveals or probes it
     tcd_browser.reset_status_cache()
     assert "tcd" not in client.get("/healthz").json()
     assert len(cli()) == 1
-    assert "tcd_codex" not in body["limits"]["attempts_today"]  # existing dict unchanged
 
 
 def test_healthz_tcd_block_when_unusable(cfg):
-    _ready_state(cfg, tcd_last_selftest_ok=False)
+    _ready_state(_tcd_cfg(cfg), tcd_last_selftest_ok=False)
     body = TestClient(bridge_app.create_app(cfg)).get("/healthz", headers=_auth()).json()
     assert body["tcd"]["cli_present"] is False and body["tcd"]["gateway"] is None
     assert body["tcd"]["tcd_usable"] is False and body["tcd"]["last_selftest_ok"] is False
 
 
 def test_healthz_tcd_unusable_with_a_stale_selftest(cfg, cli):
-    _ready_state(cfg, tcd_last_selftest_at=_days_ago(15))
+    _ready_state(_tcd_cfg(cfg), tcd_last_selftest_at=_days_ago(15))
     body = TestClient(bridge_app.create_app(cfg)).get("/healthz", headers=_auth()).json()
     assert body["tcd"]["gateway"]["ok"] is True and body["tcd"]["tcd_usable"] is False
 
@@ -896,7 +976,7 @@ def test_trial_tcd_shares_the_trial_daily_cap(cfg, cli, monkeypatch):
 
 
 def _fake_selftest(calls: list, *, ok=True, error_code=None, raise_exc=None):
-    async def _fake(run_dir, *, env=None, wall_seconds=None):
+    async def _fake(run_dir, *, wall_seconds):
         calls.append(wall_seconds)
         if raise_exc is not None:
             raise raise_exc
@@ -913,17 +993,28 @@ def _clear_attempts(cfg):
     con.close()
 
 
+def _ledger(cfg) -> list[tuple[str, str, int]]:
+    con = _conn(cfg)
+    rows = [(r["strategy"], r["outcome"], r["request_id"]) for r in con.execute(
+        "SELECT strategy, outcome, request_id FROM paper_attempts ORDER BY id")]
+    con.close()
+    return rows
+
+
 def test_latched_off_codex_rearms_once_then_runs(cfg, monkeypatch):
     _write_state(cfg, sandbox_mode=None, last_selftest_ok=False, last_selftest_at=_days_ago(9))
     calls: list = []
     codex: list = []
-    monkeypatch.setattr(executor, "run_selftest", _fake_selftest(calls))
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _fake_selftest(calls))
     monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(codex, kind="auth_error"))
     client = TestClient(bridge_app.create_app(cfg))
     resp = _download(client)
+    rid = _last_request_id(cfg)
     assert len(calls) == 1 and 0 < calls[0] <= bridge_app.CODEX_REARM_WALL_SECONDS
     assert len(codex) == 1 and codex[0]["sandbox_mode"] == "workspace-write"
     assert resp.json()["error_code"] == "codex_auth"  # carried on with the re-armed codex
+    # the selftest is a ledger row on this request, before the paper attempt
+    assert _ledger(cfg)[-2:] == [("codex_selftest", "selftest_ok", rid), ("codex_bridge", "auth_error", rid)]
     state = _read_state(cfg)
     assert state["codex_rearm_attempted_at"]
     assert state["sandbox_mode"] is None  # the runtime auth error latched it off again
@@ -935,9 +1026,10 @@ def test_latched_off_codex_rearms_once_then_runs(cfg, monkeypatch):
 
 
 def test_stale_codex_selftest_is_refreshed(cfg, monkeypatch):
-    _write_state(cfg, sandbox_mode="bypass", last_selftest_ok=True, last_selftest_at=_days_ago(20))
+    _write_state(cfg, sandbox_mode="workspace-write", last_selftest_ok=True,
+                 last_selftest_at=_days_ago(20))
     calls: list = []
-    monkeypatch.setattr(executor, "run_selftest", _fake_selftest(calls))
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _fake_selftest(calls))
     monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([], kind="gave_up"))
     _download(TestClient(bridge_app.create_app(cfg)))
     state = _read_state(cfg)
@@ -946,12 +1038,145 @@ def test_stale_codex_selftest_is_refreshed(cfg, monkeypatch):
     assert bridge_app._codex_usable(bridge_app.BridgeState(**state))
 
 
+def _fake_codex_selftest_variant(modes: list, *, passes: bool):
+    """executor.run_codex for the selftest prompt: records the sandbox it was asked for."""
+    async def _fake(run_dir, prompt, sandbox_mode, **kw):
+        assert prompt == executor.SELFTEST_PROMPT
+        modes.append(sandbox_mode)
+        if passes:
+            return executor.ExecResult(
+                kind="executor_died", events=[{"type": "turn.completed"}],
+                raw_last_message="CDP_BROWSER=Chrome/147.0.1\nTITLE=About Version\n")
+        return executor.ExecResult(kind="executor_died", notes="bwrap: transient failure")
+    return _fake
+
+
+def test_a_transient_sandboxed_failure_never_ends_in_bypass(cfg, monkeypatch):
+    """The re-arm runs the workspace-write variant alone: a transient failure there
+    is recorded and the mode is left as it was, never switched to bypass."""
+    _write_state(cfg, sandbox_mode="workspace-write", last_selftest_ok=True,
+                 last_selftest_at=_days_ago(20))
+    modes: list = []
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _REAL_SANDBOXED)
+    monkeypatch.setattr(executor, "run_codex", _fake_codex_selftest_variant(modes, passes=False))
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([], kind="gave_up"))
+    _download(TestClient(bridge_app.create_app(cfg)))
+    state = _read_state(cfg)
+    assert modes == ["workspace-write"]  # the bypass variant never ran
+    assert state["sandbox_mode"] == "workspace-write" and state["last_selftest_ok"] is False
+    assert ("codex_selftest", "selftest_failed") in [(s, o) for s, o, _ in _ledger(cfg)]
+
+
+def test_a_passing_rearm_arms_workspace_write(cfg, monkeypatch):
+    _write_state(cfg, sandbox_mode=None, last_selftest_ok=False, last_selftest_at=_days_ago(9))
+    modes: list = []
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _REAL_SANDBOXED)
+    monkeypatch.setattr(executor, "run_codex", _fake_codex_selftest_variant(modes, passes=True))
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([], kind="gave_up"))
+    _download(TestClient(bridge_app.create_app(cfg)))
+    assert modes == ["workspace-write"]
+    assert _read_state(cfg)["sandbox_mode"] == "workspace-write"
+
+
+def test_a_bypass_state_is_never_rearmed_automatically(cfg, monkeypatch):
+    before = dict(sandbox_mode="bypass", last_selftest_ok=True, last_selftest_at=_days_ago(20))
+    _write_state(cfg, **before)
+    calls: list = []
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _fake_selftest(calls))
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([], kind="gave_up"))
+    _download(TestClient(bridge_app.create_app(cfg)))
+    assert calls == []
+    state = _read_state(cfg)
+    assert {k: state[k] for k in before} == before and state.get("codex_rearm_attempted_at") is None
+
+
+def _seed_codex_pool(cfg, n: int) -> None:
+    started = _now() - timedelta(seconds=limits.RATE_RULES["codex_bridge"][0] + 5)
+    if started.date() != _now().date():
+        pytest.skip("too close to UTC midnight")
+    bridge_app.build_bridge(cfg)
+    for i in range(n):
+        _insert_attempt(cfg, ("codex_bridge", "tcd_codex")[i % 2], started)
+
+
+def _codex_pool_launches(cfg) -> int:
+    con = _conn(cfg)
+    n = sum(limits.attempts_today(con, m) for m in limits.pool_members("codex_bridge"))
+    con.close()
+    return n
+
+
+def test_rearm_skipped_one_below_the_cap_and_the_paper_attempt_runs(cfg, monkeypatch, caplog):
+    cap = limits.RATE_RULES["codex_bridge"][1]
+    _write_state(cfg, sandbox_mode="workspace-write", last_selftest_ok=True,
+                 last_selftest_at=_days_ago(20))  # stale but armed: codex still runs
+    _seed_codex_pool(cfg, cap - 1)
+    calls: list = []
+    codex: list = []
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _fake_selftest(calls))
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(codex, kind="gave_up"))
+    with caplog.at_level(logging.WARNING, logger="paperika.bridge.app"):
+        _download(TestClient(bridge_app.create_app(cfg)))
+    assert calls == [] and len(codex) == 1
+    assert any("re-arm skipped" in r.getMessage() for r in caplog.records)
+    assert _codex_pool_launches(cfg) == cap
+    assert _read_state(cfg).get("codex_rearm_attempted_at") is None
+
+
+def test_rearm_with_room_is_on_the_ledger_and_launches_stay_within_the_cap(cfg, monkeypatch):
+    cap = limits.RATE_RULES["codex_bridge"][1]
+    _write_state(cfg, sandbox_mode=None, last_selftest_ok=False, last_selftest_at=_days_ago(9))
+    _seed_codex_pool(cfg, cap - 2)
+    calls: list = []
+    codex: list = []
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _fake_selftest(calls))
+    monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(codex, kind="gave_up"))
+    client = TestClient(bridge_app.create_app(cfg))
+    _download(client)
+    assert len(calls) == 1 and len(codex) == 1
+    assert [s for s, _, _ in _ledger(cfg)][-2:] == ["codex_selftest", "codex_bridge"]
+    assert _codex_pool_launches(cfg) == cap  # 18 seeded + the selftest + the paper attempt
+    con = _conn(cfg)
+    assert limits.check_rate(con, "codex_bridge").error_code in {"cooldown", "daily_cap"}
+    con.close()
+
+
+def test_a_selftest_row_is_not_a_paper_attempt(cfg, monkeypatch, chrome_calls):
+    """The re-arm row never carries a screenshot (KC's handoff evidence), is never
+    wall evidence, and a bridge restart closes it without salvaging through it."""
+    _write_state(cfg, sandbox_mode=None, last_selftest_ok=False, last_selftest_at=_days_ago(9))
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _fake_selftest([], ok=False))
+    client = TestClient(bridge_app.create_app(cfg))
+    _download(client)
+    rid = _last_request_id(cfg)
+    con = _conn(cfg)
+    row = con.execute("SELECT * FROM paper_attempts WHERE strategy = 'codex_selftest'").fetchone()
+    con.close()
+    assert row["outcome"] == "selftest_failed" and row["screenshot_path"] is None
+    bridge = client.app.state.bridge
+    assert bridge.wall_evidence(rid) == ([], None, None)
+    # a restart mid-selftest: a matching PDF in the window is NOT salvaged through it
+    con = _conn(cfg)
+    con.execute("UPDATE paper_attempts SET outcome='running', started_at=? WHERE id=?",
+                (limits.iso(_now()), row["id"]))
+    con.execute("UPDATE paper_requests SET status='in_progress' WHERE id=?", (rid,))
+    con.commit()
+    con.close()
+    _make_pdf(cfg.download_dir / f"{direct_fetch.sanitize_doi(DOI)}.pdf", doi=DOI, title=TITLE)
+    bridge_app.startup_sweep(bridge)
+    con = _conn(cfg)
+    assert con.execute("SELECT outcome FROM paper_attempts WHERE id=?", (row["id"],)).fetchone()[0] == "interrupted"
+    assert con.execute("SELECT status FROM paper_requests WHERE id=?", (rid,)).fetchone()[0] == "failed"
+    con.close()
+
+
 def test_failed_rearm_records_it_and_auth_keeps_codex_off(cfg, monkeypatch):
     _write_state(cfg, sandbox_mode="workspace-write", last_selftest_ok=True,
                  last_selftest_at=_days_ago(20))
     calls: list = []
     codex: list = []
-    monkeypatch.setattr(executor, "run_selftest", _fake_selftest(calls, ok=False, error_code="codex_auth"))
+    monkeypatch.setattr(executor, "run_selftest_sandboxed",
+                        _fake_selftest(calls, ok=False, error_code="codex_auth"))
     monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(codex))
     resp = _download(TestClient(bridge_app.create_app(cfg)))
     state = _read_state(cfg)
@@ -968,9 +1193,11 @@ def _parse(stamp: str) -> datetime:
 def test_a_crashing_rearm_never_loops(cfg, monkeypatch):
     _write_state(cfg, sandbox_mode=None, last_selftest_ok=False, last_selftest_at=_days_ago(3))
     calls: list = []
-    monkeypatch.setattr(executor, "run_selftest", _fake_selftest(calls, raise_exc=FileNotFoundError("codex")))
+    monkeypatch.setattr(executor, "run_selftest_sandboxed",
+                        _fake_selftest(calls, raise_exc=FileNotFoundError("codex")))
     client = TestClient(bridge_app.create_app(cfg))
     assert _download(client).json()["error_code"] == "selftest_required"
+    assert ("codex_selftest", "selftest_failed") in [(s, o) for s, o, _ in _ledger(cfg)]
     _clear_attempts(cfg)
     assert _download(client).json()["error_code"] == "selftest_required"
     assert len(calls) == 1 and _read_state(cfg)["codex_rearm_attempted_at"]
@@ -982,32 +1209,34 @@ def test_a_crashing_rearm_never_loops(cfg, monkeypatch):
     {"sandbox_mode": None, "last_selftest_ok": False, "last_selftest_at": "old",
      "codex_rearm_attempted_at": "recent"},
     {"sandbox_mode": "workspace-write", "last_selftest_ok": True, "last_selftest_at": "old13"},
+    {"sandbox_mode": "bypass", "last_selftest_ok": False, "last_selftest_at": "old"},
 ])
 def test_rearm_is_not_due(cfg, monkeypatch, state):
     stamps = {"recent": _days_ago(0.5), "old": _days_ago(9), "old13": _days_ago(13)}
     _write_state(cfg, **{k: stamps.get(v, v) if isinstance(v, str) else v for k, v in state.items()})
     calls: list = []
-    monkeypatch.setattr(executor, "run_selftest", _fake_selftest(calls))
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _fake_selftest(calls))
     monkeypatch.setattr(bridge_app, "run_codex", _fake_codex([]))
     _download(TestClient(bridge_app.create_app(cfg)))
     assert calls == []
+    assert "codex_selftest" not in [s for s, _, _ in _ledger(cfg)]
 
 
 def test_rearm_never_runs_on_a_health_check(cfg, monkeypatch):
     _write_state(cfg, sandbox_mode=None, last_selftest_ok=False, last_selftest_at=_days_ago(9))
     calls: list = []
-    monkeypatch.setattr(executor, "run_selftest", _fake_selftest(calls))
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _fake_selftest(calls))
     client = TestClient(bridge_app.create_app(cfg))
     for _ in range(3):
         client.get("/healthz", headers=_auth())
         client.get("/healthz")
-    assert calls == [] and "codex_rearm_attempted_at" not in _read_state(cfg)
+    assert calls == [] and _read_state(cfg).get("codex_rearm_attempted_at") is None
 
 
 def test_rearm_skipped_when_it_cannot_help(cfg, monkeypatch, chrome_calls):
     _write_state(cfg, sandbox_mode=None, last_selftest_ok=False, last_selftest_at=_days_ago(9))
     calls: list = []
-    monkeypatch.setattr(executor, "run_selftest", _fake_selftest(calls))
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _fake_selftest(calls))
     client = TestClient(bridge_app.create_app(cfg))
     # local Chrome down: the codex selftest drives it, so it could not pass
     chrome_calls["ok"] = False
@@ -1017,13 +1246,13 @@ def test_rearm_skipped_when_it_cannot_help(cfg, monkeypatch, chrome_calls):
     _clear_attempts(cfg)
     _insert_attempt(cfg, "codex_bridge", _now() - timedelta(seconds=30))
     _download(client)
-    assert calls == [] and "codex_rearm_attempted_at" not in _read_state(cfg)
+    assert calls == [] and _read_state(cfg).get("codex_rearm_attempted_at") is None
 
 
 def test_rearm_stays_inside_the_request_budget(cfg, monkeypatch):
     _write_state(cfg, sandbox_mode=None, last_selftest_ok=False, last_selftest_at=_days_ago(9))
     calls: list = []
-    monkeypatch.setattr(executor, "run_selftest", _fake_selftest(calls))
+    monkeypatch.setattr(executor, "run_selftest_sandboxed", _fake_selftest(calls))
     clock = {"t": 0.0}
     monkeypatch.setattr(bridge_app, "MONOTONIC", lambda: clock["t"])
 
@@ -1032,4 +1261,160 @@ def test_rearm_stays_inside_the_request_budget(cfg, monkeypatch):
         return direct_fetch.DirectFetchResult(kind="no_pdf", notes="slow")
     monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _slow_direct)
     _download(TestClient(bridge_app.create_app(cfg)))
-    assert calls == [] and "codex_rearm_attempted_at" not in _read_state(cfg)
+    assert calls == [] and _read_state(cfg).get("codex_rearm_attempted_at") is None
+
+
+# ------------------------------------------- fix 1: cancellation and the lease ---
+
+_STUB_SLEEPER = r"""
+import os, time
+with open(os.environ["STUB_PID_FILE"], "w") as fh:
+    fh.write(str(os.getpid()))
+time.sleep(30)
+"""
+
+
+def _install_sleepers(tmp_path: Path, monkeypatch) -> Path:
+    """Stub codex/claude executables that record their pid and hang."""
+    bindir = tmp_path / "stubbin"
+    bindir.mkdir()
+    (bindir / "codex").write_text("#!/usr/bin/env python3\n" + _STUB_SLEEPER)
+    (bindir / "claude").write_text("#!/usr/bin/env python3\n" + _STUB_SLEEPER)
+    (bindir / "timeout").write_text(
+        "#!/usr/bin/env python3\nimport os, sys\nos.execvp(sys.argv[2], sys.argv[2:])\n")
+    for f in bindir.iterdir():
+        f.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    monkeypatch.setenv("PAPERIKA_CLAUDE_BIN", str(bindir / "claude"))
+    pidfile = tmp_path / "victim.pid"
+    monkeypatch.setenv("STUB_PID_FILE", str(pidfile))
+    return pidfile
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _cancel_once_started(coro, pidfile: Path) -> int:
+    task = asyncio.ensure_future(coro)
+    for _ in range(200):
+        if pidfile.exists() and pidfile.read_text():
+            break
+        await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return int(pidfile.read_text())
+    raise AssertionError("the task finished instead of being cancelled")
+
+
+def _executor_run(driver: str, run_dir: Path, *, tcd: bool):
+    if driver == "codex":
+        return _REAL_RUN_CODEX(run_dir, "P", "workspace-write", write_schema=False, tcd=tcd)
+    return _REAL_RUN_CLAUDE(run_dir, "P", "sk-test", tcd=tcd)
+
+
+@pytest.mark.parametrize("driver", ["codex", "claude"])
+def test_a_cancelled_tcd_executor_is_killed_and_reaped_before_the_cancel_propagates(
+        tmp_path, monkeypatch, driver):
+    pidfile = _install_sleepers(tmp_path, monkeypatch)
+
+    async def main():
+        pid = await _cancel_once_started(_executor_run(driver, tmp_path / "run", tcd=True), pidfile)
+        return _alive(pid)
+    assert asyncio.run(main()) is False
+
+
+@pytest.mark.parametrize("driver", ["codex", "claude"])
+def test_local_mode_cancellation_is_unchanged(tmp_path, monkeypatch, driver):
+    """Local mode: the cancellation propagates without killing, exactly as before."""
+    pidfile = _install_sleepers(tmp_path, monkeypatch)
+
+    async def main():
+        pid = await _cancel_once_started(_executor_run(driver, tmp_path / "run", tcd=False), pidfile)
+        alive = _alive(pid)
+        os.killpg(pid, 9)  # the test's own cleanup of the survivor
+        await asyncio.sleep(0.5)  # let the loop see its pipes close before it shuts down
+        return alive
+    assert asyncio.run(main()) is True
+
+
+def test_a_cancelled_tcd_attempt_is_killed_before_its_lease_is_released(cfg, cli, tmp_path, monkeypatch):
+    pidfile = _install_sleepers(tmp_path, monkeypatch)
+    monkeypatch.setenv("STUB_VICTIM_PIDFILE", str(pidfile))
+    monkeypatch.setattr(bridge_app, "run_codex", _REAL_RUN_CODEX)
+    bridge = bridge_app.build_bridge(cfg)
+    start_url = f"https://doi.org/{DOI}"
+    rid = bridge.db.create_request(raw_input=DOI, inferred_title=TITLE, inferred_doi=DOI,
+                                   inferred_url=start_url, paper_id=None)
+    run_dir = cfg.db_path.parent / "codex_runs" / str(rid)
+    run_dir.mkdir(parents=True)
+    attempt = bridge_app._run_executor_attempt(
+        bridge, driver="codex", request_id=rid, run_dir=run_dir, doi=DOI, title=TITLE,
+        start_url=start_url, sandbox_mode="workspace-write", defer_failure=False,
+        deadline=bridge_app.MONOTONIC() + 1000, tcd=True,
+    )
+    pid = asyncio.run(_cancel_once_started(attempt, pidfile))
+    closes = [c for c in cli() if c["argv"][-1:] == ["--close"]]
+    assert [c["argv"][2] for c in closes] == [f"paperika-{rid}-codex"]  # the release still ran
+    assert closes[0]["victim_alive"] is False  # ...after the executor was already dead
+    assert not _alive(pid)
+
+
+def test_a_cancellation_during_release_does_not_abort_the_close(cli, monkeypatch):
+    monkeypatch.setenv("STUB_TCD_CLOSE_SLEEP", "1")
+
+    async def main(fn):
+        task = asyncio.ensure_future(fn("paperika-5-codex"))
+        await asyncio.sleep(0.4)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(main(tcd_browser.release_shielded))
+    assert [c["argv"] for c in cli()] == [["ab", "--session", "paperika-5-codex", "--close"],
+                                          ["close-finished"]]
+    # control: the unshielded call is interrupted (its CLI process is killed on cancel)
+    asyncio.run(main(tcd_browser.release))
+    assert [c["argv"] for c in cli()][-1] == ["ab", "--session", "paperika-5-codex", "--close"]
+
+
+def test_a_cancelled_bridge_cli_call_is_killed(cli, tmp_path, monkeypatch):
+    pidfile = tmp_path / "cli.pid"
+    monkeypatch.setenv("STUB_TCD_PIDFILE", str(pidfile))
+    monkeypatch.setenv("STUB_TCD_URL_SLEEP", "30")
+
+    async def main():
+        pid = await _cancel_once_started(tcd_browser.session_url("paperika-6-codex"), pidfile)
+        return _alive(pid)
+    assert asyncio.run(main()) is False
+
+
+@pytest.mark.parametrize("site", ["download", "trial", "selftest"])
+def test_every_tcd_site_uses_the_shielded_release_and_kill_on_cancel(cfg, cli, monkeypatch, site):
+    released: list = []
+
+    async def _record(session):
+        released.append(session)
+        return True
+    monkeypatch.setattr(tcd_browser, "release_shielded", _record)
+    seen: list = []
+    if site == "download":
+        _ready_state(_tcd_cfg(cfg))
+        monkeypatch.setattr(bridge_app, "run_codex", _fake_codex(seen))
+        _download(TestClient(bridge_app.create_app(cfg)))
+    elif site == "trial":
+        _ready_state(cfg)
+        monkeypatch.setattr(bridge_app, "run_codex", _fake_trial_codex(seen))
+        _trial(TestClient(bridge_app.create_app(cfg)))
+    else:
+        _write_state(cfg, sandbox_mode="workspace-write")
+        monkeypatch.setattr(executor, "run_codex", _fake_selftest_codex(seen, text=_tcd_report()))
+        _selftest(cfg)
+    assert released == [seen[0]["env"]["TCD_BROWSER_SESSION"]]
+    assert seen[0]["tcd"] is True  # run_codex(tcd=True) => kill on cancel
+    assert _releases(cli()) == []  # nothing released around the shield

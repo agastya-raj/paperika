@@ -52,7 +52,12 @@ RATE_POOLS: dict[str, str] = {
     "tcd_claude": "claude_bridge",
     "trial_tcd_codex": "trial_codex",
     "trial_tcd_claude": "trial_claude",
+    # The automatic codex latch re-arm (app._maybe_rearm_codex) is a codex launch
+    # too: its ledger row spends the codex pool like a paper attempt.
+    "codex_selftest": "codex_bridge",
 }
+# The re-arm's ledger strategy; never a paper attempt (no PDF, no screenshot).
+CODEX_SELFTEST_STRATEGY = "codex_selftest"
 
 # AGA-1461: every LLM-driven strategy, production and trial. ``check_llm_spacing``
 # applies ONE shared clock across them so a trial and a production run never overlap
@@ -60,11 +65,11 @@ RATE_POOLS: dict[str, str] = {
 # sees trial rows.
 LLM_STRATEGIES: tuple[str, ...] = (
     "codex_bridge", "claude_bridge", "trial_codex", "trial_claude",
-    *RATE_POOLS,  # AGA-1702: the TCD-mode twins of all four
+    *RATE_POOLS,  # AGA-1702: the TCD-mode twins of all four, and the codex re-arm
 )
 LLM_SPACING_SECONDS = 180
 TRIAL_STRATEGIES: tuple[str, ...] = ("trial_codex", "trial_claude")
-TCD_STRATEGIES: tuple[str, ...] = tuple(RATE_POOLS)
+TCD_STRATEGIES: tuple[str, ...] = ("tcd_codex", "tcd_claude", "trial_tcd_codex", "trial_tcd_claude")
 # SQL fragment: excludes trial rows from the whole-ledger (strategy=None) counts so
 # the production totals never include bake-off attempts.
 _NOT_TRIAL = "COALESCE(strategy, '') NOT LIKE 'trial\\_%' ESCAPE '\\'"
@@ -184,7 +189,7 @@ def check_rate(
     over the rows of the whole pool (e.g. codex_bridge + tcd_codex)."""
     now = now or utc_now()
     owner = RATE_POOLS.get(strategy, strategy)
-    members = (owner, *(alias for alias, own in RATE_POOLS.items() if own == owner))
+    members = pool_members(strategy)
     default_spacing, default_cap = RATE_RULES.get(owner, (MIN_SPACING_SECONDS, DAILY_CAP))
     if min_spacing_seconds is None:
         min_spacing_seconds = default_spacing
@@ -203,6 +208,21 @@ def check_rate(
         return RateDecision(False, "daily_cap")
 
     return RateDecision(True)
+
+
+def pool_members(strategy: str) -> tuple[str, ...]:
+    """``strategy``'s rate pool: its owner plus every strategy pooled with it."""
+    owner = RATE_POOLS.get(strategy, strategy)
+    return (owner, *(alias for alias, own in RATE_POOLS.items() if own == owner))
+
+
+def pool_room_today(
+    conn: sqlite3.Connection, strategy: str, *, now: datetime | None = None
+) -> int:
+    """Launches left today under ``strategy``'s pooled daily cap."""
+    owner = RATE_POOLS.get(strategy, strategy)
+    cap = RATE_RULES.get(owner, (MIN_SPACING_SECONDS, DAILY_CAP))[1]
+    return cap - sum(attempts_today(conn, m, now=now) for m in pool_members(strategy))
 
 
 def check_llm_spacing(

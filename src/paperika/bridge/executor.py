@@ -10,6 +10,7 @@ prompt template is static except ``{run_dir}`` (prompt-injection containment, §
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 import json
 import logging
@@ -20,7 +21,6 @@ import shlex
 import shutil
 import signal
 import time
-from typing import Any
 
 CODEX_BIN = "codex"
 CLAUDE_BIN = "claude"
@@ -404,11 +404,10 @@ TCD_SELFTEST_PROMPT = (
     "/home/agastya/.local/bin/tcd-browser ab -- get title ; "
     "/home/agastya/.local/bin/tcd-browser ab -- get url . "
     "Do not close the session, visit no other page and use no other tcd-browser "
-    "subcommand. Then report exactly two lines and nothing else: "
+    "subcommand. Then report the structured outcome: outcome gave_up, file_path "
+    "null, final_url null, and notes exactly two lines and nothing else: "
     "TCD_TITLE=<the title the second command printed> and "
-    "TCD_URL=<the url the third command printed>. If you must answer with a "
-    "structured outcome, use outcome gave_up, file_path null, final_url null, and "
-    "put exactly those two lines in notes."
+    "TCD_URL=<the url the third command printed>."
 )
 
 
@@ -706,12 +705,22 @@ def write_outcome_schema(run_dir: Path) -> None:
     (run_dir / "outcome.schema.json").write_text(json.dumps(OUTCOME_SCHEMA), encoding="utf-8")
 
 
+# AGA-1702: how long a cancelled TCD-mode spawn waits to reap its killed group.
+CANCEL_REAP_SECONDS = 10
+
+
 async def _spawn(
-    argv: list[str], run_dir: Path, run_env: dict[str, str], *, wait_seconds: float
+    argv: list[str], run_dir: Path, run_env: dict[str, str], *, wait_seconds: float,
+    kill_on_cancel: bool = False,
 ) -> tuple[str, str, int, bool, float]:
     """Run ``argv`` in its own process group (start_new_session) with an immediate
     stdin EOF; on overrun killpg the whole group (the CLI + any spawned python).
-    Returns (stdout, stderr, exit_code, timed_out, wall_seconds)."""
+    Returns (stdout, stderr, exit_code, timed_out, wall_seconds).
+
+    ``kill_on_cancel`` (AGA-1702, TCD-mode runs only): a cancellation also killpg's
+    the group and reaps it (bounded) BEFORE it propagates, so the executor cannot
+    re-open its TCD session after the bridge has released it. Without it a
+    cancellation propagates exactly as before."""
     started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -727,6 +736,18 @@ async def _spawn(
     timed_out = False
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=wait_seconds)
+    except asyncio.CancelledError:
+        if kill_on_cancel:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                # communicate() reaps AND drains/closes the pipes.
+                await asyncio.wait_for(proc.communicate(), timeout=CANCEL_REAP_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+        raise
     except asyncio.TimeoutError:
         timed_out = True
         try:
@@ -784,7 +805,8 @@ async def run_codex(
     # CODEX_HOME intentionally NOT set here; codex resolves /home/agastya/.codex.
 
     stdout, stderr, exit_code, timed_out, wall = await _spawn(
-        argv, run_dir, run_env, wait_seconds=wall_seconds + KILL_GRACE_SECONDS
+        argv, run_dir, run_env, wait_seconds=wall_seconds + KILL_GRACE_SECONDS,
+        **({"kill_on_cancel": True} if tcd else {}),
     )
     events = _parse_events(stdout)
     try:
@@ -827,20 +849,13 @@ def _selftest_passed(result: ExecResult) -> bool:
     )
 
 
-async def run_selftest(
-    run_dir: Path, *, env: dict[str, str] | None = None, wall_seconds: float | None = None,
-) -> SelftestResult:
+async def run_selftest(run_dir: Path, *, env: dict[str, str] | None = None) -> SelftestResult:
     """Sandbox-mode ladder (§2.3): try workspace-write first, fall back to bypass
-    only for sandbox-attributable variant-1 failures. Never a publisher page.
-    ``wall_seconds`` (AGA-1702 latch re-arm inside a /download budget) caps EACH
-    variant's wall; ``None`` keeps run_codex's default."""
+    only for sandbox-attributable variant-1 failures. Never a publisher page."""
     run_dir.mkdir(parents=True, exist_ok=True)
-    wall: dict[str, Any] = {} if wall_seconds is None else {"wall_seconds": wall_seconds}
 
     # Variant 1: tight sandbox.
-    v1 = await run_codex(
-        run_dir, SELFTEST_PROMPT, "workspace-write", write_schema=False, env=env, **wall
-    )
+    v1 = await run_codex(run_dir, SELFTEST_PROMPT, "workspace-write", write_schema=False, env=env)
     if v1.kind == "auth_error":
         return SelftestResult(
             False, error_code="codex_auth",
@@ -852,7 +867,7 @@ async def run_selftest(
     v1_reason = v1.notes or f"variant-1 did not complete (kind={v1.kind}, exit={v1.exit_code})"
 
     # Variant 2: bypass fallback.
-    v2 = await run_codex(run_dir, SELFTEST_PROMPT, "bypass", write_schema=False, env=env, **wall)
+    v2 = await run_codex(run_dir, SELFTEST_PROMPT, "bypass", write_schema=False, env=env)
     if v2.kind == "auth_error":
         return SelftestResult(
             False, error_code="codex_auth",
@@ -869,6 +884,29 @@ async def run_selftest(
         detail=f"selftest failed under both sandbox variants (v1={v1.kind}, v2={v2.kind})",
         wall_seconds=v1.wall_seconds + v2.wall_seconds,
         variant1_failure_reason=v1_reason,
+    )
+
+
+async def run_selftest_sandboxed(run_dir: Path, *, wall_seconds: float) -> SelftestResult:
+    """AGA-1702 automatic latch re-arm: the ``workspace-write`` variant of
+    ``run_selftest`` ALONE. It never tries the bypass variant, so the bridge can only
+    ever re-arm the sandboxed mode by itself; a host that needs bypass still needs the
+    manual POST /selftest/codex."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    result = await run_codex(
+        run_dir, SELFTEST_PROMPT, "workspace-write", write_schema=False, wall_seconds=wall_seconds
+    )
+    if result.kind == "auth_error":
+        return SelftestResult(
+            False, error_code="codex_auth",
+            detail="re-run codex login on the gpu host as agastya", wall_seconds=result.wall_seconds,
+        )
+    if _selftest_passed(result):
+        return SelftestResult(True, sandbox_mode="workspace-write", wall_seconds=result.wall_seconds)
+    return SelftestResult(
+        False, error_code="executor_failed",
+        detail=result.notes or f"workspace-write selftest did not pass (kind={result.kind})",
+        wall_seconds=result.wall_seconds,
     )
 
 
@@ -1080,6 +1118,7 @@ async def run_claude(
     model: str | None = None,
     max_budget_usd: float | None = None,
     effort: str | None = None,
+    tcd: bool = False,
 ) -> ExecResult:
     """Spawn ``claude -p ...`` in its own process group with the same wall /
     kill-grace discipline as run_codex (``wall_seconds`` lets the ladder shrink it
@@ -1099,7 +1138,9 @@ async def run_claude(
             build_argv_claude(
                 run_dir, prompt, model=model, max_budget_usd=max_budget_usd, effort=effort
             ),
-            run_dir, run_env, wait_seconds=wall_seconds
+            run_dir, run_env, wait_seconds=wall_seconds,
+            # AGA-1702: a cancelled TCD-mode run is killed before the bridge releases it.
+            **({"kill_on_cancel": True} if tcd else {}),
         )
     except FileNotFoundError:
         # A missing CLI is a host fault, not a verdict: retryable, never a crash.
@@ -1157,26 +1198,31 @@ def parse_tcd_selftest(text: str) -> tuple[str | None, str | None]:
 
 
 async def run_tcd_selftest(
-    run_dir: Path, *, driver: str, env: dict[str, str], sandbox_mode: str | None = None,
-    api_key: str | None = None,
+    run_dir: Path, *, driver: str, env: dict[str, str],
+    read_session_url: Callable[[], Awaitable[tuple[str | None, str | None]]],
+    sandbox_mode: str | None = None, api_key: str | None = None,
 ) -> SelftestResult:
     """AGA-1702: one executor in TCD mode (``env`` carries TCD_BROWSER_SESSION) runs
-    TCD_SELFTEST_PROMPT. Passes ONLY on the exact expected title and URL. The caller
-    releases the lease afterwards."""
+    TCD_SELFTEST_PROMPT through OUTCOME_SCHEMA (both drivers). Passes ONLY when
+    (a) the run completed normally: the structured ``gave_up`` the prompt asks for
+        (never timeout / executor_died / an auth, quota or budget kind);
+    (b) the reported TCD_TITLE / TCD_URL are exactly the expected pair; and
+    (c) ``read_session_url`` (the bridge's OWN trusted read of that session's tab,
+        made after the run and before the release) returns the expected URL. The
+        two strings are public constants a model could report without browsing;
+        (c) is evidence it cannot supply.
+    The caller releases the lease afterwards."""
     run_dir.mkdir(parents=True, exist_ok=True)
     if driver == "claude":
-        result = await run_claude(run_dir, TCD_SELFTEST_PROMPT, api_key or "", env=env)
+        result = await run_claude(run_dir, TCD_SELFTEST_PROMPT, api_key or "", env=env, tcd=True)
         if result.kind == "claude_auth":
             return SelftestResult(
                 False, error_code="claude_auth", detail="ANTHROPIC_API_KEY was rejected (401)",
                 wall_seconds=result.wall_seconds,
             )
-        # claude answers through OUTCOME_SCHEMA: the two lines arrive in notes.
-        text = result.notes if result.kind == "gave_up" else ""
     else:
         result = await run_codex(
-            run_dir, TCD_SELFTEST_PROMPT, sandbox_mode or "", write_schema=False, env=env,
-            tcd=True,
+            run_dir, TCD_SELFTEST_PROMPT, sandbox_mode or "", env=env, tcd=True,
         )
         if result.kind == "auth_error":
             return SelftestResult(
@@ -1184,16 +1230,25 @@ async def run_tcd_selftest(
                 detail="re-run codex login on the gpu host as agastya",
                 wall_seconds=result.wall_seconds,
             )
-        text = (result.raw_last_message or "") if _turn_completed(result.events) else ""
-    title, url = parse_tcd_selftest(text)
-    if title == TCD_SELFTEST_EXPECTED_TITLE and url in TCD_SELFTEST_EXPECTED_URLS:
-        return SelftestResult(True, sandbox_mode=sandbox_mode, wall_seconds=result.wall_seconds)
-    return SelftestResult(
-        False, error_code="executor_failed",
-        detail=(f"tcd selftest did not report example.org (driver={driver}, "
-                f"kind={result.kind}, title={title!r}, url={url!r})")[:300],
-        wall_seconds=result.wall_seconds,
-    )
+
+    def _fail(why: str) -> SelftestResult:
+        return SelftestResult(
+            False, error_code="executor_failed",
+            detail=f"tcd selftest failed (driver={driver}, kind={result.kind}): {why}"[:300],
+            wall_seconds=result.wall_seconds,
+        )
+
+    if result.kind != "gave_up":
+        return _fail("the run did not complete normally")
+    title, url = parse_tcd_selftest(result.notes)
+    if title != TCD_SELFTEST_EXPECTED_TITLE or url not in TCD_SELFTEST_EXPECTED_URLS:
+        return _fail(f"reported title={title!r}, url={url!r}")
+    seen_url, error = await read_session_url()
+    if error is not None:
+        return _fail(f"the bridge could not read the session's tab: {error}")
+    if seen_url not in TCD_SELFTEST_EXPECTED_URLS:
+        return _fail(f"the bridge read the session's tab at {seen_url!r}")
+    return SelftestResult(True, sandbox_mode=sandbox_mode, wall_seconds=result.wall_seconds)
 
 
 def codex_token_total(events: list[dict]) -> int | None:

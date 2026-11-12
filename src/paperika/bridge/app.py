@@ -10,6 +10,7 @@ executor.py.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -631,7 +632,9 @@ def startup_sweep(bridge: Bridge) -> None:
             window_end = _utc_now()
 
         salvaged = False
-        if doi or title:
+        # AGA-1702: a codex_selftest row (the latch re-arm) never downloads, so it
+        # is never a salvage window; it is closed 'interrupted' like any other.
+        if (doi or title) and row["strategy"] != limits.CODEX_SELFTEST_STRATEGY:
             located = bridge._locate_in_window(window_start, window_end)
             if located and bridge._mechanical_gates(located):
                 ok, _reason = bridge.verify_identity(doi=doi, title=title, path=located)
@@ -821,11 +824,15 @@ async def _tcd_not_ready_reason(state: BridgeState) -> str | None:
     return None
 
 
+def _configured_tier3_browser(config: PaperikaConfig) -> str:
+    return (config.tier3_browser or "").strip().lower()
+
+
 async def _select_tier3_browser(bridge: Bridge, state: BridgeState) -> bool:
     """Whether THIS request's tier 3 runs in TCD mode. Called once per request at the
     tier-3 gate; a configured-but-not-ready TCD falls back to the local Chrome with
     the reason logged once."""
-    mode = (bridge.config.tier3_browser or "").strip().lower()
+    mode = _configured_tier3_browser(bridge.config)
     if mode == "local":
         return False
     if mode != "tcd":
@@ -846,7 +853,7 @@ async def _select_tier3_browser(bridge: Bridge, state: BridgeState) -> bool:
 # re-runs POST /selftest/codex; it once stayed off nine days after the login was
 # fixed. /download now runs that selftest itself, at most once per this interval.
 CODEX_REARM_INTERVAL = timedelta(hours=24)
-# Per selftest variant (two can run back to back). A passing selftest measures
+# Wall of the one sandboxed selftest the re-arm runs. A passing selftest measures
 # ~70 s at high effort.
 CODEX_REARM_WALL_SECONDS = 180
 CODEX_REARM_MIN_WALL_SECONDS = 60
@@ -854,9 +861,12 @@ CODEX_REARM_MIN_WALL_SECONDS = 60
 
 def _codex_rearm_due(state: BridgeState) -> bool:
     """Codex is off or stale, a selftest has run before (the FIRST arm stays an
-    operator step: POST /selftest/codex), and no selftest, manual or automatic,
-    was attempted within CODEX_REARM_INTERVAL."""
+    operator step: POST /selftest/codex), the persisted mode is not ``bypass`` (the
+    re-arm only ever arms the sandboxed mode, and leaves a bypass state alone), and
+    no selftest, manual or automatic, was attempted within CODEX_REARM_INTERVAL."""
     if _parse_iso(state.last_selftest_at) is None or _codex_usable(state):
+        return False
+    if state.sandbox_mode == "bypass":
         return False
     now = _utc_now()
     for stamp in (state.last_selftest_at, state.codex_rearm_attempted_at):
@@ -868,48 +878,74 @@ def _codex_rearm_due(state: BridgeState) -> bool:
 
 async def _maybe_rearm_codex(
     bridge: Bridge, state: BridgeState, *, deadline: float, chrome_ok: bool, codex_rate_ok: bool,
+    ensure_request: Callable[[], tuple[int, Path]],
 ) -> BridgeState:
-    """At the tier-3 gate of a /download (under the lock), run the codex selftest
-    once when ``_codex_rearm_due`` and carry on with its result. Skipped when codex
-    could not run anyway (rate-blocked) or the selftest could not pass (it drives the
-    LOCAL Chrome, so it needs chrome_ok), and when the request budget cannot fit it
-    and still leave tier 3 a useful wall. Never runs from /healthz."""
+    """At the tier-3 gate of a /download (under the lock), run the codex selftest's
+    ``workspace-write`` variant ONCE when ``_codex_rearm_due`` and carry on with its
+    result. It never runs the bypass variant and never persists ``bypass``.
+
+    The launch is a ledger row (``limits.CODEX_SELFTEST_STRATEGY`` on the current
+    request, pooled with codex_bridge), so it spends codex's daily cap; it runs only
+    when the pool has room for it AND the paper attempt after it. Skipped too when
+    codex could not run anyway (rate-blocked), when the selftest could not pass (it
+    drives the LOCAL Chrome, so it needs chrome_ok), and when the request budget
+    cannot fit it and still leave tier 3 a useful wall. Never runs from /healthz."""
     if not (codex_rate_ok and chrome_ok and _codex_rearm_due(state)):
+        return state
+    with bridge.db.transaction() as conn:
+        room = limits.pool_room_today(conn, "codex_bridge")
+    if room < 2:
+        logger.warning(
+            "codex latch re-arm skipped: the codex pool has room for %d launch(es) today, "
+            "not the selftest plus the paper attempt", max(room, 0),
+        )
         return state
     remaining = deadline - MONOTONIC()
     wall = min(
         float(CODEX_REARM_WALL_SECONDS),
-        (remaining - CLEANUP_RESERVE_SECONDS - FALLBACK_MIN_SECONDS) / 2
-        - executor.KILL_GRACE_SECONDS,
+        remaining - CLEANUP_RESERVE_SECONDS - FALLBACK_MIN_SECONDS - executor.KILL_GRACE_SECONDS,
     )
     if wall < CODEX_REARM_MIN_WALL_SECONDS:
         logger.info("codex latch re-arm skipped: request budget too short (%.0fs left)", remaining)
         return state
-    # Recorded BEFORE the run, so a crash or cancel mid-selftest cannot retry it
-    # within the interval.
+    request_id, _run_dir = ensure_request()
+    selftest_dir = bridge.config.db_path.parent / "codex_runs" / "selftest"
+    # Recorded BEFORE the run (state stamp + ledger row), so a crash or cancel
+    # mid-selftest cannot retry it within the interval, and the launch is counted.
     bridge.state_store.update(codex_rearm_attempted_at=_utc_now().isoformat())
-    logger.warning("codex readiness latch is off or stale; running the codex selftest once")
-    run_dir = bridge.config.db_path.parent / "codex_runs" / "selftest"
+    attempt_id = bridge.write_ahead(
+        request_id=request_id, paper_id=None, run_dir=str(selftest_dir),
+        strategy=limits.CODEX_SELFTEST_STRATEGY,
+    )
+    logger.warning("codex readiness latch is off or stale; running the sandboxed codex selftest once")
     try:
-        result = await executor.run_selftest(run_dir, wall_seconds=wall)
-    except Exception:
+        result = await executor.run_selftest_sandboxed(selftest_dir, wall_seconds=wall)
+    except Exception as exc:
         logger.exception("codex latch re-arm: the selftest could not run")
+        bridge.resolve_attempt(attempt_id, outcome="selftest_failed",
+                               message=f"selftest could not run: {type(exc).__name__}")
         return bridge.state_store.load()
+    except BaseException:
+        bridge.resolve_attempt(attempt_id, outcome="interrupted", message="selftest interrupted")
+        raise
     now_iso = _utc_now().isoformat()
     if result.ok:
-        # Exactly what POST /selftest/codex persists on a pass.
+        # What POST /selftest/codex persists on a pass (the mode is always workspace-write).
         bridge.state_store.update(
             sandbox_mode=result.sandbox_mode, last_selftest_ok=True, last_selftest_at=now_iso,
-            last_variant1_failure_reason=result.variant1_failure_reason,
+            last_variant1_failure_reason=None,
         )
+        bridge.resolve_attempt(attempt_id, outcome="selftest_ok", message="codex latch re-armed")
         logger.warning("codex latch re-armed (sandbox_mode=%s)", result.sandbox_mode)
     else:
-        # As POST /selftest/codex on a failure; a dead login also clears sandbox_mode,
-        # as a runtime auth_error does.
+        # As POST /selftest/codex on a failure: sandbox_mode is left as it was, except
+        # that a dead login clears it, as a runtime auth_error does.
         fields: dict[str, Any] = {"last_selftest_ok": False, "last_selftest_at": now_iso}
         if result.error_code == "codex_auth":
             fields["sandbox_mode"] = None
         bridge.state_store.update(**fields)
+        bridge.resolve_attempt(attempt_id, outcome="selftest_failed",
+                               message=f"{result.error_code}: {result.detail}"[:300])
         logger.warning("codex latch re-arm failed: %s %s", result.error_code, result.detail)
     return bridge.state_store.load()
 
@@ -985,10 +1021,13 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 tcd_attempts = {s: limits.attempts_today(conn, s) for s in limits.TCD_STRATEGIES}
                 tcd_claude_cost = limits.month_cost_usd(conn, "tcd_claude")
                 tcd_trial_cost = limits.month_cost_usd(conn, "trial_tcd_claude")
-        # AGA-1702: the CLI's status probe runs only in this authenticated tier
-        # (cached tcd_browser.STATUS_CACHE_TTL_SECONDS) and only when the CLI exists.
+        # AGA-1702: the CLI's status probe runs only in this authenticated tier, only
+        # when tier3_browser is tcd and the CLI exists (cached
+        # tcd_browser.STATUS_CACHE_TTL_SECONDS). In local mode gateway and tcd_usable
+        # are null: nothing was probed.
         tcd_cli = tcd_browser.cli_present()
-        tcd_status = await tcd_browser.probe_status() if tcd_cli else None
+        tcd_mode = _configured_tier3_browser(bridge.config) == "tcd"
+        tcd_status = await tcd_browser.probe_status() if (tcd_cli and tcd_mode) else None
         tcd_block = {
             "configured_mode": bridge.config.tier3_browser,
             "cli_present": tcd_cli,
@@ -998,7 +1037,10 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
                 "error": tcd_status.error,
                 "probe_age_seconds": int(tcd_status.age_seconds() or 0),
             },
-            "tcd_usable": bool(tcd_status and tcd_status.ok and _tcd_selftest_fresh(state)),
+            "tcd_usable": (
+                None if not tcd_mode
+                else bool(tcd_status and tcd_status.ok and _tcd_selftest_fresh(state))
+            ),
             "last_selftest_ok": state.tcd_last_selftest_ok,
             "last_selftest_at": state.tcd_last_selftest_at,
             "attempts_today": tcd_attempts,
@@ -1147,12 +1189,15 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
             session = tcd_browser.session_name(f"selftest{int(time.time())}", driver)
             run_dir = bridge.config.db_path.parent / "codex_runs" / "selftest_tcd"
             try:
+                # The bridge's own read of the tab (before the release) is the pass
+                # evidence the model cannot fake.
                 result = await executor.run_tcd_selftest(
                     run_dir, driver=driver, env={tcd_browser.SESSION_ENV: session},
+                    read_session_url=functools.partial(tcd_browser.session_url, session),
                     sandbox_mode=state.sandbox_mode, api_key=api_key,
                 )
             finally:
-                await tcd_browser.release(session)
+                await tcd_browser.release_shielded(session)
             bridge.state_store.update(
                 tcd_last_selftest_ok=result.ok, tcd_last_selftest_at=_utc_now().isoformat()
             )
@@ -1521,7 +1566,7 @@ async def _download_locked(
     # above keeps its own Chrome rule).
     state = await _maybe_rearm_codex(
         bridge, state, deadline=deadline, chrome_ok=chrome_ok,
-        codex_rate_ok=rate["codex_bridge"].allowed,
+        codex_rate_ok=rate["codex_bridge"].allowed, ensure_request=ensure_request,
     )
     tcd = await _select_tier3_browser(bridge, state)
     browser_ok = tcd or chrome_ok
@@ -1722,7 +1767,7 @@ async def _run_executor_attempt(
     if tcd:
         prompt = executor.render_tcd_prompt(run_dir)
         session = tcd_browser.session_name(str(request_id), driver)
-        tcd_kw: dict[str, Any] = {"env": {tcd_browser.SESSION_ENV: session}}
+        tcd_kw: dict[str, Any] = {"env": {tcd_browser.SESSION_ENV: session}, "tcd": True}
     else:
         prompt = executor.PROMPT_TEMPLATE.format(run_dir=str(run_dir))
         tcd_kw = {}
@@ -1736,16 +1781,16 @@ async def _run_executor_attempt(
             # row, notification or HTTP error detail.
             exec_result.notes = executor.redact_secret(exec_result.notes, api_key)
         else:
-            if tcd:
-                tcd_kw["tcd"] = True
             exec_result = await run_codex(
                 run_dir, prompt, sandbox_mode or "", wall_seconds=codex_wall, **tcd_kw
             )
         ended = _utc_now()
     finally:
         if tcd:
-            # Success, failure, timeout, kill or exception: the lease goes back.
-            await tcd_browser.release(session)
+            # Success, failure, timeout, kill, exception or cancellation: the lease goes
+            # back. A cancelled TCD run's process group is already dead (run_* kill on
+            # cancel), and the close itself is shielded from the cancellation.
+            await tcd_browser.release_shielded(session)
     screenshot = str(run_dir / "final.png") if (run_dir / "final.png").exists() else None
     if exec_result.cost_usd is not None:
         with bridge.db.transaction() as conn:
@@ -2179,7 +2224,7 @@ async def _trial_locked(
         if tcd:
             prompt = executor.render_tcd_prompt(run_dir, download_dir=trial_dl)
             session = tcd_browser.session_name(f"trial{attempt_id}", driver)
-            tcd_kw: dict[str, Any] = {"env": {tcd_browser.SESSION_ENV: session}}
+            tcd_kw: dict[str, Any] = {"env": {tcd_browser.SESSION_ENV: session}, "tcd": True}
         else:
             prompt = executor.render_prompt(run_dir, download_dir=trial_dl)
             tcd_kw = {}
@@ -2191,8 +2236,6 @@ async def _trial_locked(
                     max_budget_usd=max_budget_usd, effort=effort, **tcd_kw,
                 )
             else:
-                if tcd:
-                    tcd_kw["tcd"] = True
                 exec_result = await run_codex(
                     run_dir, prompt, state.sandbox_mode or "", wall_seconds=wall,
                     model=model, effort=effort, download_dir=trial_dl, **tcd_kw,
@@ -2200,7 +2243,7 @@ async def _trial_locked(
             ended = _utc_now()
         finally:
             if tcd:
-                await tcd_browser.release(session)
+                await tcd_browser.release_shielded(session)
         exec_result.notes = _redact_all(exec_result.notes)
         final_url = _redact_all(exec_result.final_url) or None
         kind = exec_result.kind

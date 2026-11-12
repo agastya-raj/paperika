@@ -470,6 +470,10 @@ request budget are unchanged.
   unchanged. Claude gets no new tool.
 - **Lease:** the bridge runs `tcd-browser ab --session <name> --close` (20 s timeout, best
   effort, logged) after every TCD-mode executor run, whatever its outcome or exception.
+  Cancellation: a cancelled TCD-mode executor's process group is killed and reaped (10 s)
+  before the cancellation propagates, so it cannot re-open the session after the release; the
+  release itself is shielded (`tcd_browser.release_shielded`), finishes, then re-raises. The
+  bridge's own CLI calls are killed on cancellation too. Local-mode cancellation is unchanged.
 - **Local Chrome:** a TCD-mode tier 3 does not require it and is never followed by the local
   Chrome recovery; the pre-flight and tier 2 keep their Chrome rules.
 - **Recording and limits:** attempts are `tcd_codex` / `tcd_claude` (trials `trial_tcd_codex`
@@ -478,11 +482,17 @@ request budget are unchanged.
   `trial_claude`); all four join the global LLM spacing. No extra attempt is ever added.
 - **`POST /selftest/tcd`** (token, lock; `?driver=codex|claude`, default codex when armed
   else claude): fresh status check (`503 tcd_unavailable` when down), then one executor opens
-  https://example.org through the CLI and reports `TCD_TITLE=` / `TCD_URL=`; passes only on
-  `Example Domain` and `https://example.org/` (or without the slash). Persists
-  `tcd_last_selftest_ok/at`; the bridge releases the lease.
+  https://example.org through the CLI and reports, through `OUTCOME_SCHEMA` (both drivers),
+  `gave_up` with notes `TCD_TITLE=` / `TCD_URL=`. It passes only when (a) the run completed
+  normally (that `gave_up`; never timeout, `executor_died`, auth, quota or budget), (b) the
+  pair is exactly `Example Domain` and `https://example.org/` (or without the slash), and
+  (c) the bridge's own `tcd-browser ab --session <name> -- get url` (20 s, made after the run
+  and before the release) reads the expected URL: the two strings are public constants, (c)
+  is evidence a model cannot supply. Persists `tcd_last_selftest_ok/at`; the bridge releases
+  the lease.
 - **`/healthz` `tcd` block** (authenticated tier only): `configured_mode`, `cli_present`,
-  `gateway {ok, shared_up, error, probe_age_seconds}` (null without the CLI), `tcd_usable`,
+  `gateway {ok, shared_up, error, probe_age_seconds}` (probed only when the configured mode is
+  `tcd` and the CLI exists; null otherwise), `tcd_usable` (null in local mode),
   `last_selftest_ok/at`, `attempts_today` per TCD strategy, `claude_cost_usd` and
   `trial_claude_cost_usd` month-to-date.
 - **Trials:** `/admin/trial` takes `browser: "local"|"tcd"` (default local, `422
@@ -492,10 +502,17 @@ request budget are unchanged.
 ### The codex latch re-arms itself (AGA-1702)
 
 When a `/download` reaches the tier-3 gate with codex off or its selftest stale
-(`codex_usable` false), a selftest has run before (`last_selftest_at` set), no selftest
-(manual or automatic) started in the last 24 h, codex's rate rule allows it and the local
-Chrome is up, the bridge runs the codex selftest itself under the lock, each variant's wall
-capped at 180 s and within the request budget (skipped when tier 3 would be left under
-`FALLBACK_MIN_SECONDS`). `codex_rearm_attempted_at` is written before it runs. A pass persists
-exactly what `POST /selftest/codex` does; a failure records `last_selftest_ok=false` and, for
-`codex_auth`, clears `sandbox_mode`. It never runs from `/healthz`.
+(`codex_usable` false), a selftest has run before (`last_selftest_at` set), the persisted mode
+is not `bypass`, no selftest (manual or automatic) started in the last 24 h, codex's rate rule
+allows it, the codex pool has room today for the selftest AND the paper attempt after it, and
+the local Chrome is up, the bridge runs the selftest's `workspace-write` variant alone
+(`executor.run_selftest_sandboxed`, wall capped at 180 s and within the request budget; skipped
+when tier 3 would be left under `FALLBACK_MIN_SECONDS`). It never runs the bypass variant and
+never persists `bypass`: a host that needs bypass still needs the manual `POST
+/selftest/codex`, which is unchanged. The launch is a ledger row on the current request,
+strategy `codex_selftest`, pooled with `codex_bridge` (same daily cap and spacing), resolved
+`selftest_ok` / `selftest_failed` (`interrupted` on a cancel); it never carries a screenshot,
+is never wall evidence, and the startup sweep closes it without salvaging through it.
+`codex_rearm_attempted_at` is written before it runs. A pass sets `sandbox_mode=workspace-write`
+as `POST /selftest/codex` would; a failure records `last_selftest_ok=false` and leaves
+`sandbox_mode` as it was, clearing it only on `codex_auth`. It never runs from `/healthz`.

@@ -34,6 +34,8 @@ SESSION_ENV = "TCD_BROWSER_SESSION"
 STATUS_CACHE_TTL_SECONDS = 60
 STATUS_TIMEOUT_SECONDS = 5
 RELEASE_TIMEOUT_SECONDS = 20
+SESSION_URL_TIMEOUT_SECONDS = 20
+REAP_SECONDS = 5
 MONOTONIC = time.monotonic  # module attribute so tests can stub the clock
 
 # `tcd-browser status` prints, among others:
@@ -83,8 +85,17 @@ def _cli_env() -> dict[str, str]:
     return env
 
 
+def _kill_group(proc: asyncio.subprocess.Process) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 async def _run_cli(args: list[str], *, timeout: float) -> tuple[int, str, str]:
-    """Run the CLI; on overrun killpg its group and raise TimeoutError."""
+    """Run the CLI; on overrun killpg its group and raise TimeoutError. A
+    cancellation also kills (and briefly reaps) the group before it propagates: a
+    stray `ab` call finishing after the bridge's release would lease a new tab."""
     proc = await asyncio.create_subprocess_exec(
         TCD_BROWSER_BIN, *args,
         stdin=asyncio.subprocess.DEVNULL,
@@ -95,13 +106,17 @@ async def _run_cli(args: list[str], *, timeout: float) -> tuple[int, str, str]:
     )
     try:
         out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except asyncio.CancelledError:
+        _kill_group(proc)
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            await asyncio.wait_for(proc.communicate(), timeout=REAP_SECONDS)
+        except asyncio.TimeoutError:
             pass
+        raise
+    except asyncio.TimeoutError:
+        _kill_group(proc)
         try:
-            await asyncio.wait_for(proc.communicate(), timeout=5)
+            await asyncio.wait_for(proc.communicate(), timeout=REAP_SECONDS)
         except asyncio.TimeoutError:
             pass
         raise
@@ -167,3 +182,43 @@ async def release(session: str) -> bool:
     logger.warning("tcd-browser release of %s exited %s: %s", session, code,
                    (err or out).strip()[:200])
     return False
+
+
+async def release_shielded(session: str) -> bool:
+    """``release`` shielded from cancellation: the close always runs to its end
+    (bounded by RELEASE_TIMEOUT_SECONDS) even when the request task is cancelled
+    meanwhile; that cancellation is re-raised once the close is done."""
+    task = asyncio.ensure_future(release(session))
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    if cancelled is not None:
+        raise cancelled
+    return task.result()
+
+
+async def session_url(session: str) -> tuple[str | None, str | None]:
+    """The bridge's OWN read of a session's tab: ``tcd-browser ab --session <name>
+    -- get url``. Returns (url, None), or (None, why) on any error or timeout; never
+    raises an Exception. A session that was never opened leases a fresh blank tab
+    here, so it reads as about:blank (the caller's release then closes it)."""
+    try:
+        code, out, err = await _run_cli(
+            ["ab", "--session", session, "--", "get", "url"], timeout=SESSION_URL_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        return None, f"get url timed out after {SESSION_URL_TIMEOUT_SECONDS}s"
+    except Exception as exc:
+        return None, f"get url failed: {type(exc).__name__}"
+    if code != 0:
+        return None, f"get url exited {code}: {(err or out).strip()[:200]}"
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    if not lines:
+        return None, "get url printed nothing"
+    # agent-browser may wrap output in content-boundary marker lines; the URL is the
+    # line that parses as one.
+    urls = [line for line in lines if re.match(r"^[a-z][a-z0-9+.-]*:", line)]
+    return (urls[-1] if urls else lines[-1]), None
