@@ -89,9 +89,13 @@ DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.IGNORECASE)
 # DOIs a publisher stamps into every PDF that never identify the article itself, e.g.
 # Optica's open-access licence link (https://doi.org/10.1364/OA_License_v1).
 NON_ARTICLE_DOI_PATTERN = re.compile(r"10\.1364/oa_license", re.IGNORECASE)
-URI_STRING_OPEN = re.compile(r"/URI\s*\(")
+# Optica meeting-paper DOIs: 10.1364/<meeting>.<year>.<paper code>, e.g. 10.1364/ofc.2025.m1j.5.
+OPTICA_CONFERENCE_DOI = re.compile(
+    r"^10\.1364/([a-z_]+)\.((?:19|20)\d{2})\.([a-z0-9]+(?:\.[a-z0-9]+)*)$", re.IGNORECASE
+)
 SQUASHED_TITLE_MIN_CHARS = 25
 PAGE_HEAD_CHARS = 1000
+PAGE_ONE_MAX_CHARS = 20000
 # Old-style Optica journal DOIs: 10.1364/<journal>.<volume>.<first page>.
 OPTICA_VOLUME_PAGE_DOI = re.compile(r"^10\.1364/([a-z]+)\.(\d+)\.(\d+)$", re.IGNORECASE)
 # Running-head journal names per Optica DOI journal code, as lowercase words with
@@ -764,25 +768,48 @@ class Downloader:
         first = DOI_PATTERN.search(text)
         return bool(first and NON_ARTICLE_DOI_PATTERN.match(first.group(0).lower()))
 
-    def _pdf_leads_with_hyperlink_doi(self, pdf_path: Path) -> bool:
-        """True when the first DOI in the PDF bytes lies inside a link action string
-        (/URI (...)) and is not a licence DOI: a hyperlink, typically a reference-list
-        entry, is not the paper's own identity (see _extract_pdf_identity)."""
+    def _extract_pdf_head(self, pdf_path: Path, max_chars: int = PAGE_HEAD_CHARS) -> str:
+        """The first max_chars characters of page 1 only ("" when pdftotext is unavailable)."""
+        if not shutil.which("pdftotext"):
+            return ""
         try:
-            text = pdf_path.read_bytes()[:262144].decode("latin-1", errors="ignore")
+            result = subprocess.run(
+                ["pdftotext", "-f", "1", "-l", "1", str(pdf_path), "-"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
         except Exception:
-            return False
-        first = DOI_PATTERN.search(text)
-        if not first or NON_ARTICLE_DOI_PATTERN.match(first.group(0).lower()):
-            return False
-        return self._doi_inside_link_string(text, first.start())
+            return ""
+        return (result.stdout or "")[:max_chars]
 
-    @staticmethod
-    def _doi_inside_link_string(text: str, position: int) -> bool:
-        opens = list(URI_STRING_OPEN.finditer(text, 0, position))
-        if not opens:
+    def _optica_meeting_head_corroborates(
+        self, doi: str, title: str | None, observed_doi: str | None, pdf_path: Path
+    ) -> bool:
+        """Optica meeting papers (OFC, ...) print no DOI of their own. Accept only on positive
+        evidence in the first 1,000 characters of page 1: the DOI's paper code and year as
+        standalone tokens and the requested title. A differing observed DOI must not be
+        printed anywhere on page 1 (printed there it is the paper's own and vetoes)."""
+        match = OPTICA_CONFERENCE_DOI.match(doi)
+        if not match or not title:
             return False
-        return ")" not in text[opens[-1].end() : position]
+        year, code = match.group(2), match.group(3)
+        if not (any(ch.isalpha() for ch in code) and any(ch.isdigit() for ch in code)):
+            return False
+        page = self._extract_pdf_head(pdf_path, PAGE_ONE_MAX_CHARS)
+        head = page[:PAGE_HEAD_CHARS]
+        if not head:
+            return False
+
+        def standalone(token: str) -> bool:
+            return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])", head, re.IGNORECASE))
+
+        if not (standalone(code) and standalone(year)):
+            return False
+        if not self._text_contains_normalized_title(title, head):
+            return False
+        return not (observed_doi and observed_doi.lower() in page.lower())
 
     def _optica_running_head_corroborates(self, doi: str, text: str) -> bool:
         """Old-style Optica DOIs encode journal, volume and first page (10.1364/oe.20.001798
@@ -922,13 +949,10 @@ class Downloader:
         # Only the FIRST DOI in the bytes counts. When it is a licence DOI the PDF
         # exposes no article DOI: a later DOI in the bytes may be a reference link
         # (possibly to the very paper requested), so it is never promoted.
-        # The same holds for a DOI inside a link action string (a reference hyperlink).
         doi_match = DOI_PATTERN.search(text)
         if doi_match:
             candidate_doi = doi_match.group(0).lower().rstrip(".,;)]")
-            if not NON_ARTICLE_DOI_PATTERN.match(candidate_doi) and not self._doi_inside_link_string(
-                text, doi_match.start()
-            ):
+            if not NON_ARTICLE_DOI_PATTERN.match(candidate_doi):
                 observed_doi = candidate_doi
         return observed_title, observed_doi
 
@@ -951,22 +975,6 @@ class Downloader:
         except Exception:
             return ""
 
-    def _extract_pdf_head(self, pdf_path: Path, max_chars: int = PAGE_HEAD_CHARS) -> str:
-        """The first max_chars characters of page 1 only ("" when pdftotext is unavailable)."""
-        if not shutil.which("pdftotext"):
-            return ""
-        try:
-            result = subprocess.run(
-                ["pdftotext", "-f", "1", "-l", "1", str(pdf_path), "-"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=10,
-            )
-        except Exception:
-            return ""
-        return (result.stdout or "")[:max_chars]
-
     def _verify_downloaded_pdf_identity(self, parsed: ParsedInput, pdf_path: Path) -> PdfIdentityCheck:
         observed_title, observed_doi = self._extract_pdf_identity(pdf_path)
         extracted_text = self._extract_pdf_text(pdf_path)
@@ -985,31 +993,21 @@ class Downloader:
                     observed_title,
                     normalized_requested_doi,
                 )
+            if self._optica_meeting_head_corroborates(
+                normalized_requested_doi, parsed.title, normalized_observed_doi, pdf_path
+            ):
+                return PdfIdentityCheck(
+                    True,
+                    "Matched the Optica meeting paper code, year and requested title at the head of page 1; the PDF prints no DOI of its own",
+                    observed_title or parsed.title,
+                    None,
+                )
             if normalized_observed_doi:
                 return PdfIdentityCheck(
                     False,
                     f"expected DOI {parsed.doi} but observed {normalized_observed_doi}",
                     observed_title,
                     normalized_observed_doi,
-                )
-            if self._pdf_leads_with_hyperlink_doi(pdf_path):
-                # The leading DOI is a hyperlink, not the paper's own. A citing paper's
-                # reference list carries the requested title too, so only the head of page 1
-                # (where the paper's own title sits) can vouch for it.
-                if parsed.title and self._text_contains_normalized_title(
-                    parsed.title, self._extract_pdf_head(pdf_path)
-                ):
-                    return PdfIdentityCheck(
-                        True,
-                        "Matched requested title at the head of page 1; the PDF's leading DOI is a hyperlink, not its own",
-                        observed_title or parsed.title,
-                        None,
-                    )
-                return PdfIdentityCheck(
-                    False,
-                    "the PDF's leading DOI is a hyperlink, not its own, and the requested title is not at the head of page 1",
-                    observed_title,
-                    None,
                 )
             if parsed.title and self._text_contains_normalized_title(parsed.title, extracted_text):
                 if self._pdf_leads_with_licence_doi(
