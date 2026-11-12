@@ -89,6 +89,12 @@ DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.IGNORECASE)
 # DOIs a publisher stamps into every PDF that never identify the article itself, e.g.
 # Optica's open-access licence link (https://doi.org/10.1364/OA_License_v1).
 NON_ARTICLE_DOI_PATTERN = re.compile(r"10\.1364/oa_license", re.IGNORECASE)
+# Optica meeting-paper DOIs: 10.1364/<meeting>.<year>.<paper code>, e.g. 10.1364/ofc.2025.m1j.5.
+OPTICA_CONFERENCE_DOI = re.compile(
+    r"^10\.1364/([a-z_]+)\.((?:19|20)\d{2})\.([a-z0-9]+(?:\.[a-z0-9]+)*)$", re.IGNORECASE
+)
+SQUASHED_TITLE_MIN_CHARS = 25
+PAGE_ONE_MAX_CHARS = 20000
 # Old-style Optica journal DOIs: 10.1364/<journal>.<volume>.<first page>.
 OPTICA_VOLUME_PAGE_DOI = re.compile(r"^10\.1364/([a-z]+)\.(\d+)\.(\d+)$", re.IGNORECASE)
 # Running-head journal names per Optica DOI journal code, as lowercase words with
@@ -761,6 +767,61 @@ class Downloader:
         first = DOI_PATTERN.search(text)
         return bool(first and NON_ARTICLE_DOI_PATTERN.match(first.group(0).lower()))
 
+    def _extract_pdf_page_one(self, pdf_path: Path, max_chars: int = PAGE_ONE_MAX_CHARS) -> str:
+        """Text of page 1 only ("" when pdftotext is unavailable)."""
+        if not shutil.which("pdftotext"):
+            return ""
+        try:
+            result = subprocess.run(
+                ["pdftotext", "-f", "1", "-l", "1", str(pdf_path), "-"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except Exception:
+            return ""
+        return (result.stdout or "")[:max_chars]
+
+    def _optica_meeting_head_corroborates(self, doi: str, title: str | None, pdf_path: Path) -> bool:
+        """Optica meeting papers (OFC, ...) print no DOI of their own, but their first page
+        has a fixed layout (real files):
+            M1J.5 | OFC 2025 (c) Optica Publishing Group 2025 | <title block> ...
+        Accept a 10.1364/<meeting>.<year>.<code> request only when line 1 is the paper code
+        alone (optionally with ".pdf"), line 2 names the meeting and the year, the title
+        block starts right after (lost hyphens tolerated only here) and page 1 prints no
+        other DOI. A mere occurrence of the code, year or title is not identity."""
+        match = OPTICA_CONFERENCE_DOI.match(doi)
+        if not match or not title:
+            return False
+        meeting, year, code = match.group(1).lower(), match.group(2), match.group(3).lower()
+        if not (any(ch.isalpha() for ch in code) and any(ch.isdigit() for ch in code)):
+            return False
+        page = self._extract_pdf_page_one(pdf_path)
+        lines = [line.strip() for line in page.splitlines() if line.strip()]
+        if len(lines) < 3:
+            return False
+        if lines[0].lower() not in (code, code + ".pdf"):
+            return False
+        words = re.findall(r"[a-z0-9]+", lines[1].lower())
+        if meeting.split("_")[0] not in words or year not in words:
+            return False
+
+        def squash(text: str) -> str:
+            return "".join(ch for ch in text.lower() if ch.isalnum())
+
+        squashed_title = squash(title)
+        if len(squashed_title) < SQUASHED_TITLE_MIN_CHARS:
+            return False
+        if not squash(" ".join(lines[2:])).startswith(squashed_title):
+            return False
+        flattened = "".join(page.split()).lower()
+        for printed in DOI_PATTERN.finditer(flattened):
+            found = printed.group(0)
+            if not found.startswith(doi.lower()) and not NON_ARTICLE_DOI_PATTERN.match(found):
+                return False
+        return True
+
     def _optica_running_head_corroborates(self, doi: str, text: str) -> bool:
         """Old-style Optica DOIs encode journal, volume and first page (10.1364/oe.20.001798
         is Opt. Express 20, 1798), and those papers often print no DOI, only a running
@@ -935,6 +996,13 @@ class Downloader:
                     "Matched requested DOI in extracted PDF text despite non-article DOI in PDF metadata/bytes",
                     observed_title,
                     normalized_requested_doi,
+                )
+            if self._optica_meeting_head_corroborates(normalized_requested_doi, parsed.title, pdf_path):
+                return PdfIdentityCheck(
+                    True,
+                    "Matched the Optica meeting paper code, year and requested title at the head of page 1; the PDF prints no DOI of its own",
+                    observed_title or parsed.title,
+                    None,
                 )
             if normalized_observed_doi:
                 return PdfIdentityCheck(

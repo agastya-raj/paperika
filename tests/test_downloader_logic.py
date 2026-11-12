@@ -1186,3 +1186,169 @@ def test_materialize_clicked_download_rejects_non_pdf_candidates(tmp_path: Path,
 
     assert result == target
     assert target.read_bytes().startswith(b"%PDF")
+
+
+# --- AGA-1702: Optica meeting papers are accepted on their first-page layout only ----------
+
+OFC_TITLE = "QoT Estimation with Margin-Driven Transfer Learning in Time-Varying Optical Networks"
+OFC_DOI = "10.1364/ofc.2025.m1j.5"
+NETWORKS = "10.1364/networks.2020.nem3b.2"
+REFERENCE_LINK_BYTES = (
+    b"%PDF-1.4\n239 0 obj\n<<\n/A\n<<\n/S/URI\n/Type/Action\n"
+    b"/URI(https://doi.org/10.1364/NETWORKS.2020.NeM3B.2)\n>>\n/Border"
+)
+OFC_LINE2 = "OFC 2025 \u00a9 Optica Publishing Group 2025"
+TITLE_TWO_LINES = "QoT Estimation with Margin-Driven Transfer\nLearning in Time-Varying Optical Networks"
+
+
+def _page(code: str = "M1J.5", line2: str = OFC_LINE2, title: str = TITLE_TWO_LINES, tail: str = "Authors\n") -> str:
+    return f"{code}\n{line2}\n{title}\n{tail}"
+
+
+def _identity_downloader(tmp_path: Path, monkeypatch, pdf_bytes: bytes, page: str):
+    """`page` is the text of page 1 (pdftotext -f 1 -l 1); pages 1-2 text is the same."""
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    downloader = StubDownloader(config, db)
+    pdf_path = config.download_dir / "case.pdf"
+    pdf_path.write_bytes(pdf_bytes)
+    monkeypatch.setattr(downloader, "_extract_pdf_text", lambda path, max_chars=20000: page)
+    monkeypatch.setattr(
+        downloader, "_extract_pdf_page_one", lambda path, max_chars=20000: page[:max_chars], raising=False
+    )
+    return downloader, pdf_path
+
+
+def _verify(downloader, pdf_path, doi: str = OFC_DOI, title: str = OFC_TITLE):
+    return downloader._verify_downloaded_pdf_identity(infer_input(f"{title} {doi}"), pdf_path)
+
+
+def _rejected_for_conflict(result, observed: str, doi: str = OFC_DOI):
+    assert result.ok is False
+    assert result.reason == f"expected DOI {doi} but observed {observed}"
+
+
+def _reject_case(tmp_path, monkeypatch, page, pdf_bytes=REFERENCE_LINK_BYTES, observed=NETWORKS, **kw):
+    d, p = _identity_downloader(tmp_path, monkeypatch, pdf_bytes, page)
+    _rejected_for_conflict(_verify(d, p, **kw), observed, kw.get("doi", OFC_DOI))
+
+
+def test_meeting_paper_accepted_on_first_page_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    d, p = _identity_downloader(tmp_path, monkeypatch, REFERENCE_LINK_BYTES, _page())
+    result = _verify(d, p)
+    assert result.ok is True
+    assert result.reason.startswith("Matched the Optica meeting paper code, year and requested title")
+
+
+def test_meeting_paper_accepted_with_lost_hyphen_in_title_block(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    title = "Simultaneous monitoring of 8 fiber routes by means of high-speed switching for time-sharing FDM-DAS"
+    page = _page(
+        "Th1I.2", title="Simultaneous monitoring of 8 fiber routes by means of highspeed switching for time-sharing FDM-DAS"
+    )
+    d, p = _identity_downloader(tmp_path, monkeypatch, b"%PDF-1.4\n", page)
+    assert _verify(d, p, "10.1364/ofc.2025.th1i.2", title).ok is True
+
+
+def test_meeting_paper_accepted_with_pdf_suffix_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    title = "ANN-Based Transfer Learning for QoT Prediction in Real-Time Mixed Line-Rate Systems"
+    page = _page(
+        "W4F.3.pdf", "OFC 2018 \u00a9 OSA 2018",
+        "ANN-Based Transfer Learning for QoT Prediction in RealTime Mixed Line-Rate Systems",
+    )
+    d, p = _identity_downloader(tmp_path, monkeypatch, b"%PDF-1.4\n", page)
+    assert _verify(d, p, "10.1364/ofc.2018.w4f.3", title).ok is True
+
+
+def test_other_meeting_same_code_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _reject_case(tmp_path, monkeypatch, _page(line2="CLEO 2025 \u00a9 Optica Publishing Group 2025"))
+
+
+def test_programme_listing_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = f"OFC 2025 Programme\nM1J.5: {OFC_TITLE}\nM1J.6: Another talk\n"
+    _reject_case(tmp_path, monkeypatch, page)
+
+
+def test_comment_paper_mentioning_code_and_meeting_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = f"Comment on {OFC_TITLE}\nA. Author\nAbstract: we comment on OFC 2025 paper M1J.5.\n"
+    _reject_case(tmp_path, monkeypatch, page)
+
+
+@pytest.mark.parametrize("code", ["M1J.5.1", "X.M1J.5", "XM1J.52"])
+def test_code_line_must_be_the_code_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str):
+    _reject_case(tmp_path, monkeypatch, _page(code))
+
+
+def test_wrong_year_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _reject_case(tmp_path, monkeypatch, _page(line2="OFC 2024 \u00a9 Optica Publishing Group 2024"))
+
+
+def test_title_block_must_start_with_the_title(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _reject_case(tmp_path, monkeypatch, _page(title=f"Invited: {TITLE_TWO_LINES}"))
+
+
+@pytest.mark.parametrize(
+    "printed",
+    ["https://doi.org/10.1364/oe.999999", "DOI: 10.1364/OE.999999", "doi 10.1364/\noe.999999"],
+)
+def test_other_doi_printed_on_page_one_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, printed: str):
+    # contiguous, upper case, and split by a line break
+    _reject_case(
+        tmp_path, monkeypatch, _page(tail=f"Authors\n{printed}\n"),
+        pdf_bytes=b"%PDF-1.4\n/Subject (doi:10.1364/oe.999999)\n", observed="10.1364/oe.999999",
+    )
+
+
+def test_other_doi_printed_when_first_raw_doi_is_a_link_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _reject_case(tmp_path, monkeypatch, _page(tail="Authors\nhttps://doi.org/10.1364/oe.999999\n"))
+
+
+def test_non_meeting_optica_doi_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    doi = "10.1364/oe.20.001798"
+    assert downloader_module.OPTICA_CONFERENCE_DOI.match(doi) is None
+    assert downloader_module.OPTICA_CONFERENCE_DOI.match("10.1364/jocn.409538") is None
+    _reject_case(tmp_path, monkeypatch, _page("1798", "OE 2012 Vol. 20"), doi=doi)
+
+
+def test_non_optica_doi_with_meeting_like_suffix_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _reject_case(tmp_path, monkeypatch, _page(), doi="10.1109/ofc.2025.m1j.5")
+
+
+def test_all_digit_code_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = _page("001234", "XX 2020 \u00a9 Optica 2020")
+    _reject_case(tmp_path, monkeypatch, page, doi="10.1364/xx.2020.001234")
+
+
+def test_short_title_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _reject_case(tmp_path, monkeypatch, _page(title="Margin Driven QoT"), title="Margin Driven QoT")
+
+
+def test_two_line_page_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _reject_case(tmp_path, monkeypatch, f"M1J.5\n{OFC_LINE2}\n")
+
+
+def test_pdftotext_unavailable_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    d = StubDownloader(config, db)
+    p = config.download_dir / "case.pdf"
+    p.write_bytes(REFERENCE_LINK_BYTES)
+    monkeypatch.setattr(downloader_module.shutil, "which", lambda name: None)
+    assert d._extract_pdf_page_one(p) == ""
+    _rejected_for_conflict(_verify(d, p), NETWORKS)
+
+
+def test_lost_hyphen_in_reference_list_does_not_widen_older_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # Main's containment test is unchanged: a different paper citing the title with a lost
+    # hyphen and no observable DOI is not accepted by the older fallback branches.
+    page = "A different paper\nbody\n[5] QoT Estimation with MarginDriven Transfer Learning in Time-Varying Optical Networks\n"
+    d, p = _identity_downloader(tmp_path, monkeypatch, b"%PDF-1.4\n", page)
+    with_doi = _verify(d, p)
+    assert with_doi.ok is False
+    assert with_doi.reason == "downloaded PDF did not expose the requested DOI or a strong title match in extracted text"
+    title_only = d._verify_downloaded_pdf_identity(infer_input(OFC_TITLE), p)
+    assert title_only.ok is False
+    assert title_only.reason == "downloaded PDF did not expose a matching DOI or strong title"
