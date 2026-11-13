@@ -67,7 +67,10 @@ if argv[:1] == ["status"]:
     sys.stdout.write(os.environ.get("STUB_TCD_STATUS", ""))
     sys.exit(int(os.environ.get("STUB_TCD_STATUS_RC", "0")))
 if argv[:1] == ["ask"]:
-    sys.exit(int(os.environ.get("STUB_TCD_ASK_RC", "5")))  # old CLI: ask unavailable
+    if "STUB_TCD_ASK_RC" not in os.environ:  # a CLI from before `ask`: exit 2, as in production
+        sys.stderr.write("tcd-browser: unknown command 'ask' (run, ab, mcp, login, view)\n")
+        sys.exit(2)
+    sys.exit(int(os.environ["STUB_TCD_ASK_RC"]))
 if argv[-1:] == ["--close"]:
     fails = int(os.environ.get("STUB_TCD_CLOSE_FAILS", "0"))
     if fails:
@@ -305,8 +308,11 @@ def human_check(cfg, cli, monkeypatch):
             calls["open"] = False
             return 0, "", ""
         code = calls["codes"].pop(0)
+        if code == "old":  # a CLI from before `ask`: exit 2 and "unknown command"
+            calls["open"] = False
+            return 2, "", "tcd-browser: unknown command 'ask' (run, ab, mcp, login, view)"
         calls["open"] = code in {2, 4}
-        return code, "", "unknown subcommand" if code == 5 else ""
+        return code, "", ""
 
     async def _codex(run_dir, prompt, sandbox_mode, **kwargs):
         calls["runs"] += 1
@@ -401,7 +407,7 @@ def test_human_check_declined_is_terminal_and_closed(cfg, human_check, later):
 
 
 def test_human_check_unknown_ask_keeps_legacy_response_and_handoff(cfg, human_check):
-    human_check["codes"] = [5]
+    human_check["codes"] = ["old"]
     with TestClient(bridge_app.create_app(cfg)) as client:
         response = _download(client)
     assert response.status_code == 502 and response.json()["error_code"] == "bot_wall"
