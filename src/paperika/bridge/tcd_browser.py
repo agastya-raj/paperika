@@ -250,6 +250,28 @@ async def probe_status(*, fresh: bool = False) -> StatusResult:
     return result
 
 
+async def ask_human_check(
+    url: str, *, reason: str = "", wait_seconds: int = 0, withdraw: bool = False,
+) -> str:
+    """The ask CLI adapter: done=0, pending=2/4, declined=3; all other exits,
+    a missing/older CLI or subprocess errors mean unavailable. Only the human
+    operates the check; this call files, waits for or withdraws their request."""
+    args = (["ask", "--withdraw", url] if withdraw else
+            ["ask", url, "--reason", reason, "--wait", str(wait_seconds)])
+    try:
+        code, _out, err = await _run_cli(args, timeout=max(0, wait_seconds) + 20)
+    except Exception as exc:
+        logger.warning("tcd-browser ask unavailable: %s", type(exc).__name__)
+        return "unavailable"
+    if "unknown command" in (err or "").lower():
+        # A CLI from before `ask` answers "unknown command 'ask'" with exit 2, the
+        # same code as "the wait ran out" (seen on the Mac and on gpu, 13 Nov 2026).
+        # Reading that as pending would park every walled paper with nothing on his
+        # screen.
+        return "unavailable"
+    return {0: "done", 2: "pending", 3: "declined", 4: "pending"}.get(code, "unavailable")
+
+
 def reset_status_cache() -> None:
     global _cached_status
     _cached_status = None

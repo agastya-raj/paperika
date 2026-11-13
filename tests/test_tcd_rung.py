@@ -66,6 +66,11 @@ if os.environ.get("STUB_TCD_SLEEP"):
 if argv[:1] == ["status"]:
     sys.stdout.write(os.environ.get("STUB_TCD_STATUS", ""))
     sys.exit(int(os.environ.get("STUB_TCD_STATUS_RC", "0")))
+if argv[:1] == ["ask"]:
+    if "STUB_TCD_ASK_RC" not in os.environ:  # a CLI from before `ask`: exit 2, as in production
+        sys.stderr.write("tcd-browser: unknown command 'ask' (run, ab, mcp, login, view)\n")
+        sys.exit(2)
+    sys.exit(int(os.environ["STUB_TCD_ASK_RC"]))
 if argv[-1:] == ["--close"]:
     fails = int(os.environ.get("STUB_TCD_CLOSE_FAILS", "0"))
     if fails:
@@ -278,6 +283,209 @@ def _download(client: TestClient):
 def _releases(calls: list[dict]) -> list[str]:
     return [c["argv"][2] for c in calls
             if c["argv"][:2] == ["ab", "--session"] and c["argv"][3:] == ["--close"]]
+
+
+# ----------------------------------------------- AGA-1707: human checks ---
+
+
+@pytest.fixture
+def human_check(cfg, cli, monkeypatch):
+    _ready_state(_tcd_cfg(cfg))
+    calls = {"asks": [], "runs": 0, "codes": [2], "open": False, "elapsed": 0}
+    original_cli = tcd_browser._run_cli
+    now = _now()
+    monkeypatch.setattr(limits, "utc_now", lambda: now + timedelta(seconds=calls["elapsed"]))
+    monkeypatch.setattr(bridge_app, "MONOTONIC", lambda: calls["elapsed"])
+
+    async def _sleep(seconds):
+        calls["elapsed"] += seconds
+
+    async def _cli(args, **kwargs):
+        if args[0] != "ask":
+            return await original_cli(args, **kwargs)
+        calls["asks"].append(args)
+        if args[1] == "--withdraw":
+            calls["open"] = False
+            return 0, "", ""
+        code = calls["codes"].pop(0)
+        if code == "old":  # a CLI from before `ask`: exit 2 and "unknown command"
+            calls["open"] = False
+            return 2, "", "tcd-browser: unknown command 'ask' (run, ab, mcp, login, view)"
+        calls["open"] = code in {2, 4}
+        return code, "", ""
+
+    async def _codex(run_dir, prompt, sandbox_mode, **kwargs):
+        calls["runs"] += 1
+        (run_dir / "final.png").write_bytes(b"wall screenshot")
+        if calls.get("download") and calls["runs"] > 1:
+            return await _fake_codex([], kind="downloaded", cfg=cfg)(run_dir, prompt, sandbox_mode, **kwargs)
+        return executor.ExecResult(kind="bot_wall", final_url=calls.get("url", "https://pub.example/check"),
+                                   notes="human verification required")
+
+    monkeypatch.setattr(bridge_app, "SLEEP", _sleep)
+    monkeypatch.setattr(tcd_browser, "_run_cli", _cli)
+    monkeypatch.setattr(bridge_app, "run_codex", _codex)
+    return calls
+
+
+def test_human_check_done_retries_once_and_verifies_pdf(cfg, human_check):
+    human_check.update(codes=[0], download=True)
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        response = _download(client)
+    assert response.status_code == 200 and response.content.startswith(b"%PDF-")
+    assert human_check["runs"] == 2 and len(human_check["asks"]) == 1
+    assert human_check["elapsed"] >= 180  # the extra attempt obeys the same spacing
+    with _conn(cfg) as conn:
+        assert conn.execute("SELECT status FROM paper_requests").fetchone()[0] == "completed"
+        assert conn.execute("SELECT verified_pdf FROM papers").fetchone()[0] == 1
+        assert [r[0] for r in conn.execute("SELECT outcome FROM paper_attempts WHERE strategy='tcd_codex'")] == [
+            "bot_wall", "completed"]
+
+
+@pytest.mark.parametrize("code,url", [(2, "https://pub.example/check"), (4, "https://pub.example/check"), (2, None)])
+def test_human_check_pending_keeps_wall_fields_and_retry_hint(cfg, human_check, code, url):
+    human_check["codes"] = [code]
+    human_check["url"] = url
+    expected_url = url or f"https://doi.org/{DOI}"
+    cfg.human_check_retry_seconds = 321
+    title = "Paper " * 20
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        response = client.post("/download", headers=_auth(), json={"doi": DOI, "title": title})
+    assert response.status_code == 502
+    assert response.json()["error_code"] == "human_check_pending"
+    assert response.json()["retry_after_seconds"] == 321
+    assert human_check["asks"] == [["ask", expected_url, "--reason",
+        f"Paper download: {title.strip()[:80]}. Pass the human check; the download finishes by itself.",
+        "--wait", "180"]]
+    with _conn(cfg) as conn:
+        row = conn.execute("SELECT * FROM paper_requests").fetchone()
+    assert row["status"] == "failed"
+    assert row["manual_reason"] == "waiting for Agastya to pass a human check in the shared browser"
+    assert row["manual_suggested_next_action"] == (
+        "A request is waiting in the tcd-browser extension: open it and pass the check. "
+        "The download is tried again automatically; nothing needs to be saved by hand.")
+    assert row["manual_current_url"] == expected_url
+    assert Path(row["manual_screenshot_path"]).read_bytes() == b"wall screenshot"
+
+
+def test_human_check_pending_re_request_after_restart_spends_no_tier(cfg, human_check, monkeypatch):
+    human_check["codes"] = [2, 4]
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        first = _download(client)
+    with _conn(cfg) as conn:
+        before = [tuple(r) for r in conn.execute("SELECT * FROM paper_attempts")]
+
+    async def _refuse(**kwargs):
+        raise AssertionError("pending request must not run a fetch or Chrome preflight")
+
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _refuse)
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _refuse)
+    monkeypatch.setattr(bridge_app, "_chrome_preflight", _refuse)
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        again = _download(client)
+    assert again.json()["error_code"] == "human_check_pending"
+    assert again.json()["request_id"] == first.json()["request_id"]
+    assert human_check["runs"] == 1 and human_check["asks"][-1][-2:] == ["--wait", "0"]
+    with _conn(cfg) as conn:
+        assert [tuple(r) for r in conn.execute("SELECT * FROM paper_attempts")] == before
+        assert conn.execute("SELECT COUNT(*) FROM paper_requests").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("later", [False, True])
+def test_human_check_declined_is_terminal_and_closed(cfg, human_check, later):
+    human_check["codes"] = [2, 3] if later else [3]
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        if later:
+            assert _download(client).json()["error_code"] == "human_check_pending"
+        response = _download(client)
+    assert response.json()["error_code"] == "bot_wall"
+    assert "retry_after_seconds" not in response.json()
+    assert human_check["runs"] == 1 and not human_check["open"]
+    with _conn(cfg) as conn:
+        assert conn.execute("SELECT manual_reason FROM paper_requests").fetchone()[0] == "he declined the human check"
+        assert conn.execute("SELECT outcome FROM paper_attempts WHERE strategy='tcd_codex'").fetchone()[0] == "bot_wall"
+
+
+def test_human_check_unknown_ask_keeps_legacy_response_and_handoff(cfg, human_check):
+    human_check["codes"] = ["old"]
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        response = _download(client)
+    assert response.status_code == 502 and response.json()["error_code"] == "bot_wall"
+    assert response.json()["detail"] == "human verification required"
+    with _conn(cfg) as conn:
+        row = conn.execute("SELECT * FROM paper_requests").fetchone()
+    assert row["manual_reason"] == bridge_app._codex_wall_reason([], "bot_wall")
+    assert row["manual_suggested_next_action"] == bridge_app._wall_suggested_action("https://pub.example/check")
+    assert human_check["runs"] == 1
+
+
+def test_human_check_returning_wall_does_not_ask_twice(cfg, human_check):
+    human_check["codes"] = [0]
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        response = _download(client)
+    assert response.json()["error_code"] == "bot_wall" and human_check["runs"] == 2
+    assert len(human_check["asks"]) == 1
+    with _conn(cfg) as conn:
+        assert conn.execute("SELECT manual_reason FROM paper_requests").fetchone()[0] == "the human check came back after his pass"
+
+
+def test_human_check_done_without_driver_budget_stays_pending(cfg, human_check, monkeypatch):
+    human_check["codes"] = [0]
+    monkeypatch.setitem(limits.RATE_RULES, "codex_bridge", (180, 1))
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        response = _download(client)
+    assert response.json()["error_code"] == "human_check_pending"
+    assert human_check["runs"] == 1 and human_check["elapsed"] == 0
+
+
+def test_human_check_done_on_later_request_runs_ladder(cfg, human_check):
+    human_check.update(codes=[2, 0], download=True)
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        assert _download(client).json()["error_code"] == "human_check_pending"
+        human_check["elapsed"] += cfg.human_check_retry_seconds
+        response = _download(client)
+    assert response.status_code == 200 and human_check["runs"] == 2
+    assert len(human_check["asks"]) == 2 and human_check["asks"][-1][-1] == "0"
+
+
+def test_human_check_expiry_withdraws_before_fresh_ladder(cfg, human_check):
+    human_check.update(codes=[2, 5])
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        assert _download(client).json()["error_code"] == "human_check_pending"
+        with _conn(cfg) as conn:
+            conn.execute("UPDATE paper_attempts SET finished_at=? WHERE outcome='human_check_pending'",
+                         ((_now() - timedelta(hours=25)).isoformat(),))
+        human_check["elapsed"] += cfg.human_check_retry_seconds
+        response = _download(client)
+    assert response.json()["error_code"] == "bot_wall" and human_check["runs"] == 2
+    assert human_check["asks"][1] == ["ask", "--withdraw", "https://pub.example/check"]
+
+
+@pytest.mark.parametrize("mode,wait", [("local", 180), ("tcd", 0)])
+def test_human_check_disabled_or_local_keeps_legacy_flow(cfg, human_check, mode, wait):
+    cfg.tier3_browser = mode
+    cfg.human_check_wait_seconds = wait
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        response = _download(client)
+    assert response.json()["error_code"] == "bot_wall"
+    assert human_check["asks"] == [] and human_check["runs"] == 1
+
+
+def test_human_check_never_asks_for_unclassified_wall(cfg, human_check, monkeypatch):
+    _ready_state(cfg, sandbox_mode=None, last_selftest_at=None)
+
+    async def _wall_direct(**kwargs):
+        return direct_fetch.DirectFetchResult(kind="wall")
+
+    async def _wall_scripted(**kwargs):
+        return scripted_browser.ScriptedFetchResult(kind="wall")
+
+    monkeypatch.setattr(bridge_app, "attempt_direct_fetch", _wall_direct)
+    monkeypatch.setattr(bridge_app, "attempt_scripted_fetch", _wall_scripted)
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        response = _download(client)
+    assert response.json()["error_code"] == "bot_wall_unclassified"
+    assert human_check["asks"] == [] and human_check["runs"] == 0
 
 
 def _insert_attempt(cfg: PaperikaConfig, strategy: str, started: datetime,

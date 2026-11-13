@@ -197,7 +197,7 @@ The design's handler vocabulary (`in_progress`/`completed`/`failed`) does NOT
 collide with these. The bridge uses, on its OWN rows:
 - request status: `in_progress` (write-ahead) → `completed` | `failed`.
 - attempt `outcome` (new column): `running` → `completed` | `wrong_paper` |
-  `throttled` | `no_access` | `bot_wall` | `executor_gave_up` | `auth_error` |
+  `throttled` | `no_access` | `bot_wall` | `human_check_pending` | `executor_gave_up` | `auth_error` |
   `timeout` | `executor_died` | `codex_quota` | `claude_auth` | `claude_budget` |
   `interrupted`.
 - attempt `status` (NOT NULL mirror): `running` while in-flight; `downloaded` on
@@ -551,6 +551,62 @@ request budget are unchanged.
   invalid_browser`); `tcd` needs that trial's own driver to be TCD-ready (`503
   tcd_unavailable`), skips the Chrome
   pre-flight, uses the trial's private download dir, and the response carries `browser`.
+
+### Human checks through the extension (AGA-1707)
+
+Only a tier-3 **TCD-mode** executor's confirmed `bot_wall` asks Agastya to pass the
+check in the shared browser. Local mode and `bot_wall_unclassified` retain their
+existing behavior. No executor or script may click, solve or bypass a human check;
+the existing driver prompts and restrictions are unchanged.
+
+`PaperikaConfig` settings (integer environment overrides):
+
+| Field | Environment variable | Default |
+|---|---|---|
+| `human_check_wait_seconds` | `PAPERIKA_HUMAN_CHECK_WAIT_SECONDS` | 180; 0 disables this entire flow |
+| `human_check_retry_seconds` | `PAPERIKA_HUMAN_CHECK_RETRY_SECONDS` | 900 |
+| `human_check_max_age_hours` | `PAPERIKA_HUMAN_CHECK_MAX_AGE_HOURS` | 24 |
+
+The single CLI adapter is `bridge/tcd_browser.py:ask_human_check`. It runs
+`tcd-browser ask <wall URL> --reason "Paper download: <title, at most 80 chars>. Pass the human check; the download finishes by itself." --wait <seconds>`.
+The URL is the executor attempt's `current_url` (reported `final_url`), else the
+request's canonical/source URL. The wait is capped to the remaining request
+deadline. Exit 0 means Done; 2 or 4 means still pending; 3 means declined (the CLI
+closes the ask). Any other exit, missing binary, timeout or exception means ask
+unavailable and preserves the previous terminal `bot_wall` behavior and text.
+Repeated asks for a URL attach to the same request without another notification.
+
+- Done within the wait: try **one** more TCD tier-3 attempt on the same request,
+  using the usual driver readiness, pooled spacing/daily caps and original request
+  deadline. A short cooldown may be waited out. The normal identity gate still
+  decides acceptance. If no driver can run, return pending. If the wall returns,
+  finish terminal `bot_wall`, with reason `the human check came back after his pass`;
+  never ask a second time in that ladder.
+- Still pending: **HTTP 502 `human_check_pending` is retryable**, with
+  `retry_after_seconds = human_check_retry_seconds` and `request_id`/`screenshot`.
+  The request is `failed`; its last TCD attempt's durable outcome is
+  `human_check_pending`. The existing `manual_*` hand-off columns are filled:
+  reason `waiting for Agastya to pass a human check in the shared browser`;
+  next action `A request is waiting in the tcd-browser extension: open it and pass the check. The download is tried again automatically; nothing needs to be saved by hand.`
+  Screenshot, page title and URL retain the existing wall hand-off semantics.
+- Declined: terminal `bot_wall`, reason `he declined the human check`; no open ask.
+
+Before any tier or Chrome pre-flight, a later `/download` checks the latest request
+for the normalized DOI. If its last attempt is `human_check_pending`, it polls the
+stored URL with `ask --wait 0`. Still pending returns the same error and retry hint
+immediately, without a fetch, LLM attempt or new request row, and without refreshing
+the pending timestamp. Done runs the normal ladder (deterministic tiers included);
+a returning tier-3 TCD wall is terminal. Declined or ask unavailable finishes the
+stored request as terminal `bot_wall` (the latter with the original hand-off text).
+When the pending attempt's `finished_at` is older than `human_check_max_age_hours`,
+the next request first runs `tcd-browser ask --withdraw <stored URL>`, retires the
+pending outcome to `bot_wall`, and proceeds through a fresh ladder. This uses the
+existing ledger and hand-off columns; no schema migration is needed.
+
+The bridge remains on-demand: Knowledge Center must treat `human_check_pending`
+as retryable and re-request after the hint. The bridge adds no poller or scheduled
+job. The ask's own CLI timeout is its wait plus five seconds, within the existing
+request budget.
 
 ### The codex latch re-arms itself (AGA-1702)
 

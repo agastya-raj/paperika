@@ -232,6 +232,7 @@ _TAXONOMY: dict[str, tuple[str, str, int, str]] = {
     "throttled": ("throttled", "download_throttled", 429, "throttled"),
     "paywalled_no_access": ("no_access", "no_institutional_access", 403, "paywalled_no_access"),
     "bot_wall": ("bot_wall", "bot_wall", 502, "bot_wall"),
+    "human_check_pending": ("human_check_pending", "bot_wall", 502, "human_check_pending"),
     # Both deterministic tiers walled and codex was unavailable to classify — a
     # DISTINCT error_code from codex-confirmed "bot_wall" (AGA-596 P1), still a
     # retryable 502. KC has carried it in RETRYABLE_CODES since AGA-596 P1
@@ -1523,6 +1524,96 @@ async def _chrome_preflight(bridge: Bridge) -> bool:
     return chrome_ok
 
 
+_HUMAN_CHECK_PENDING_REASON = "waiting for Agastya to pass a human check in the shared browser"
+_HUMAN_CHECK_NEXT_ACTION = (
+    "A request is waiting in the tcd-browser extension: open it and pass the check. "
+    "The download is tried again automatically; nothing needs to be saved by hand."
+)
+
+
+def _human_check_reason(title: str) -> str:
+    return f"Paper download: {title[:80]}. Pass the human check; the download finishes by itself."
+
+
+async def _check_pending_human_check(bridge: Bridge, *, doi: str, title: str) -> tuple[Response | None, bool]:
+    """Poll only the latest request for this DOI, before any tier or Chrome work.
+    Repeated pending answers do not rewrite its timestamp or extend its lifetime."""
+    if bridge.config.human_check_wait_seconds <= 0 or _configured_tier3_browser(bridge.config) != "tcd":
+        return None, False
+    with bridge.db.transaction() as conn:
+        row = conn.execute(
+            "SELECT r.id AS request_id, r.status AS request_status, r.inferred_url, "
+            "r.manual_current_url, r.manual_screenshot_path, a.* "
+            "FROM paper_requests r LEFT JOIN paper_attempts a ON a.id = "
+            "(SELECT MAX(id) FROM paper_attempts WHERE request_id = r.id) "
+            "WHERE r.inferred_doi = ? ORDER BY r.id DESC LIMIT 1", (doi,),
+        ).fetchone()
+    if (row is None or row["request_status"] != "failed" or row["outcome"] != "human_check_pending"
+            or row["strategy"] not in {"tcd_codex", "tcd_claude"}):
+        return None, False
+    url = row["manual_current_url"] or row["current_url"] or row["inferred_url"]
+    pending_at = _parse_iso(row["finished_at"])
+    if pending_at is not None and _utc_now() - pending_at > timedelta(hours=bridge.config.human_check_max_age_hours):
+        await tcd_browser.ask_human_check(url, withdraw=True)
+        bridge.resolve_attempt(row["id"], outcome="bot_wall", message="human check request expired")
+        return None, False
+    result = await tcd_browser.ask_human_check(url, reason=_human_check_reason(title), wait_seconds=0)
+    if result == "pending":
+        return _json_error(
+            502, "human_check_pending", _HUMAN_CHECK_PENDING_REASON,
+            request_id=str(row["request_id"]), screenshot=row["manual_screenshot_path"],
+            retry_after_seconds=bridge.config.human_check_retry_seconds,
+        ), False
+    if result == "done":
+        bridge.resolve_attempt(row["id"], outcome="bot_wall", message="human check passed; resuming download")
+        return None, True  # normal ladder; a returning wall must not ask again
+    return _finish_failure(
+        bridge, kind="bot_wall", request_id=row["request_id"], attempt_id=row["id"],
+        screenshot=row["manual_screenshot_path"], final_url=url, message="bot_wall",
+        wall_reason="he declined the human check" if result == "declined" else None,
+    ), False
+
+
+async def _retry_after_human_check(
+    bridge: Bridge, *, request_id: int, run_dir: Path, doi: str, title: str,
+    start_url: str, deadline: float,
+) -> Response | None:
+    """ONE extra TCD attempt, under the usual readiness, pooled caps, spacing and
+    deadline. No driver available (including after a short cooldown): stay pending.
+    There is no second fallback chain and no second human ask."""
+    state = bridge.state_store.load()
+    ready = []
+    for driver, armed in (("codex", bool(state.sandbox_mode)), ("claude", _claude_ready(state))):
+        if armed and await _tcd_not_ready_reason(state, driver) is None:
+            ready.append(driver)
+
+    def decisions() -> dict[str, limits.RateDecision]:
+        with bridge.db.transaction() as conn:
+            return {driver: limits.check_rate(conn, f"tcd_{driver}") for driver in ready
+                    if not limits.pool_at_daily_cap(conn, f"tcd_{driver}")}
+
+    rate = decisions()
+    if not any(d.allowed for d in rate.values()):
+        waits = [d.retry_after_seconds for d in rate.values() if d.error_code == "cooldown"
+                 and d.retry_after_seconds is not None and d.retry_after_seconds <= TIER3_COOLDOWN_WAIT_MAX]
+        if waits and deadline - MONOTONIC() - min(waits) >= FALLBACK_MIN_SECONDS + CLEANUP_RESERVE_SECONDS:
+            await SLEEP(min(waits))
+            rate = decisions()
+    driver = next((d for d in ready if d in rate and rate[d].allowed), None)
+    wall = min(float(executor.EXEC_WALL_SECONDS), deadline - MONOTONIC() - CLEANUP_RESERVE_SECONDS)
+    if driver is None or wall < FALLBACK_MIN_SECONDS:
+        return None
+    socket_dir = tcd_browser.make_socket_dir(run_dir)
+    if socket_dir is None:
+        return None
+    return await _run_executor_attempt(
+        bridge, driver=driver, request_id=request_id, run_dir=run_dir, doi=doi,
+        title=title, start_url=start_url, sandbox_mode=state.sandbox_mode if driver == "codex" else None,
+        defer_failure=False, deadline=deadline, api_key=executor.anthropic_api_key() if driver == "claude" else None,
+        codex_wall=wall, claude_wall=wall, tcd=True, socket_dir=socket_dir, human_check_passed=True,
+    )
+
+
 async def _download_locked(
     bridge: Bridge, *, doi: str, title: str, start_url: str, requested_by: str
 ) -> Response:
@@ -1532,6 +1623,9 @@ async def _download_locked(
     escalate — codex stays the sole terminal-classification authority, except a
     both-tiers bot wall with codex unavailable, mapped to a retryable 502
     bot_wall_unclassified (AGA-596 P1)."""
+    pending_response, human_check_passed = await _check_pending_human_check(bridge, doi=doi, title=title)
+    if pending_response is not None:
+        return pending_response
     state = bridge.state_store.load()
     deadline = MONOTONIC() + REQUEST_BUDGET_SECONDS
 
@@ -1784,6 +1878,7 @@ async def _download_locked(
             start_url=start_url, sandbox_mode=state.sandbox_mode if codex_ready else None,
             claude_go=claude_go, deadline=deadline, codex_wall=codex_wall, tcd=tcd,
             socket_dir=socket_dir,
+            human_check_passed=human_check_passed,
         )
 
     # Codex is unavailable. Both deterministic tiers hitting a wall is the one
@@ -1883,6 +1978,7 @@ async def _run_tier3(
     start_url: str, sandbox_mode: str | None, claude_go: bool, deadline: float,
     codex_wall: float = float(executor.EXEC_WALL_SECONDS), tcd: bool = False,
     socket_dir: Path | None = None,
+    human_check_passed: bool = False,
 ) -> Response:
     """Tier 3 driver chain (AGA-1460): codex first when usable, claude as the
     automatic fallback. ``sandbox_mode=None`` means codex is unusable (no selftest /
@@ -1896,6 +1992,7 @@ async def _run_tier3(
             title=title, start_url=start_url, sandbox_mode=sandbox_mode,
             defer_failure=claude_go, deadline=deadline, pending=pending, codex_wall=codex_wall,
             tcd=tcd, socket_dir=socket_dir,
+            human_check_passed=human_check_passed,
         )
         socket_dir = None  # consumed: codex's close released (and on success removed) it
         if response is not None:
@@ -1926,6 +2023,7 @@ async def _run_tier3(
         claude_wall=max(1.0, min(float(executor.EXEC_WALL_SECONDS),
                                  remaining - CLEANUP_RESERVE_SECONDS)),
         tcd=tcd, socket_dir=socket_dir,
+        human_check_passed=human_check_passed,
     )
     assert response is not None
     return response
@@ -1939,6 +2037,7 @@ async def _run_executor_attempt(
     pending: dict[str, Any] | None = None,
     tcd: bool = False,
     socket_dir: Path | None = None,
+    human_check_passed: bool = False,
 ) -> Response | None:
     """One tier-3 executor attempt (``driver`` = codex | claude). Writes its own
     write-ahead row, runs the executor, resolves the terminal taxonomy (§2.7) — the
@@ -2003,12 +2102,20 @@ async def _run_executor_attempt(
             limits.record_attempt_cost(conn, attempt_id, exec_result.cost_usd)
 
     bad_outcome = exec_result.kind in {"timeout", "gave_up", "executor_died", "claude_budget"}
-    response = await _resolve_outcome(
-        bridge, exec_result=exec_result, request_id=request_id, attempt_id=attempt_id,
-        doi=doi, title=title, run_dir=run_dir, window_start=started, window_end=ended,
-        screenshot=screenshot, tier_label=strategy,
-        defer_failure=defer_failure, deferred=pending,
-    )
+    human_wall = tcd and exec_result.kind == "bot_wall" and bridge.config.human_check_wait_seconds > 0
+    if human_wall:
+        # Persist the wall before any cancellable human wait, without announcing a
+        # terminal failure. The usual sweep can recover this evidence after a crash.
+        bridge.resolve_attempt(attempt_id, outcome="bot_wall", message=exec_result.notes or "bot_wall",
+                               screenshot_path=screenshot, current_url=exec_result.final_url)
+        response = None
+    else:
+        response = await _resolve_outcome(
+            bridge, exec_result=exec_result, request_id=request_id, attempt_id=attempt_id,
+            doi=doi, title=title, run_dir=run_dir, window_start=started, window_end=ended,
+            screenshot=screenshot, tier_label=strategy,
+            defer_failure=defer_failure, deferred=pending,
+        )
 
     # A runtime auth failure means that driver's login/key is dead. Retrying burns
     # the wall on every request while it stays dead. Clear its readiness latch so
@@ -2023,6 +2130,31 @@ async def _run_executor_attempt(
         bridge.state_store.update(claude_last_selftest_ok=False)
     if late_cancel is not None:
         raise late_cancel  # only now: the outcome above is already persisted
+
+    if human_wall:
+        failure = dict(request_id=request_id, attempt_id=attempt_id, screenshot=screenshot,
+                       final_url=exec_result.final_url, message=exec_result.notes or "bot_wall")
+        if human_check_passed:
+            return _finish_failure(bridge, kind="bot_wall", **failure,
+                                   wall_reason="the human check came back after his pass")
+        url = _preferred_current_url(bridge, request_id, exec_result.final_url) or start_url
+        wait = min(bridge.config.human_check_wait_seconds, max(0, int(deadline - MONOTONIC() - 5)))
+        result = await tcd_browser.ask_human_check(url, reason=_human_check_reason(title), wait_seconds=wait)
+        if result == "done":
+            retried = await _retry_after_human_check(
+                bridge, request_id=request_id, run_dir=run_dir, doi=doi, title=title,
+                start_url=url, deadline=deadline,
+            )
+            if retried is not None:
+                return retried
+        if result in {"done", "pending"}:
+            # Store the exact ask URL (not a previous deterministic tier's URL).
+            failure["final_url"] = url
+            return _finish_failure(bridge, kind="human_check_pending", **failure)
+        return _finish_failure(
+            bridge, kind="bot_wall", **failure,
+            wall_reason="he declined the human check" if result == "declined" else None,
+        )
 
     # chrome recovery on bad outcomes (still holding the lock). After a claude run
     # that overran the request deadline, skip it: KC has already timed out and the
@@ -2287,8 +2419,11 @@ def _codex_wall_reason(walled_tiers: list[str], kind: str) -> str:
 def _finish_failure(
     bridge: Bridge, *, kind: str, request_id: int, attempt_id: int,
     screenshot: str | None, message: str, final_url: str | None = None,
+    wall_reason: str | None = None,
 ) -> Response:
     outcome, event_type, http_status, error_code = _TAXONOMY[kind]
+    if kind == "human_check_pending":
+        message = _HUMAN_CHECK_PENDING_REASON
     bridge.resolve_attempt(attempt_id, outcome=outcome, message=message, screenshot_path=screenshot,
                            current_url=final_url)
     # Deterministic-tier (or a PRIOR codex run's) wall evidence is read back from
@@ -2301,7 +2436,7 @@ def _finish_failure(
         request_id, exclude_attempt_id=attempt_id
     )
     manual = None
-    if kind == "bot_wall" or walled_tiers:
+    if kind in {"bot_wall", "human_check_pending"} or walled_tiers:
         # Preference order for current_url (AGA-596 review round 2, finding 3):
         # codex's own final_url, else the last deterministic tier's wall URL,
         # else the request's own stored inferred_url — codex's OUTCOME_SCHEMA
@@ -2309,11 +2444,13 @@ def _finish_failure(
         # deterministic wall must still get a usable URL, not a bare NULL.
         current_url = _preferred_current_url(bridge, request_id, final_url, last_wall_url)
         manual = ManualIntervention(
-            reason=_codex_wall_reason(walled_tiers, kind),
+            reason=(_HUMAN_CHECK_PENDING_REASON if kind == "human_check_pending" else
+                    wall_reason or _codex_wall_reason(walled_tiers, kind)),
             screenshot_path=screenshot,
             page_title=None,
             current_url=current_url,
-            suggested_next_action=_wall_suggested_action(current_url),
+            suggested_next_action=(_HUMAN_CHECK_NEXT_ACTION if kind == "human_check_pending" else
+                                   _wall_suggested_action(current_url)),
         )
     try:
         applied = bridge.db.update_request_status(request_id, "failed", manual=manual)
@@ -2326,8 +2463,10 @@ def _finish_failure(
             event_type=event_type, request_id=request_id, paper_id=None,
             status_after="failed", status_before="in_progress", message=message,
         )
-    return _json_error(http_status, error_code, message, request_id=str(request_id),
-                       screenshot=screenshot)
+    extra = ({"retry_after_seconds": bridge.config.human_check_retry_seconds}
+             if kind == "human_check_pending" else {})
+    return _json_error(http_status, error_code, wall_reason or message, request_id=str(request_id),
+                       screenshot=screenshot, **extra)
 
 
 def _redact_all(text: str | None) -> str:
