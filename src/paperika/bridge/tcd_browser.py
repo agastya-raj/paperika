@@ -251,13 +251,15 @@ async def probe_status(*, fresh: bool = False) -> StatusResult:
 
 
 async def ask_human_check(
-    url: str, *, reason: str = "", wait_seconds: int = 0, withdraw: bool = False,
+    url: str, *, reason: str = "", task: str = "", wait_seconds: int = 0, withdraw: bool = False,
 ) -> str:
     """The ask CLI adapter: done=0, pending=2/4, declined=3; all other exits,
     a missing/older CLI or subprocess errors mean unavailable. Only the human
-    operates the check; this call files, waits for or withdraws their request."""
+    operates the check; this call files, waits for or withdraws their request.
+    ``task`` is the name his inbox groups the request under."""
     args = (["ask", "--withdraw", url] if withdraw else
-            ["ask", url, "--reason", reason, "--wait", str(wait_seconds)])
+            ["ask", url, "--reason", reason, *(["--task", task] if task else []),
+             "--wait", str(wait_seconds)])
     try:
         code, _out, err = await _run_cli(args, timeout=max(0, wait_seconds) + 20)
     except Exception as exc:

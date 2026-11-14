@@ -1070,7 +1070,15 @@ def create_app(config: PaperikaConfig | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await asyncio.get_running_loop().run_in_executor(None, startup_sweep, bridge)
-        yield
+        expiry = asyncio.create_task(_human_check_expiry_loop(bridge))
+        try:
+            yield
+        finally:
+            expiry.cancel()
+            try:
+                await expiry
+            except asyncio.CancelledError:
+                pass
 
     app = FastAPI(title="paperika-bridge", lifespan=lifespan)
     app.state.bridge = bridge
@@ -1535,6 +1543,67 @@ def _human_check_reason(title: str) -> str:
     return f"Paper download: {title[:80]}. Pass the human check; the download finishes by itself."
 
 
+def _human_check_task(title: str) -> str:
+    """The name his inbox shows for the request: the paper."""
+    return title.strip()[:60] or "Paper download"
+
+
+# How often unanswered requests are checked for their maximum age.
+HUMAN_CHECK_SWEEP_SECONDS = 600
+
+
+async def _expire_human_checks(bridge: Bridge) -> int:
+    """Withdraw every request to him that has waited past the maximum age, so an
+    unanswered one never stays on his screen after the caller has given up. The
+    attempt is closed as a wall; a later request for the paper starts afresh.
+
+    Runs under the download lock, and only when it is free: no /download can then
+    file a new ask for one of these URLs between the selection and the withdrawal
+    (a late withdrawal would take the new ask off his screen and end that download
+    as declined). A pass that finds the lock held leaves the work to the next one.
+    """
+    if bridge.config.human_check_wait_seconds <= 0 or _configured_tier3_browser(bridge.config) != "tcd":
+        return 0
+    if bridge.lock.locked():
+        return 0
+    max_age = timedelta(hours=bridge.config.human_check_max_age_hours)
+    expired = 0
+    async with bridge.lock:
+        now = _utc_now()
+        with bridge.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT a.id, a.finished_at, a.current_url, r.manual_current_url, r.inferred_url "
+                "FROM paper_requests r JOIN paper_attempts a ON a.id = "
+                "(SELECT MAX(id) FROM paper_attempts WHERE request_id = r.id) "
+                "WHERE r.status = 'failed' AND a.outcome = 'human_check_pending' "
+                "AND a.strategy IN ('tcd_codex', 'tcd_claude')",
+            ).fetchall()
+        for row in rows:
+            pending_at = _parse_iso(row["finished_at"])
+            if pending_at is None or now - pending_at <= max_age:
+                continue
+            url = row["manual_current_url"] or row["current_url"] or row["inferred_url"]
+            withdrawn = await tcd_browser.ask_human_check(url, withdraw=True) == "done"
+            if not withdrawn and now - pending_at <= 2 * max_age:
+                continue  # the ask may still be on his screen: the next pass tries again
+            bridge.resolve_attempt(
+                row["id"], outcome="bot_wall",
+                message="human check request expired" if withdrawn
+                else "human check request expired; its withdrawal failed")
+            expired += 1
+    return expired
+
+
+async def _human_check_expiry_loop(bridge: Bridge) -> None:
+    while True:
+        # asyncio.sleep, not SLEEP: the loop must not spin under a stubbed clock.
+        await asyncio.sleep(HUMAN_CHECK_SWEEP_SECONDS)
+        try:
+            await _expire_human_checks(bridge)
+        except Exception:  # noqa: BLE001 - the next pass tries again
+            logger.warning("human check expiry pass failed", exc_info=True)
+
+
 async def _check_pending_human_check(bridge: Bridge, *, doi: str, title: str) -> tuple[Response | None, bool]:
     """Poll only the latest request for this DOI, before any tier or Chrome work.
     Repeated pending answers do not rewrite its timestamp or extend its lifetime."""
@@ -1557,8 +1626,11 @@ async def _check_pending_human_check(bridge: Bridge, *, doi: str, title: str) ->
         await tcd_browser.ask_human_check(url, withdraw=True)
         bridge.resolve_attempt(row["id"], outcome="bot_wall", message="human check request expired")
         return None, False
-    result = await tcd_browser.ask_human_check(url, reason=_human_check_reason(title), wait_seconds=0)
-    if result == "pending":
+    result = await tcd_browser.ask_human_check(
+        url, reason=_human_check_reason(title), task=_human_check_task(title), wait_seconds=0)
+    if result in {"pending", "unavailable"}:
+        # A poll that could not reach the gateway says nothing about his answer:
+        # the request stays open on his screen, so the paper keeps waiting.
         return _json_error(
             502, "human_check_pending", _HUMAN_CHECK_PENDING_REASON,
             request_id=str(row["request_id"]), screenshot=row["manual_screenshot_path"],
@@ -2139,7 +2211,8 @@ async def _run_executor_attempt(
                                    wall_reason="the human check came back after his pass")
         url = _preferred_current_url(bridge, request_id, exec_result.final_url) or start_url
         wait = min(bridge.config.human_check_wait_seconds, max(0, int(deadline - MONOTONIC() - 5)))
-        result = await tcd_browser.ask_human_check(url, reason=_human_check_reason(title), wait_seconds=wait)
+        result = await tcd_browser.ask_human_check(
+            url, reason=_human_check_reason(title), task=_human_check_task(title), wait_seconds=wait)
         if result == "done":
             retried = await _retry_after_human_check(
                 bridge, request_id=request_id, run_dir=run_dir, doi=doi, title=title,
