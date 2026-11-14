@@ -564,11 +564,12 @@ the existing driver prompts and restrictions are unchanged.
 | Field | Environment variable | Default |
 |---|---|---|
 | `human_check_wait_seconds` | `PAPERIKA_HUMAN_CHECK_WAIT_SECONDS` | 180; 0 disables this entire flow |
-| `human_check_retry_seconds` | `PAPERIKA_HUMAN_CHECK_RETRY_SECONDS` | 900 |
-| `human_check_max_age_hours` | `PAPERIKA_HUMAN_CHECK_MAX_AGE_HOURS` | 24 |
+| `human_check_retry_seconds` | `PAPERIKA_HUMAN_CHECK_RETRY_SECONDS` | 60: his pass clears the check for a short time only (fine seconds later, gone 21 minutes later, 14 Nov 2026), so the caller is told to come back every minute |
+| `human_check_max_age_hours` | `PAPERIKA_HUMAN_CHECK_MAX_AGE_HOURS` | 13: past Knowledge Center's own wait of 12 h |
 
 The single CLI adapter is `bridge/tcd_browser.py:ask_human_check`. It runs
-`tcd-browser ask <wall URL> --reason "Paper download: <title, at most 80 chars>. Pass the human check; the download finishes by itself." --wait <seconds>`.
+`tcd-browser ask <wall URL> --reason "Paper download: <title, at most 80 chars>. Pass the human check; the download finishes by itself." --task "<title, at most 60 chars>" --wait <seconds>`.
+`--task` is the name his inbox shows for the request.
 The URL is the executor attempt's `current_url` (reported `final_url`), else the
 request's canonical/source URL. The wait is capped to the remaining request
 deadline. Exit 0 means Done; 2 or 4 means still pending; 3 means declined (the CLI
@@ -596,17 +597,26 @@ for the normalized DOI. If its last attempt is `human_check_pending`, it polls t
 stored URL with `ask --wait 0`. Still pending returns the same error and retry hint
 immediately, without a fetch, LLM attempt or new request row, and without refreshing
 the pending timestamp. Done runs the normal ladder (deterministic tiers included);
-a returning tier-3 TCD wall is terminal. Declined or ask unavailable finishes the
-stored request as terminal `bot_wall` (the latter with the original hand-off text).
+a returning tier-3 TCD wall is terminal. Declined finishes the stored request as
+terminal `bot_wall`. A poll that could not reach the gateway (ask unavailable) is not
+his answer: it returns the same pending error and retry hint, and the ask stays open.
 When the pending attempt's `finished_at` is older than `human_check_max_age_hours`,
 the next request first runs `tcd-browser ask --withdraw <stored URL>`, retires the
 pending outcome to `bot_wall`, and proceeds through a fresh ladder. This uses the
 existing ledger and hand-off columns; no schema migration is needed.
 
-The bridge remains on-demand: Knowledge Center must treat `human_check_pending`
-as retryable and re-request after the hint. The bridge adds no poller or scheduled
-job. The ask's own CLI timeout is its wait plus five seconds, within the existing
-request budget.
+The bridge remains on-demand for downloads: Knowledge Center must treat
+`human_check_pending` as retryable and re-request after the hint. One pass runs inside
+the bridge process (`_human_check_expiry_loop`, every 600 s, first run 600 s after
+start): every request whose last attempt is `human_check_pending` and older than
+`human_check_max_age_hours` has its ask withdrawn and its attempt retired to `bot_wall`
+(`human check request expired`), so an unanswered request never stays on his screen
+after the caller has given up. The pass runs only when the download lock is free and
+holds it from its selection to the last withdrawal, so it cannot take a newer ask for
+the same URL away; a `/download` arriving in that moment gets the usual 429 `busy`. A
+withdrawal that did not succeed is tried again on the next pass, and the attempt is
+closed anyway once it is twice the maximum age. The ask's own CLI timeout is its wait
+plus twenty seconds, within the existing request budget.
 
 ### The codex latch re-arms itself (AGA-1702)
 
