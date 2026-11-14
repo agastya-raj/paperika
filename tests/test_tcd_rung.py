@@ -481,6 +481,39 @@ def test_human_check_unanswered_request_is_withdrawn_after_the_maximum_age(cfg, 
     assert (row["outcome"], row["message"]) == ("bot_wall", "human check request expired")
 
 
+def test_human_check_expiry_waits_for_the_download_lock_and_for_a_withdrawal_that_worked(
+    cfg, human_check, monkeypatch
+):
+    import asyncio
+
+    with TestClient(bridge_app.create_app(cfg)) as client:
+        assert _download(client).json()["error_code"] == "human_check_pending"
+        bridge = client.app.state.bridge
+        with _conn(cfg) as conn:
+            conn.execute("UPDATE paper_attempts SET finished_at=? WHERE outcome='human_check_pending'",
+                         ((_now() - timedelta(hours=cfg.human_check_max_age_hours + 1)).isoformat(),))
+
+        async def while_a_download_runs():
+            async with bridge.lock:
+                return await bridge_app._expire_human_checks(bridge)
+
+        asks = len(human_check["asks"])
+        assert asyncio.run(while_a_download_runs()) == 0  # a later pass does it
+        assert len(human_check["asks"]) == asks and human_check["open"]
+
+        async def _gateway_down(url, **kwargs):
+            return "unavailable"
+
+        with monkeypatch.context() as patch:
+            patch.setattr(tcd_browser, "ask_human_check", _gateway_down)
+            assert asyncio.run(bridge_app._expire_human_checks(bridge)) == 0
+        with _conn(cfg) as conn:
+            assert conn.execute("SELECT outcome FROM paper_attempts ORDER BY id DESC LIMIT 1"
+                                ).fetchone()["outcome"] == "human_check_pending"
+        assert asyncio.run(bridge_app._expire_human_checks(bridge)) == 1
+    assert not human_check["open"]
+
+
 def test_human_check_expiry_withdraws_before_fresh_ladder(cfg, human_check):
     human_check.update(codes=[2, 5])
     with TestClient(bridge_app.create_app(cfg)) as client:
