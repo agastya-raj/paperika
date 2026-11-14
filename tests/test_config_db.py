@@ -53,7 +53,7 @@ def test_human_check_config_defaults_and_environment(monkeypatch):
     for name in names:
         monkeypatch.delenv(f"PAPERIKA_{name.upper()}", raising=False)
     config = PaperikaConfig.from_env()
-    assert tuple(getattr(config, name) for name in names) == (180, 900, 24)
+    assert tuple(getattr(config, name) for name in names) == (180, 60, 13)
     for name, value in zip(names, (0, 120, 12)):
         monkeypatch.setenv(f"PAPERIKA_{name.upper()}", str(value))
     config = PaperikaConfig.from_env()

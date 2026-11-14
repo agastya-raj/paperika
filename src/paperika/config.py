@@ -30,8 +30,14 @@ class PaperikaConfig:
     discovery_shortlist_size: int = 8
     tier3_browser: str = DEFAULT_TIER3_BROWSER
     human_check_wait_seconds: int = 180
-    human_check_retry_seconds: int = 900
-    human_check_max_age_hours: int = 24
+    # The retry hint for a waiting request. A re-request while he has not answered
+    # costs one CLI poll and no tier, and his pass clears the check only for a short
+    # time (14 Nov 2026: fine seconds later, gone 12.6 h later), so the caller is
+    # told to come back every minute.
+    human_check_retry_seconds: int = 60
+    # An unanswered request is withdrawn after this long. Longer than KC's own wait
+    # (12 h), so KC has stopped re-requesting before the withdrawal.
+    human_check_max_age_hours: int = 13
 
     @classmethod
     def from_env(cls) -> "PaperikaConfig":
@@ -44,8 +50,8 @@ class PaperikaConfig:
             discovery_shortlist_size=int(os.getenv("PAPERIKA_DISCOVERY_SHORTLIST_SIZE", "8")),
             tier3_browser=os.getenv("PAPERIKA_TIER3_BROWSER", DEFAULT_TIER3_BROWSER),
             human_check_wait_seconds=int(os.getenv("PAPERIKA_HUMAN_CHECK_WAIT_SECONDS", "180")),
-            human_check_retry_seconds=int(os.getenv("PAPERIKA_HUMAN_CHECK_RETRY_SECONDS", "900")),
-            human_check_max_age_hours=int(os.getenv("PAPERIKA_HUMAN_CHECK_MAX_AGE_HOURS", "24")),
+            human_check_retry_seconds=int(os.getenv("PAPERIKA_HUMAN_CHECK_RETRY_SECONDS", "60")),
+            human_check_max_age_hours=int(os.getenv("PAPERIKA_HUMAN_CHECK_MAX_AGE_HOURS", "13")),
         )
 
     def ensure_runtime_dirs(self) -> None:
