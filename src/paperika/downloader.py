@@ -979,6 +979,40 @@ class Downloader:
         except Exception:
             return ""
 
+    @staticmethod
+    def _arxiv_id_from_doi(doi: str | None) -> tuple[str, str | None] | None:
+        match = re.fullmatch(
+            r"10\.48550/arxiv\.(\d{4}\.\d{4,5}|[a-z\-]+(?:\.[a-z]{2})?/\d{7})(?:v(\d+))?",
+            (doi or "").strip().lower(),
+        )
+        return (match.group(1), match.group(2)) if match else None
+
+    _ARXIV_STAMP = re.compile(
+        r"arxiv:\s*(\d{4}\.\d{4,5}|[a-z\-]+(?:\.[a-z]{2})?/\d{7})v(\d+)\s*\[[a-z\-]+(?:\.[a-z]{2})?\]\s*\d{1,2}\s+[a-z]{3}\s+\d{4}"
+    )
+
+    @classmethod
+    def _arxiv_stamp_matches(cls, arxiv_id: str, version: str | None, first_page_text: str) -> bool:
+        """True only when page 1 carries the paper's OWN full arXiv stamp
+        (``arXiv:<id>vN [cat] D Mon YYYY``) for exactly this id and no stamp for
+        any other id. Citations (page 2, reference lists) never qualify."""
+        stamps = cls._ARXIV_STAMP.findall(" ".join(first_page_text.lower().split()))
+        if not stamps or any(sid != arxiv_id for sid, _ in stamps):
+            return False
+        return version is None or any(sv == version for _, sv in stamps)
+
+    def _extract_pdf_first_page_text(self, pdf_path: Path, max_chars: int = 20000) -> str:
+        if shutil.which("pdftotext"):
+            try:
+                result = subprocess.run(
+                    ["pdftotext", "-f", "1", "-l", "1", str(pdf_path), "-"],
+                    capture_output=True, text=True, check=False, timeout=10,
+                )
+                return result.stdout[:max_chars]
+            except Exception:
+                pass
+        return ""
+
     def _verify_downloaded_pdf_identity(self, parsed: ParsedInput, pdf_path: Path) -> PdfIdentityCheck:
         observed_title, observed_doi = self._extract_pdf_identity(pdf_path)
         extracted_text = self._extract_pdf_text(pdf_path)
@@ -987,6 +1021,22 @@ class Downloader:
         if normalized_requested_doi:
             if normalized_observed_doi == normalized_requested_doi:
                 return PdfIdentityCheck(True, "Matched requested DOI in downloaded PDF", observed_title, normalized_observed_doi)
+            # arXiv DOIs (10.48550/arxiv.<id>): arXiv PDFs never print the DOI, but
+            # arXiv stamps its own id down the first page ("arXiv:2310.02994v2
+            # [cs.LG] 10 Dec 2024"). That stamp proves identity regardless of the
+            # title, which arXiv authors revise and a registry may hold stale (AGA-1774).
+            arxiv_ref = self._arxiv_id_from_doi(normalized_requested_doi)
+            if (
+                arxiv_ref
+                and (not normalized_observed_doi or normalized_observed_doi == normalized_requested_doi)
+                and self._arxiv_stamp_matches(arxiv_ref[0], arxiv_ref[1], self._extract_pdf_first_page_text(pdf_path))
+            ):
+                return PdfIdentityCheck(
+                    True,
+                    f"Matched the paper's own arXiv stamp arXiv:{arxiv_ref[0]} on page 1 of the PDF",
+                    observed_title,
+                    normalized_requested_doi,
+                )
             # Optica/JOCN PDFs can expose a license DOI (e.g. 10.1364/oa_license_v2)
             # in low-level PDF bytes before the article DOI appears in rendered text.
             # Trust the rendered text if it contains the exact requested DOI.
