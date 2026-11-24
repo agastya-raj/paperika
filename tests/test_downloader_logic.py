@@ -1358,3 +1358,42 @@ def test_lost_hyphen_in_reference_list_does_not_widen_older_branches(tmp_path: P
     title_only = d._verify_downloaded_pdf_identity(infer_input(OFC_TITLE), p)
     assert title_only.ok is False
     assert title_only.reason == "downloaded PDF did not expose a matching DOI or strong title"
+
+
+def _arxiv_downloader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, observed_doi=None):
+    config = build_config(tmp_path)
+    config.ensure_runtime_dirs()
+    db = Database.from_config(config)
+    db.init()
+    downloader = StubDownloader(config, db)
+    pdf_path = config.download_dir / "arxiv.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+    monkeypatch.setattr(downloader, "_extract_pdf_identity", lambda path: (None, observed_doi))
+    monkeypatch.setattr(downloader, "_extract_pdf_text", lambda path, max_chars=20000: text)
+    return downloader, pdf_path
+
+
+STAMP = "Multiple Physics Pretraining\n\narXiv:2310.02994v2 [cs.LG] 10 Dec 2024\n"
+
+
+def test_arxiv_doi_accepted_by_stamp_despite_stale_title(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # AGA-1774: registry holds the OLD arXiv title; the PDF carries the new one.
+    downloader, pdf_path = _arxiv_downloader(tmp_path, monkeypatch, STAMP)
+    parsed = infer_input("10.48550/arxiv.2310.02994")
+    parsed.title = "Multiple Physics Pretraining for Physical Surrogate Models"
+    assert downloader._verify_downloaded_pdf_identity(parsed, pdf_path).ok is True
+
+
+def test_arxiv_doi_stamp_beats_reference_doi_in_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    downloader, pdf_path = _arxiv_downloader(tmp_path, monkeypatch, STAMP, observed_doi="10.1000/some-reference")
+    parsed = infer_input("10.48550/arxiv.2310.02994")
+    parsed.title = "Small Caps Title"
+    assert downloader._verify_downloaded_pdf_identity(parsed, pdf_path).ok is True
+
+
+def test_arxiv_doi_rejects_other_arxiv_id_and_bare_reference(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    other = "Some Other Paper\narXiv:2401.00001v1 [cs.LG] 1 Jan 2024\nRefs: arXiv:2310.02994 (2023)\n"
+    downloader, pdf_path = _arxiv_downloader(tmp_path, monkeypatch, other)
+    parsed = infer_input("10.48550/arxiv.2310.02994")
+    parsed.title = "Multiple Physics Pretraining for Physical Surrogate Models"
+    assert downloader._verify_downloaded_pdf_identity(parsed, pdf_path).ok is False

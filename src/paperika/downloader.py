@@ -979,6 +979,18 @@ class Downloader:
         except Exception:
             return ""
 
+    @staticmethod
+    def _arxiv_id_from_doi(doi: str | None) -> str | None:
+        match = re.fullmatch(r"10\.48550/arxiv\.(\d{4}\.\d{4,5}|[a-z\-]+(?:\.[a-z]{2})?/\d{7})(?:v\d+)?", (doi or "").strip().lower())
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _arxiv_stamp_matches(arxiv_id: str, text: str) -> bool:
+        # The stamp is "arXiv:<id>vN [<category>] <date>"; a bare "arXiv:<id>" in a
+        # reference list has no category bracket, so it does not count.
+        pattern = r"arxiv:\s*" + re.escape(arxiv_id) + r"(?:v\d+)?\s*\[[a-z\-]+(?:\.[a-z]{2})?\]"
+        return re.search(pattern, text.lower()) is not None
+
     def _verify_downloaded_pdf_identity(self, parsed: ParsedInput, pdf_path: Path) -> PdfIdentityCheck:
         observed_title, observed_doi = self._extract_pdf_identity(pdf_path)
         extracted_text = self._extract_pdf_text(pdf_path)
@@ -987,6 +999,18 @@ class Downloader:
         if normalized_requested_doi:
             if normalized_observed_doi == normalized_requested_doi:
                 return PdfIdentityCheck(True, "Matched requested DOI in downloaded PDF", observed_title, normalized_observed_doi)
+            # arXiv DOIs (10.48550/arxiv.<id>): arXiv PDFs never print the DOI, but
+            # arXiv stamps its own id down the first page ("arXiv:2310.02994v2
+            # [cs.LG] 10 Dec 2024"). That stamp proves identity regardless of the
+            # title, which arXiv authors revise and a registry may hold stale (AGA-1774).
+            arxiv_id = self._arxiv_id_from_doi(normalized_requested_doi)
+            if arxiv_id and self._arxiv_stamp_matches(arxiv_id, extracted_text):
+                return PdfIdentityCheck(
+                    True,
+                    f"Matched the arXiv id stamp arXiv:{arxiv_id} on the first pages of the PDF",
+                    observed_title,
+                    normalized_requested_doi,
+                )
             # Optica/JOCN PDFs can expose a license DOI (e.g. 10.1364/oa_license_v2)
             # in low-level PDF bytes before the article DOI appears in rendered text.
             # Trust the rendered text if it contains the exact requested DOI.
